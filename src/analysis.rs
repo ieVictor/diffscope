@@ -5,6 +5,7 @@ use crate::{
     languages::{
         FunctionDefinition, FunctionKind, Language, LanguageDiagnostic, SourceRange, analyze_source,
     },
+    metrics::FunctionMetrics,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct FunctionChange {
     pub qualified_name: String,
     pub base_range: Option<SourceRange>,
     pub target_range: Option<SourceRange>,
+    pub metrics_before: Option<FunctionMetrics>,
+    pub metrics_after: Option<FunctionMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +128,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                     qualified_name: key.qualified_name,
                     base_range: Some(base_function.range.clone()),
                     target_range: Some(target_function.range.clone()),
+                    metrics_before: Some(base_function.metrics.clone()),
+                    metrics_after: Some(target_function.metrics.clone()),
                 });
             }
             (Some(base_function), None) => functions.push(FunctionChange {
@@ -134,6 +139,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 qualified_name: key.qualified_name,
                 base_range: Some(base_function.range.clone()),
                 target_range: None,
+                metrics_before: Some(base_function.metrics.clone()),
+                metrics_after: None,
             }),
             (None, Some(target_function)) => functions.push(FunctionChange {
                 status: FunctionChangeStatus::Added,
@@ -142,6 +149,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 qualified_name: key.qualified_name,
                 base_range: None,
                 target_range: Some(target_function.range.clone()),
+                metrics_before: None,
+                metrics_after: Some(target_function.metrics.clone()),
             }),
             (None, None) => {}
         }
@@ -285,6 +294,8 @@ mod tests {
         assert_eq!(mapped.functions.len(), 1);
         assert_eq!(mapped.functions[0].qualified_name, "greet");
         assert_eq!(mapped.functions[0].status, FunctionChangeStatus::Modified);
+        assert!(mapped.functions[0].metrics_before.is_some());
+        assert!(mapped.functions[0].metrics_after.is_some());
     }
 
     #[test]
