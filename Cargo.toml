@@ -1,0 +1,25 @@
+[package]
+name = "diffscope"
+version = "0.1.0"
+authors = ["Victor Gabriel <victor_tiss@outlook.com>"]
+edition = "2024"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "analysis"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.bench]
+debug = true

@@ -1,0 +1,5 @@
+[files]
+extend-exclude = ["target/"]
+
+[default.extend-identifiers]
+diffscope = "diffscope"
