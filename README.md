@@ -8,9 +8,21 @@ It compares revisions and reports:
 - Files and functions touched by a diff
 - Before-and-after function metrics, including LOC, cyclomatic complexity, and cognitive complexity
 
-DiffScope is designed around a reusable analysis core. It will be available both as a command-line application and through adapters for multiple coding-agent harnesses.
+DiffScope is designed around a reusable analysis core. It is available as a command-line application; adapters for coding-agent harnesses can use the same public analysis API.
 
 The project prioritizes correctness, deterministic output, safe Rust, and measured performance. See [`AGENTS.MD`](AGENTS.MD) for its development rules.
+
+## Command line
+
+Compare two committed Git revisions from the repository containing the current directory:
+
+```sh
+diffscope <BASE> <TARGET>
+```
+
+Use `--repository <PATH>` to select another repository and `--format json` for schema-versioned JSON. Human output is the default. Successful and partially supported analyses exit with status `0`, analysis failures with `1`, and invalid command-line usage with `2`.
+
+The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
 ## Local development
 
