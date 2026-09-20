@@ -3,6 +3,7 @@ pub mod application;
 pub mod git;
 pub mod languages;
 pub mod metrics;
+pub mod output;
 pub mod result;
 
 pub use application::analyze;
