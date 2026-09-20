@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Parser};
 
-use crate::DiffScopeError;
+use crate::{DiffScopeError, metrics::FunctionMetrics};
 
 use super::{
     DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
@@ -133,6 +133,7 @@ impl<'source> FunctionCollector<'source> {
             kind,
             qualified_name,
             range: SourceRange::from_tree_sitter(node.range())?,
+            metrics: function_metrics(node, self.source)?,
         });
         Ok(())
     }
@@ -239,6 +240,187 @@ fn clean_property_name(name: &str) -> String {
     name.trim_matches(['\'', '"', '`']).to_owned()
 }
 
+fn function_metrics(node: Node<'_>, source: &str) -> Result<FunctionMetrics, DiffScopeError> {
+    Ok(FunctionMetrics {
+        physical_loc: physical_loc(node, source)?,
+        source_loc: source_loc(node, source)?,
+        cyclomatic_complexity: cyclomatic_complexity(node),
+        cognitive_complexity: cognitive_complexity(node),
+    })
+}
+
+fn physical_loc(node: Node<'_>, source: &str) -> Result<u32, DiffScopeError> {
+    let text = node_text(node, source).ok_or_else(|| {
+        DiffScopeError::Language("function source range is not a UTF-8 boundary".to_owned())
+    })?;
+    if text.is_empty() {
+        return Ok(0);
+    }
+    u32::try_from(text.lines().count()).map_err(|error| {
+        DiffScopeError::Language(format!("physical LOC does not fit in u32: {error}"))
+    })
+}
+
+fn source_loc(node: Node<'_>, source: &str) -> Result<u32, DiffScopeError> {
+    let text = node_text(node, source).ok_or_else(|| {
+        DiffScopeError::Language("function source range is not a UTF-8 boundary".to_owned())
+    })?;
+    let uncommented = remove_comments(text);
+    let count = uncommented
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    u32::try_from(count).map_err(|error| {
+        DiffScopeError::Language(format!("source LOC does not fit in u32: {error}"))
+    })
+}
+
+fn remove_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(character) = chars.next() {
+        if in_line_comment {
+            if character == '\n' {
+                in_line_comment = false;
+                output.push('\n');
+            } else {
+                output.push(' ');
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            if character == '*' && chars.peek() == Some(&'/') {
+                let _ignored = chars.next();
+                in_block_comment = false;
+                output.push(' ');
+                output.push(' ');
+            } else if character == '\n' {
+                output.push('\n');
+            } else {
+                output.push(' ');
+            }
+            continue;
+        }
+
+        if let Some(quote) = in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quote {
+                in_string = None;
+            }
+            continue;
+        }
+
+        if matches!(character, '\'' | '"' | '`') {
+            in_string = Some(character);
+            output.push(character);
+        } else if character == '/' && chars.peek() == Some(&'/') {
+            let _ignored = chars.next();
+            in_line_comment = true;
+            output.push(' ');
+            output.push(' ');
+        } else if character == '/' && chars.peek() == Some(&'*') {
+            let _ignored = chars.next();
+            in_block_comment = true;
+            output.push(' ');
+            output.push(' ');
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn cyclomatic_complexity(node: Node<'_>) -> u32 {
+    1 + complexity_points(node, 0).cyclomatic
+}
+
+fn cognitive_complexity(node: Node<'_>) -> u32 {
+    complexity_points(node, 0).cognitive
+}
+
+#[derive(Debug, Default)]
+struct ComplexityPoints {
+    cyclomatic: u32,
+    cognitive: u32,
+}
+
+fn complexity_points(node: Node<'_>, nesting: u32) -> ComplexityPoints {
+    let mut points = ComplexityPoints::default();
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        if child.start_byte() != node.start_byte() && function_kind(child, "").is_some() {
+            continue;
+        }
+
+        let kind = child.kind();
+        if is_cyclomatic_decision(kind) {
+            points.cyclomatic += 1;
+        }
+        if is_cognitive_decision(kind) {
+            points.cognitive += 1 + nesting;
+            let child_points = complexity_points(child, nesting + 1);
+            points.cyclomatic += child_points.cyclomatic;
+            points.cognitive += child_points.cognitive;
+            continue;
+        }
+        if kind == "binary_expression" && is_short_circuit_operator(child) {
+            points.cyclomatic += 1;
+            points.cognitive += 1;
+        }
+
+        let child_points = complexity_points(child, nesting);
+        points.cyclomatic += child_points.cyclomatic;
+        points.cognitive += child_points.cognitive;
+    }
+
+    points
+}
+
+fn is_cyclomatic_decision(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "catch_clause"
+            | "ternary_expression"
+            | "case_clause"
+    )
+}
+
+fn is_cognitive_decision(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "catch_clause"
+            | "ternary_expression"
+            | "case_clause"
+    )
+}
+
+fn is_short_circuit_operator(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "&&" | "||" | "??"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -282,6 +464,65 @@ class Greeter {
         assert!(names.contains(&("assigned", FunctionKind::ArrowFunction)));
         assert!(names.contains(&("Greeter.constructor", FunctionKind::Constructor)));
         assert!(names.contains(&("Greeter.greet", FunctionKind::Method)));
+    }
+
+    #[test]
+    fn calculates_loc_metrics() {
+        let source = br"
+function measured() {
+  // comment only
+
+  return 1; // mixed code and comment
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let metrics = &analysis.functions[0].metrics;
+
+        assert_eq!(metrics.physical_loc, 5);
+        assert_eq!(metrics.source_loc, 3);
+    }
+
+    #[test]
+    fn calculates_complexity_metrics() {
+        let source = br"
+function complex(a: boolean, b: boolean, items: number[]) {
+  if (a && b) {
+    for (const item of items) { console.log(item); }
+  } else {
+    while (b) { break; }
+  }
+  return a ? 1 : 0;
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let metrics = &analysis.functions[0].metrics;
+
+        assert_eq!(metrics.cyclomatic_complexity, 6);
+        assert_eq!(metrics.cognitive_complexity, 7);
+    }
+
+    #[test]
+    fn excludes_nested_functions_from_complexity_metrics() {
+        let source = br"
+function outer() {
+  function inner() {
+    if (true) { return 1; }
+  }
+  return 0;
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let outer = analysis
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "outer")
+            .expect("outer function exists");
+
+        assert_eq!(outer.metrics.cyclomatic_complexity, 1);
+        assert_eq!(outer.metrics.cognitive_complexity, 0);
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod typescript;
 
 use std::path::Path;
 
-use crate::DiffScopeError;
+use crate::{DiffScopeError, metrics::FunctionMetrics};
 
 pub use typescript::TypeScriptAnalyzer;
 
@@ -34,6 +34,7 @@ pub struct FunctionDefinition {
     pub kind: FunctionKind,
     pub qualified_name: String,
     pub range: SourceRange,
+    pub metrics: FunctionMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

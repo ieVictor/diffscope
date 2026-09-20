@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod git;
 pub mod languages;
+pub mod metrics;
 
 use std::path::PathBuf;
 
