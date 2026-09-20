@@ -19,6 +19,7 @@ diffScope/
 ├── benches/                # Criterion benchmarks
 ├── docs/
 │   ├── ARCHITECTURE.md     # System design and boundaries
+│   ├── DEFINITIONS.md      # Versioned metric and result semantics
 │   ├── ROADMAP.md          # Forward-only implementation plan
 │   └── STRUCTURE.MD        # Directory ownership and conventions
 ├── scripts/                # Local setup and maintenance scripts

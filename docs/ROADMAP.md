@@ -17,7 +17,7 @@ Forward-only does not prohibit internal refactoring. Refactoring must preserve t
 
 ## Milestone 1: Stable definitions
 
-Define the behavior that later milestones must preserve:
+Definitions are captured in [DEFINITIONS.md](DEFINITIONS.md). Define the behavior that later milestones must preserve:
 
 - Revision and diff semantics, including additions, deletions, renames, and binary files
 - Physical and source LOC definitions
