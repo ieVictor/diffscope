@@ -1,0 +1,321 @@
+use std::collections::HashSet;
+
+use tree_sitter::{Node, Parser};
+
+use crate::DiffScopeError;
+
+use super::{
+    DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
+    LanguageDiagnosticCode, SourceAnalysis, SourceRange,
+};
+
+pub struct TypeScriptAnalyzer {
+    language: Language,
+    parser: Parser,
+}
+
+impl TypeScriptAnalyzer {
+    /// Create a TypeScript or TSX analyzer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree-sitter grammar cannot be loaded.
+    pub fn new(language: Language) -> Result<Self, DiffScopeError> {
+        let mut parser = Parser::new();
+        let grammar = match language {
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+        };
+        parser.set_language(&grammar.into()).map_err(|error| {
+            DiffScopeError::Language(format!("load TypeScript grammar: {error}"))
+        })?;
+        Ok(Self { language, parser })
+    }
+
+    /// Analyze a TypeScript source blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tree-sitter does not produce a syntax tree or when
+    /// source coordinates exceed the public result type.
+    pub fn analyze(&mut self, source: &[u8]) -> Result<SourceAnalysis, DiffScopeError> {
+        let source_text = match std::str::from_utf8(source) {
+            Ok(source_text) => source_text,
+            Err(error) => {
+                return Ok(SourceAnalysis {
+                    language: Some(self.language),
+                    functions: Vec::new(),
+                    diagnostics: vec![LanguageDiagnostic {
+                        code: LanguageDiagnosticCode::InvalidUtf8,
+                        severity: DiagnosticSeverity::Error,
+                        message: format!("source is not valid UTF-8: {error}"),
+                        range: None,
+                    }],
+                });
+            }
+        };
+
+        let tree = self
+            .parser
+            .parse(source_text, None)
+            .ok_or_else(|| DiffScopeError::Language("tree-sitter returned no tree".to_owned()))?;
+        let root = tree.root_node();
+        let mut diagnostics = Vec::new();
+        if root.has_error() {
+            diagnostics.push(LanguageDiagnostic {
+                code: LanguageDiagnosticCode::MalformedSource,
+                severity: DiagnosticSeverity::Warning,
+                message: "source contains syntax errors; function inventory may be incomplete"
+                    .to_owned(),
+                range: Some(SourceRange::from_tree_sitter(root.range())?),
+            });
+        }
+
+        let mut collector = FunctionCollector::new(self.language, source_text);
+        collector.visit(root)?;
+        let mut functions = collector.functions;
+        functions.sort_by(|left, right| {
+            left.range
+                .start_line
+                .cmp(&right.range.start_line)
+                .then_with(|| left.range.start_column.cmp(&right.range.start_column))
+                .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+                .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
+        });
+
+        Ok(SourceAnalysis {
+            language: Some(self.language),
+            functions,
+            diagnostics,
+        })
+    }
+}
+
+struct FunctionCollector<'source> {
+    language: Language,
+    source: &'source str,
+    functions: Vec<FunctionDefinition>,
+    seen_starts: HashSet<usize>,
+    anonymous_count: u32,
+}
+
+impl<'source> FunctionCollector<'source> {
+    fn new(language: Language, source: &'source str) -> Self {
+        Self {
+            language,
+            source,
+            functions: Vec::new(),
+            seen_starts: HashSet::new(),
+            anonymous_count: 0,
+        }
+    }
+
+    fn visit(&mut self, node: Node<'_>) -> Result<(), DiffScopeError> {
+        self.collect_node(node)?;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.visit(child)?;
+        }
+        Ok(())
+    }
+
+    fn collect_node(&mut self, node: Node<'_>) -> Result<(), DiffScopeError> {
+        let Some(kind) = function_kind(node, self.source) else {
+            return Ok(());
+        };
+        if !self.seen_starts.insert(node.start_byte()) {
+            return Ok(());
+        }
+
+        let qualified_name = self.qualified_name(node, kind);
+        self.functions.push(FunctionDefinition {
+            language: self.language,
+            kind,
+            qualified_name,
+            range: SourceRange::from_tree_sitter(node.range())?,
+        });
+        Ok(())
+    }
+
+    fn qualified_name(&mut self, node: Node<'_>, kind: FunctionKind) -> String {
+        if kind == FunctionKind::Constructor {
+            return qualify_with_containers(node, self.source, "constructor");
+        }
+
+        if let Some(name) = explicit_name(node, self.source) {
+            return qualify_with_containers(node, self.source, &name);
+        }
+
+        if matches!(kind, FunctionKind::ArrowFunction | FunctionKind::Function)
+            && let Some(name) = assigned_name(node, self.source)
+        {
+            return qualify_with_containers(node, self.source, &name);
+        }
+
+        self.anonymous_count += 1;
+        qualify_with_containers(
+            node,
+            self.source,
+            &format!("<anonymous>#{}", self.anonymous_count),
+        )
+    }
+}
+
+fn function_kind(node: Node<'_>, source: &str) -> Option<FunctionKind> {
+    match node.kind() {
+        "function_declaration" | "generator_function_declaration" | "function" => {
+            Some(FunctionKind::Function)
+        }
+        "method_definition" | "abstract_method_signature" | "method_signature" => {
+            if explicit_name(node, source).as_deref() == Some("constructor") {
+                Some(FunctionKind::Constructor)
+            } else {
+                Some(FunctionKind::Method)
+            }
+        }
+        "arrow_function" => Some(FunctionKind::ArrowFunction),
+        _ => None,
+    }
+}
+
+fn explicit_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    node_text(name, source).map(clean_property_name)
+}
+
+fn assigned_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "variable_declarator"
+            | "assignment_expression"
+            | "pair"
+            | "public_field_definition" => {
+                if let Some(name) = candidate
+                    .child_by_field_name("name")
+                    .or_else(|| candidate.child_by_field_name("left"))
+                    .or_else(|| candidate.child_by_field_name("key"))
+                    .and_then(|name| node_text(name, source))
+                {
+                    return Some(clean_property_name(name));
+                }
+            }
+            "statement_block" | "program" | "class_body" => return None,
+            _ => {}
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+fn qualify_with_containers(node: Node<'_>, source: &str, name: &str) -> String {
+    let mut containers = Vec::new();
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "module"
+            | "internal_module" => {
+                if let Some(container) = explicit_name(candidate, source) {
+                    containers.push(container);
+                }
+            }
+            _ => {}
+        }
+        parent = candidate.parent();
+    }
+    containers.reverse();
+    containers.push(name.to_owned());
+    containers.join(".")
+}
+
+fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    source.get(node.byte_range())
+}
+
+fn clean_property_name(name: &str) -> String {
+    name.trim_matches(['\'', '"', '`']).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::super::{
+        DiagnosticSeverity, FunctionKind, Language, LanguageDiagnosticCode, analyze_source,
+        detect_language,
+    };
+
+    #[test]
+    fn detects_typescript_extensions() {
+        assert_eq!(
+            detect_language(Path::new("index.ts")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(detect_language(Path::new("index.tsx")), Some(Language::Tsx));
+        assert_eq!(detect_language(Path::new("index.js")), None);
+    }
+
+    #[test]
+    fn inventories_typescript_functions_and_methods() {
+        let source = br"
+function topLevel(value: number): number { return value + 1; }
+const assigned = (name: string) => name.toUpperCase();
+class Greeter {
+  constructor(private name: string) {}
+  greet(): string { return this.name; }
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let names = analysis
+            .functions
+            .iter()
+            .map(|function| (function.qualified_name.as_str(), function.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(analysis.language, Some(Language::TypeScript));
+        assert!(analysis.diagnostics.is_empty());
+        assert!(names.contains(&("topLevel", FunctionKind::Function)));
+        assert!(names.contains(&("assigned", FunctionKind::ArrowFunction)));
+        assert!(names.contains(&("Greeter.constructor", FunctionKind::Constructor)));
+        assert!(names.contains(&("Greeter.greet", FunctionKind::Method)));
+    }
+
+    #[test]
+    fn reports_malformed_source_without_panicking() {
+        let analysis = analyze_source(Path::new("broken.ts"), b"function broken( {")
+            .expect("analysis succeeds");
+
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == LanguageDiagnosticCode::MalformedSource
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn reports_invalid_utf8_without_panicking() {
+        let analysis =
+            analyze_source(Path::new("bad.ts"), &[0xff, 0xfe]).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions, Vec::new());
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == LanguageDiagnosticCode::InvalidUtf8
+                && diagnostic.severity == DiagnosticSeverity::Error
+        }));
+    }
+
+    #[test]
+    fn reports_unsupported_language() {
+        let analysis =
+            analyze_source(Path::new("readme.md"), b"# title").expect("analysis succeeds");
+
+        assert_eq!(analysis.language, None);
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == LanguageDiagnosticCode::UnsupportedLanguage
+                && diagnostic.severity == DiagnosticSeverity::Info
+        }));
+    }
+}

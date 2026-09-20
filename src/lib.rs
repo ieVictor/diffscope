@@ -1,4 +1,5 @@
 pub mod git;
+pub mod languages;
 
 use std::path::PathBuf;
 
@@ -77,6 +78,7 @@ pub struct ChangeSummary {
 pub enum DiffScopeError {
     Git { command: String, message: String },
     InvalidGitOutput(String),
+    Language(String),
 }
 
 impl std::fmt::Display for DiffScopeError {
@@ -86,6 +88,7 @@ impl std::fmt::Display for DiffScopeError {
                 write!(formatter, "git command failed (`{command}`): {message}")
             }
             Self::InvalidGitOutput(message) => write!(formatter, "invalid git output: {message}"),
+            Self::Language(message) => write!(formatter, "language analysis failed: {message}"),
         }
     }
 }
