@@ -10,6 +10,7 @@ diffScope/
 │   ├── application/        # Analysis workflow orchestration
 │   ├── analysis/           # Diff mapping and function matching
 │   ├── git/                # Git repository adapter
+│   ├── harness/            # Transport-neutral harness protocol adapters
 │   ├── languages/          # Language detection and analyzers
 │   ├── metrics/            # LOC and complexity calculations
 │   └── output/             # Human and versioned machine output
@@ -21,6 +22,7 @@ diffScope/
 │   ├── ARCHITECTURE.md     # System design and boundaries
 │   ├── DEFINITIONS.md      # Versioned metric and result semantics
 │   ├── ROADMAP.md          # Forward-only implementation plan
+│   ├── HARNESS.md          # Versioned JSONL harness protocol
 │   └── STRUCTURE.MD        # Directory ownership and conventions
 ├── scripts/                # Local setup and maintenance scripts
 ├── AGENTS.MD               # Development rules

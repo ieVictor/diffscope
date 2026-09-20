@@ -24,6 +24,8 @@ Use `--repository <PATH>` to select another repository and `--format json` for s
 
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
+Run `diffscope --jsonl` for the long-lived harness protocol over standard input and output. See [`docs/HARNESS.md`](docs/HARNESS.md) for its versioned request and response contract.
+
 ## Local development
 
 Install the pinned development tools and run the local quality gate:
