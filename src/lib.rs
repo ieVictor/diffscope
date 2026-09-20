@@ -1,12 +1,17 @@
 pub mod analysis;
 pub mod application;
 pub mod git;
+pub mod harness;
 pub mod languages;
 pub mod metrics;
 pub mod output;
 pub mod result;
 
 pub use application::analyze;
+pub use harness::{
+    HarnessError, HarnessErrorCode, HarnessOutcome, HarnessRequest, HarnessResponse,
+    execute as execute_harness_request,
+};
 pub use result::{
     AnalysisResult, AnalysisSummary, Diagnostic, DiagnosticCode, DiagnosticCounts, FileResult,
     FunctionResult, RevisionResult, SCHEMA_VERSION,
