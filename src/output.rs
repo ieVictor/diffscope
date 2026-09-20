@@ -85,6 +85,10 @@ pub fn render_json(result: &AnalysisResult) -> Result<String, serde_json::Error>
     Ok(output)
 }
 
+pub(crate) fn json_value(result: &AnalysisResult) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(JsonResult::from(result))
+}
+
 fn push_line(output: &mut String, line: &str) {
     output.push_str(line);
     output.push('\n');

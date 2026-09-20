@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use diffscope::{AnalysisRequest, analyze, output};
+use diffscope::{AnalysisRequest, analyze, harness::jsonl, output};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,10 +15,12 @@ use diffscope::{AnalysisRequest, analyze, output};
 )]
 struct Cli {
     /// Base Git revision.
-    base: String,
+    #[arg(required_unless_present = "jsonl")]
+    base: Option<String>,
 
     /// Target Git revision.
-    target: String,
+    #[arg(required_unless_present = "jsonl")]
+    target: Option<String>,
 
     /// Repository path (a path inside the work tree is accepted).
     #[arg(short, long, default_value = ".")]
@@ -27,6 +29,10 @@ struct Cli {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     format: OutputFormat,
+
+    /// Serve the versioned JSONL harness protocol over stdin and stdout.
+    #[arg(long, conflicts_with_all = ["base", "target"])]
+    jsonl: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -46,10 +52,21 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if cli.jsonl {
+        return jsonl::serve(io::stdin().lock(), io::stdout().lock())
+            .map_err(|error| error.to_string());
+    }
+
+    let base_revision = cli
+        .base
+        .ok_or_else(|| "base revision is required".to_owned())?;
+    let target_revision = cli
+        .target
+        .ok_or_else(|| "target revision is required".to_owned())?;
     let result = analyze(&AnalysisRequest {
         repository_path: cli.repository,
-        base_revision: cli.base,
-        target_revision: cli.target,
+        base_revision,
+        target_revision,
     })
     .map_err(|error| error.to_string())?;
 

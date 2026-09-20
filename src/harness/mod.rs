@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use crate::{AnalysisRequest, AnalysisResult, analyze};
 
+pub mod jsonl;
+
 /// Transport-neutral request accepted by harness adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessRequest {
