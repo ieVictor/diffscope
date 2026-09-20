@@ -47,6 +47,16 @@ Complexity metrics are language-specific implementations of these shared concept
 - Recursion, labeled jumps, and other language-specific readability costs are documented per language before support is declared.
 - Nested functions are excluded from the enclosing function's cognitive complexity once separately identified.
 
+### TypeScript metric rules
+
+For schema version `1`, TypeScript and TSX functions calculate metrics from Tree-sitter function, method, constructor, and arrow-function nodes.
+
+- LOC is measured over the complete function node range.
+- Source LOC removes `//` line comments and `/* ... */` block comments before counting non-blank lines. Comment markers inside string and template literals are treated as source text.
+- Cyclomatic complexity starts at `1` and adds `1` for each `if`, `for`, `for...in/of`, `while`, `do...while`, `catch`, ternary expression, `case` clause, and short-circuit `&&`, `||`, or `??` binary expression.
+- Cognitive complexity adds `1 + nesting depth` for each `if`, loop, `catch`, ternary expression, and `case` clause. Short-circuit `&&`, `||`, and `??` add `1` without a nesting penalty.
+- Nested functions are not included in the enclosing function's cyclomatic or cognitive complexity.
+
 ## Function identity and matching
 
 - A function identity is composed of:
