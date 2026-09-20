@@ -1,7 +1,15 @@
 pub mod analysis;
+pub mod application;
 pub mod git;
 pub mod languages;
 pub mod metrics;
+pub mod result;
+
+pub use application::analyze;
+pub use result::{
+    AnalysisResult, AnalysisSummary, Diagnostic, DiagnosticCode, DiagnosticCounts, FileResult,
+    FunctionResult, RevisionResult, SCHEMA_VERSION,
+};
 
 use std::path::PathBuf;
 

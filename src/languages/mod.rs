@@ -60,7 +60,7 @@ pub enum LanguageDiagnosticCode {
     ParseError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticSeverity {
     Info,
     Warning,

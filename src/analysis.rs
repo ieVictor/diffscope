@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, path::Path};
 use crate::{
     BlobContent, DiffHunk, DiffScopeError, FileChange, FileStatus,
     languages::{
-        FunctionDefinition, FunctionKind, Language, LanguageDiagnostic, SourceRange, analyze_source,
+        DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
+        LanguageDiagnosticCode, SourceRange, analyze_source,
     },
     metrics::FunctionMetrics,
 };
@@ -39,14 +40,19 @@ pub enum FunctionChangeStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionMappingDiagnostic {
     pub code: FunctionMappingDiagnosticCode,
+    pub severity: DiagnosticSeverity,
     pub message: String,
+    pub range: Option<SourceRange>,
     pub qualified_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionMappingDiagnosticCode {
     AmbiguousFunctionMatch,
-    LanguageDiagnostic,
+    UnsupportedLanguage,
+    MalformedSource,
+    ParseError,
+    InvalidUtf8,
     BlobUnavailable,
 }
 
@@ -71,18 +77,10 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
     diagnostics.extend(language_diagnostics(&target_functions.diagnostics));
 
     if base_functions.unavailable {
-        diagnostics.push(FunctionMappingDiagnostic {
-            code: FunctionMappingDiagnosticCode::BlobUnavailable,
-            message: "base blob is unavailable for function mapping".to_owned(),
-            qualified_name: None,
-        });
+        diagnostics.push(unavailable_diagnostic("base"));
     }
     if target_functions.unavailable {
-        diagnostics.push(FunctionMappingDiagnostic {
-            code: FunctionMappingDiagnosticCode::BlobUnavailable,
-            message: "target blob is unavailable for function mapping".to_owned(),
-            qualified_name: None,
-        });
+        diagnostics.push(unavailable_diagnostic("target"));
     }
 
     let base_by_key = group_by_key(base_functions.functions);
@@ -102,11 +100,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
         let target: &[FunctionDefinition] = target_by_key.get(&key).map_or(&[], Vec::as_slice);
 
         if base.len() > 1 || target.len() > 1 {
-            diagnostics.push(FunctionMappingDiagnostic {
-                code: FunctionMappingDiagnosticCode::AmbiguousFunctionMatch,
-                message: "multiple functions share the same semantic identity".to_owned(),
-                qualified_name: Some(key.qualified_name),
-            });
+            diagnostics.push(ambiguous_diagnostic(key.qualified_name));
             continue;
         }
 
@@ -201,12 +195,43 @@ fn analyze_blob(path: Option<&str>, blob: &BlobContent) -> Result<BlobFunctions,
     }
 }
 
+fn unavailable_diagnostic(side: &str) -> FunctionMappingDiagnostic {
+    FunctionMappingDiagnostic {
+        code: FunctionMappingDiagnosticCode::BlobUnavailable,
+        severity: DiagnosticSeverity::Error,
+        message: format!("{side} blob is unavailable for function mapping"),
+        range: None,
+        qualified_name: None,
+    }
+}
+
+fn ambiguous_diagnostic(qualified_name: String) -> FunctionMappingDiagnostic {
+    FunctionMappingDiagnostic {
+        code: FunctionMappingDiagnosticCode::AmbiguousFunctionMatch,
+        severity: DiagnosticSeverity::Warning,
+        message: "multiple functions share the same semantic identity".to_owned(),
+        range: None,
+        qualified_name: Some(qualified_name),
+    }
+}
+
 fn language_diagnostics(diagnostics: &[LanguageDiagnostic]) -> Vec<FunctionMappingDiagnostic> {
     diagnostics
         .iter()
         .map(|diagnostic| FunctionMappingDiagnostic {
-            code: FunctionMappingDiagnosticCode::LanguageDiagnostic,
+            code: match diagnostic.code {
+                LanguageDiagnosticCode::UnsupportedLanguage => {
+                    FunctionMappingDiagnosticCode::UnsupportedLanguage
+                }
+                LanguageDiagnosticCode::InvalidUtf8 => FunctionMappingDiagnosticCode::InvalidUtf8,
+                LanguageDiagnosticCode::MalformedSource => {
+                    FunctionMappingDiagnosticCode::MalformedSource
+                }
+                LanguageDiagnosticCode::ParseError => FunctionMappingDiagnosticCode::ParseError,
+            },
+            severity: diagnostic.severity,
             message: diagnostic.message.clone(),
+            range: diagnostic.range.clone(),
             qualified_name: None,
         })
         .collect()
