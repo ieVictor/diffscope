@@ -3,12 +3,15 @@ use diffscope::{
     RevisionResult,
     languages::DiagnosticSeverity,
     output::{render_human, render_json},
+    result::SCHEMA_VERSION,
 };
 
+/// Version fields are rendered from the analysis itself, so the fixture uses
+/// the identifiers the crate reports instead of copies that drift from them.
 fn result() -> AnalysisResult {
     AnalysisResult {
-        schema_version: 1,
-        tool_version: "0.1.0".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         repository: "/repo".to_owned(),
         base: RevisionResult {
             id: "1111111".to_owned(),
@@ -78,11 +81,17 @@ fn human_output_matches_golden() {
 
 #[test]
 fn json_output_matches_golden() {
-    assert_eq!(
-        render_json(&result()).expect("JSON renders"),
-        r#"{
-  "schema_version": 1,
-  "tool_version": "0.1.0",
+    let expected = GOLDEN
+        .replace("__SCHEMA_VERSION__", &SCHEMA_VERSION.to_string())
+        .replace("__TOOL_VERSION__", env!("CARGO_PKG_VERSION"));
+    assert_eq!(render_json(&result()).expect("JSON renders"), expected);
+}
+
+/// The complete schema-versioned document the CLI and the adapter's `analyze`
+/// answer both emit, with the two version fields left to the crate.
+const GOLDEN: &str = r#"{
+  "schema_version": __SCHEMA_VERSION__,
+  "tool_version": "__TOOL_VERSION__",
   "repository": "/repo",
   "base": {
     "id": "1111111",
@@ -134,6 +143,4 @@ fn json_output_matches_golden() {
   ],
   "diagnostics": []
 }
-"#
-    );
-}
+"#;
