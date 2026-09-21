@@ -2,9 +2,13 @@ use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
+use std::path::PathBuf;
+
 use super::{HarnessErrorCode, HarnessOutcome, HarnessRequest, HarnessSession};
+use crate::AnalysisRequest;
 use crate::{
     analysis::FunctionChangeStatus,
+    imports::ImportIndex,
     output,
     query::{
         self, FileFilter, FunctionFilter, Page, classify::FileClassification, risk::RiskLevel,
@@ -92,6 +96,11 @@ fn process_line(session: &HarnessSession, line: &[u8]) -> WireResponse {
         }
     };
 
+    let analysis_request = AnalysisRequest {
+        repository_path: PathBuf::from(&request.repository),
+        base_revision: request.base.clone(),
+        target_revision: request.target.clone(),
+    };
     let response = session.execute(HarnessRequest {
         id: request.id,
         repository: request.repository,
@@ -112,8 +121,21 @@ fn process_line(session: &HarnessSession, line: &[u8]) -> WireResponse {
         HarnessOutcome::Success(result) => result,
     };
 
+    // The import graph is built only for the questions that use it, because it
+    // reads every source file of the revision rather than only the changed ones.
+    let index = if method.needs_import_graph() {
+        match session.import_index(&analysis_request) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                return WireResponse::error(Some(id), "analysis_failed", error.to_string());
+            }
+        }
+    } else {
+        None
+    };
+
     let params = request.params.unwrap_or_default();
-    match project(method, &result, &params) {
+    match project(method, &result, &params, index.as_deref()) {
         Ok(value) => WireResponse {
             protocol_version: PROTOCOL_VERSION,
             id: Some(id),
@@ -137,6 +159,17 @@ enum Method {
 }
 
 impl Method {
+    /// Whether answering this question needs the revision's import graph.
+    fn needs_import_graph(self) -> bool {
+        matches!(
+            self,
+            Self::ChangeSummary
+                | Self::ListChangedFiles
+                | Self::ListChangedFunctions
+                | Self::GetFunctionChange
+        )
+    }
+
     /// A request without a method asks for the complete analysis, which is what
     /// the protocol has always returned. Older clients therefore keep working
     /// unchanged.
@@ -174,21 +207,22 @@ fn project(
     method: Method,
     result: &AnalysisResult,
     params: &WireParams,
+    index: Option<&ImportIndex>,
 ) -> Result<serde_json::Value, ProjectionError> {
     let value = match method {
         Method::Analyze => {
             output::json_value(result).map_err(|error| serialization_failed(&error))?
         }
-        Method::ChangeSummary => to_value(&query::change_summary(result))
+        Method::ChangeSummary => to_value(&query::change_summary(result, index))
             .map_err(|error| serialization_failed(&error))?,
         Method::ListChangedFiles => {
             let filter = params.file_filter()?;
-            to_value(&query::list_changed_files(result, &filter))
+            to_value(&query::list_changed_files(result, &filter, index))
                 .map_err(|error| serialization_failed(&error))?
         }
         Method::ListChangedFunctions => {
             let filter = params.function_filter()?;
-            to_value(&query::list_changed_functions(result, &filter))
+            to_value(&query::list_changed_functions(result, &filter, index))
                 .map_err(|error| serialization_failed(&error))?
         }
         Method::GetFunctionChange => {
@@ -200,7 +234,7 @@ fn project(
                 .symbol
                 .as_deref()
                 .ok_or_else(|| invalid_params("`symbol` is required".to_owned()))?;
-            match query::get_function_change(result, file, symbol) {
+            match query::get_function_change(result, file, symbol, index) {
                 Ok(detail) => to_value(&detail).map_err(|error| serialization_failed(&error))?,
                 Err(unknown) => {
                     return Err(ProjectionError {

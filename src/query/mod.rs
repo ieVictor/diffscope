@@ -14,6 +14,7 @@
 //! free of serialization concerns, and renderers for it live in [`crate::output`].
 
 pub mod classify;
+pub mod impact;
 pub mod risk;
 
 use std::collections::BTreeMap;
@@ -23,6 +24,7 @@ use serde::Serialize;
 use crate::{
     DiffHunk,
     analysis::FunctionChangeStatus,
+    imports::ImportIndex,
     languages::{DiagnosticSeverity, SourceRange, symbol_id},
     metrics::FunctionMetrics,
     result::{AnalysisResult, Diagnostic, FileResult, FunctionResult},
@@ -200,7 +202,26 @@ pub struct ChangedFile<'a> {
     /// Names this change adds to and removes from the module's public surface.
     #[serde(skip_serializing_if = "ExportChange::is_empty")]
     pub exports: ExportChange<'a>,
+    /// What else in the revision reaches this file. Absent when the import
+    /// graph was not built, which is not the same as nothing reaching it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<ImpactView>,
     pub diagnostics: DiagnosticCounts,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactView {
+    pub direct_importers: u32,
+    pub nearby_importers: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_tests: Vec<RelatedTestView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedTestView {
+    pub file: String,
+    pub reason: &'static str,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -318,6 +339,9 @@ pub struct FunctionDetail<'a> {
     pub function: ChangedFunction<'a>,
     /// Hunks of the containing file that touch this function.
     pub hunks: Vec<HunkView>,
+    /// Tests likely to exercise this file, each saying how it was connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<ImpactView>,
     pub diagnostics: Vec<DiagnosticView<'a>>,
 }
 
@@ -359,7 +383,10 @@ pub struct UnknownFunction {
 
 /// Summarize the whole change, with a short ranked list to start from.
 #[must_use]
-pub fn change_summary(result: &AnalysisResult) -> ChangeSummary<'_> {
+pub fn change_summary<'a>(
+    result: &'a AnalysisResult,
+    index: Option<&ImportIndex>,
+) -> ChangeSummary<'a> {
     let mut files = FileCounts {
         changed: result.summary.changed_files,
         supported: result.summary.supported_files,
@@ -382,7 +409,7 @@ pub fn change_summary(result: &AnalysisResult) -> ChangeSummary<'_> {
 
         let area_name = change_area(path);
         let complexity = aggregate_complexity(file);
-        let risk = file_risk(file, classification);
+        let risk = file_risk(file, classification, direct_importers(index, path));
         let area = areas.entry(area_name.clone()).or_insert(ChangeArea {
             name: area_name,
             files: 0,
@@ -407,7 +434,7 @@ pub fn change_summary(result: &AnalysisResult) -> ChangeSummary<'_> {
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let review_candidates = ranked_functions(result, &FunctionFilter::default())
+    let review_candidates = ranked_functions(result, &FunctionFilter::default(), index)
         .into_iter()
         .take(SUMMARY_CANDIDATES)
         .map(|function| ReviewCandidate {
@@ -449,7 +476,11 @@ pub fn change_summary(result: &AnalysisResult) -> ChangeSummary<'_> {
 
 /// List changed files, most in need of review first.
 #[must_use]
-pub fn list_changed_files<'a>(result: &'a AnalysisResult, filter: &FileFilter) -> FileList<'a> {
+pub fn list_changed_files<'a>(
+    result: &'a AnalysisResult,
+    filter: &FileFilter,
+    index: Option<&ImportIndex>,
+) -> FileList<'a> {
     let mut rows = result
         .files
         .iter()
@@ -462,7 +493,7 @@ pub fn list_changed_files<'a>(result: &'a AnalysisResult, filter: &FileFilter) -
             {
                 return None;
             }
-            let risk = file_risk(file, classification);
+            let risk = file_risk(file, classification, direct_importers(index, path));
             if filter.minimum_risk.is_some_and(|minimum| risk < minimum) {
                 return None;
             }
@@ -491,6 +522,7 @@ pub fn list_changed_files<'a>(result: &'a AnalysisResult, filter: &FileFilter) -
                     added: file.exports_added.iter().map(String::as_str).collect(),
                     removed: file.exports_removed.iter().map(String::as_str).collect(),
                 },
+                impact: index.map(|index| impact_view(index, path)),
                 diagnostics: diagnostic_counts(&file.diagnostics),
             })
         })
@@ -515,8 +547,9 @@ pub fn list_changed_files<'a>(result: &'a AnalysisResult, filter: &FileFilter) -
 pub fn list_changed_functions<'a>(
     result: &'a AnalysisResult,
     filter: &FunctionFilter,
+    index: Option<&ImportIndex>,
 ) -> FunctionList<'a> {
-    let (functions, page) = paginate(ranked_functions(result, filter), &filter.page);
+    let (functions, page) = paginate(ranked_functions(result, filter, index), &filter.page);
     FunctionList { functions, page }
 }
 
@@ -530,6 +563,7 @@ pub fn get_function_change<'a>(
     result: &'a AnalysisResult,
     file_path: &str,
     symbol: &str,
+    index: Option<&ImportIndex>,
 ) -> Result<FunctionDetail<'a>, UnknownFunction> {
     let file = result
         .files
@@ -546,6 +580,7 @@ pub fn get_function_change<'a>(
 
     let path = display_path(file);
     let classification = classify::classify(path);
+    let importers = direct_importers(index, path);
     let found = file.functions.iter().find(|function| {
         symbol_id(function.kind, &function.qualified_name) == symbol
             || function.qualified_name == symbol
@@ -565,6 +600,7 @@ pub fn get_function_change<'a>(
 
     Ok(FunctionDetail {
         hunks: touching_hunks(file, function),
+        impact: index.map(|index| impact_view(index, path)),
         diagnostics: file
             .diagnostics
             .iter()
@@ -577,7 +613,7 @@ pub fn get_function_change<'a>(
             .chain(function.diagnostics.iter())
             .map(DiagnosticView::from)
             .collect(),
-        function: changed_function(path, classification, file, function),
+        function: changed_function(path, classification, file, function, importers),
     })
 }
 
@@ -679,8 +715,35 @@ fn aggregate_complexity(file: &FileResult) -> AggregateComplexity {
     total
 }
 
+/// Project one file's reach into the response shape.
+fn impact_view(index: &ImportIndex, path: &str) -> ImpactView {
+    let reach = impact::for_file(index, path);
+    ImpactView {
+        direct_importers: reach.direct_importers,
+        nearby_importers: reach.nearby_importers,
+        related_tests: reach
+            .related_tests
+            .into_iter()
+            .map(|test| RelatedTestView {
+                file: test.file,
+                reason: test.link.reason(),
+                confidence: test.link.confidence(),
+            })
+            .collect(),
+    }
+}
+
+/// How many modules import a path directly, when an index is available.
+fn direct_importers(index: Option<&ImportIndex>, path: &str) -> Option<u32> {
+    index.map(|index| u32::try_from(index.importers(path).len()).unwrap_or(u32::MAX))
+}
+
 /// A file is as risky as the riskiest function changed inside it.
-fn file_risk(file: &FileResult, classification: FileClassification) -> RiskLevel {
+fn file_risk(
+    file: &FileResult,
+    classification: FileClassification,
+    importers: Option<u32>,
+) -> RiskLevel {
     file.functions
         .iter()
         .filter(|function| function.status != FunctionChangeStatus::Unchanged)
@@ -689,6 +752,7 @@ fn file_risk(file: &FileResult, classification: FileClassification) -> RiskLevel
                 function,
                 classification,
                 export_status(file, function),
+                importers,
             ))
             .level
         })
@@ -700,6 +764,7 @@ fn signals_for(
     function: &FunctionResult,
     classification: FileClassification,
     exported: ExportStatus,
+    direct_importers: Option<u32>,
 ) -> RiskSignals {
     let before = function.metrics_before.as_ref();
     let after = function.metrics_after.as_ref();
@@ -712,6 +777,7 @@ fn signals_for(
         churned_lines: function.churn.lines_added + function.churn.lines_removed,
         match_confidence: function.match_confidence,
         exported,
+        direct_importers,
     }
 }
 
@@ -750,6 +816,7 @@ fn delta(
 fn ranked_functions<'a>(
     result: &'a AnalysisResult,
     filter: &FunctionFilter,
+    index: Option<&ImportIndex>,
 ) -> Vec<ChangedFunction<'a>> {
     let mut rows = Vec::new();
     for file in &result.files {
@@ -764,6 +831,7 @@ fn ranked_functions<'a>(
         {
             continue;
         }
+        let importers = direct_importers(index, path);
 
         for function in &file.functions {
             if !filter.include_unchanged && function.status == FunctionChangeStatus::Unchanged {
@@ -775,7 +843,7 @@ fn ranked_functions<'a>(
             {
                 continue;
             }
-            let row = changed_function(path, classification, file, function);
+            let row = changed_function(path, classification, file, function, importers);
             if filter
                 .minimum_risk
                 .is_some_and(|minimum| RiskLevel::parse(row.risk.level) < Some(minimum))
@@ -823,6 +891,7 @@ fn changed_function<'a>(
     classification: FileClassification,
     file: &FileResult,
     function: &'a FunctionResult,
+    importers: Option<u32>,
 ) -> ChangedFunction<'a> {
     let before = function.metrics_before.as_ref();
     let after = function.metrics_after.as_ref();
@@ -830,6 +899,7 @@ fn changed_function<'a>(
         function,
         classification,
         export_status(file, function),
+        importers,
     ));
     ChangedFunction {
         file: path,

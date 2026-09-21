@@ -36,8 +36,8 @@ pub struct ImportIndex {
     truncated: BTreeSet<String>,
     /// Specifiers that named no file in this revision, such as npm packages.
     unresolved: u32,
-    /// Files whose imports were read.
-    scanned: u32,
+    /// Every source file scanned, whether or not it takes part in an edge.
+    files: BTreeSet<String>,
 }
 
 impl ImportIndex {
@@ -87,9 +87,15 @@ impl ImportIndex {
         &self.truncated
     }
 
+    /// Every source file this index covers.
+    #[must_use]
+    pub fn files(&self) -> &BTreeSet<String> {
+        &self.files
+    }
+
     #[must_use]
     pub fn scanned_files(&self) -> u32 {
-        self.scanned
+        u32::try_from(self.files.len()).unwrap_or(u32::MAX)
     }
 
     #[must_use]
@@ -137,7 +143,7 @@ pub fn index_revision(
             continue;
         };
         let scan = scanner.scan(std::path::Path::new(&entry.path), source)?;
-        index.scanned += 1;
+        index.files.insert(entry.path.clone());
         if scan.truncated {
             index.truncated.insert(entry.path.clone());
         }

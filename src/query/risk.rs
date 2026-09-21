@@ -62,6 +62,9 @@ pub struct RiskSignals {
     pub churned_lines: u32,
     pub match_confidence: MatchConfidence,
     pub exported: ExportStatus,
+    /// Modules importing this function's file directly, when the import graph
+    /// is available. `None` means it was not built, not that nothing imports it.
+    pub direct_importers: Option<u32>,
 }
 
 /// What the change did to this function's name in the module's exports.
@@ -133,6 +136,15 @@ pub fn assess(signals: &RiskSignals) -> RiskAssessment {
         ),
         ExportStatus::Added => add(1, "newly part of the module's public surface".to_owned()),
         ExportStatus::Unchanged => {}
+    }
+    match signals.direct_importers {
+        Some(importers) if importers >= 20 => {
+            add(2, format!("imported directly by {importers} modules"));
+        }
+        Some(importers) if importers >= 5 => {
+            add(1, format!("imported directly by {importers} modules"));
+        }
+        _ => {}
     }
     if signals.classification.is_source() {
         add(1, "production source file".to_owned());

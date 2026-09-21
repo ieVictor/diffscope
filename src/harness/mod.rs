@@ -1,10 +1,12 @@
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use crate::{AnalysisRequest, AnalysisResult, DiffScopeError, analyze, git};
+use crate::{
+    AnalysisRequest, AnalysisResult, DiffScopeError, analyze, git, imports, imports::ImportIndex,
+};
 
 pub mod jsonl;
 
@@ -55,6 +57,12 @@ const MAX_CACHED_ANALYSES: usize = 4;
 /// the bulk of a result, so they stand in for its size.
 const MAX_CACHED_FUNCTIONS: usize = 200_000;
 
+/// Import graphs retained for reuse.
+///
+/// A graph is far smaller than an analysis, holding one entry per source file
+/// rather than one per function, so a few cost little.
+const MAX_CACHED_INDEXES: usize = 4;
+
 /// A long-lived harness process that reuses analyses between requests.
 ///
 /// Entries are keyed by the commits the two revisions resolve to, never by the
@@ -65,6 +73,13 @@ const MAX_CACHED_FUNCTIONS: usize = 200_000;
 #[derive(Default)]
 pub struct HarnessSession {
     cached: Mutex<VecDeque<CacheEntry>>,
+    indexes: Mutex<VecDeque<IndexEntry>>,
+}
+
+struct IndexEntry {
+    repository_root: PathBuf,
+    commit: String,
+    index: Arc<ImportIndex>,
 }
 
 struct CacheEntry {
@@ -114,6 +129,55 @@ impl HarnessSession {
         let result = Arc::new(analyze(request)?);
         self.store(key, &result);
         Ok(result)
+    }
+
+    /// Build, or reuse, the import graph of a comparison's target revision.
+    ///
+    /// The graph describes one revision, not a comparison, so it is keyed by
+    /// the target commit alone: every comparison that ends at the same commit
+    /// shares one index, however many different bases they start from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository or target revision cannot be
+    /// resolved, or when Git cannot list or read the tree.
+    pub fn import_index(
+        &self,
+        request: &AnalysisRequest,
+    ) -> Result<Arc<ImportIndex>, DiffScopeError> {
+        let repository = git::Repository::open(&request.repository_path)?;
+        let root = repository.root().to_path_buf();
+        let commit = repository
+            .resolve_revision(&request.target_revision)?
+            .commit_id;
+
+        if let Some(cached) = self.take_index(&root, &commit) {
+            return Ok(cached);
+        }
+
+        let index = Arc::new(imports::index_revision(&repository, &commit)?);
+        let mut indexes = lock(&self.indexes);
+        indexes.retain(|entry| entry.repository_root != root || entry.commit != commit);
+        indexes.push_back(IndexEntry {
+            repository_root: root,
+            commit,
+            index: Arc::clone(&index),
+        });
+        while indexes.len() > MAX_CACHED_INDEXES {
+            let _evicted = indexes.pop_front();
+        }
+        Ok(index)
+    }
+
+    fn take_index(&self, root: &Path, commit: &str) -> Option<Arc<ImportIndex>> {
+        let mut indexes = lock(&self.indexes);
+        let position = indexes
+            .iter()
+            .position(|entry| entry.repository_root == root && entry.commit == commit)?;
+        let entry = indexes.remove(position)?;
+        let index = Arc::clone(&entry.index);
+        indexes.push_back(entry);
+        Some(index)
     }
 
     fn take_cached(&self, key: &CacheKey) -> Option<Arc<AnalysisResult>> {
