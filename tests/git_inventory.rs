@@ -1,6 +1,9 @@
 use std::{fs, path::Path, process::Command};
 
-use diffscope::{AnalysisRequest, BlobContent, FileStatus, inventory_changes};
+use diffscope::{
+    AnalysisRequest, BlobContent, DiagnosticCode, FileStatus, analysis::FunctionChangeStatus,
+    analyze, inventory_changes,
+};
 
 #[test]
 fn inventories_added_modified_deleted_renamed_and_binary_files() {
@@ -65,6 +68,117 @@ fn inventories_added_modified_deleted_renamed_and_binary_files() {
     assert_eq!(binary.status, FileStatus::Binary);
     assert!(matches!(binary.base_blob, BlobContent::Binary));
     assert!(matches!(binary.target_blob, BlobContent::Binary));
+}
+
+#[test]
+fn renamed_files_report_the_rename_delta_and_keep_untouched_functions_unchanged() {
+    let repo = TestRepo::new("rename_delta");
+    repo.git(["init"]);
+    repo.git(["config", "user.email", "diffscope@example.invalid"]);
+    repo.git(["config", "user.name", "DiffScope"]);
+
+    repo.write(
+        "before.ts",
+        "export function untouched(value: number): number {\n  return value * 3;\n}\n\nexport function edited(value: number): number {\n  return value + 1;\n}\n",
+    );
+    repo.git(["add", "."]);
+    repo.git(["commit", "-m", "base"]);
+    let base = repo.rev_parse("HEAD");
+
+    fs::remove_file(repo.path().join("before.ts")).expect("remove renamed fixture source");
+    repo.write(
+        "after.ts",
+        "export function untouched(value: number): number {\n  return value * 3;\n}\n\nexport function edited(value: number): number {\n  return value + 2;\n}\n",
+    );
+    repo.git(["add", "-A"]);
+    repo.git(["commit", "-m", "target"]);
+    let target = repo.rev_parse("HEAD");
+
+    let request = AnalysisRequest {
+        repository_path: repo.path().to_path_buf(),
+        base_revision: base,
+        target_revision: target,
+    };
+
+    let inventory = inventory_changes(&request).expect("inventory succeeds");
+    let renamed = find(&inventory.files, "after.ts");
+    assert_eq!(renamed.status, FileStatus::Renamed);
+    assert_eq!(renamed.base_path.as_deref(), Some("before.ts"));
+    assert_eq!(renamed.added_lines, 1);
+    assert_eq!(renamed.removed_lines, 1);
+    assert_eq!(renamed.hunks.len(), 1);
+    assert_eq!(inventory.summary.added_lines, 1);
+    assert_eq!(inventory.summary.removed_lines, 1);
+
+    let result = analyze(&request).expect("analysis succeeds");
+    let file = result
+        .files
+        .iter()
+        .find(|file| file.target_path.as_deref() == Some("after.ts"))
+        .expect("renamed file is analyzed");
+    let status_of = |name: &str| {
+        file.functions
+            .iter()
+            .find(|function| function.qualified_name == name)
+            .map_or_else(
+                || panic!("missing function {name}"),
+                |function| function.status,
+            )
+    };
+
+    assert_eq!(status_of("untouched"), FunctionChangeStatus::Unchanged);
+    assert_eq!(status_of("edited"), FunctionChangeStatus::Modified);
+}
+
+#[test]
+fn non_utf8_file_content_reports_a_diagnostic_instead_of_failing() {
+    let repo = TestRepo::new("non_utf8_content");
+    repo.git(["init"]);
+    repo.git(["config", "user.email", "diffscope@example.invalid"]);
+    repo.git(["config", "user.name", "DiffScope"]);
+
+    repo.write(
+        "kept.ts",
+        "export function kept(): number {\n  return 1;\n}\n",
+    );
+    repo.git(["add", "."]);
+    repo.git(["commit", "-m", "base"]);
+    let base = repo.rev_parse("HEAD");
+
+    let mut latin1 = b"export function latin(): string {\n  return \"".to_vec();
+    latin1.extend_from_slice(&[0xe9]);
+    latin1.extend_from_slice(b"\";\n}\n");
+    repo.write_bytes("latin1.ts", &latin1);
+    repo.git(["add", "-A"]);
+    repo.git(["commit", "-m", "target"]);
+    let target = repo.rev_parse("HEAD");
+
+    let request = AnalysisRequest {
+        repository_path: repo.path().to_path_buf(),
+        base_revision: base,
+        target_revision: target,
+    };
+
+    let inventory =
+        inventory_changes(&request).expect("inventory succeeds despite non-UTF-8 content");
+    let file = find(&inventory.files, "latin1.ts");
+    assert_eq!(file.status, FileStatus::Added);
+    assert_eq!(file.added_lines, 3);
+
+    let result = analyze(&request).expect("analysis succeeds despite non-UTF-8 content");
+    let analyzed = result
+        .files
+        .iter()
+        .find(|file| file.target_path.as_deref() == Some("latin1.ts"))
+        .expect("non-UTF-8 file is inventoried");
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::InvalidUtf8),
+        "expected an invalid_utf8 diagnostic, got {:?}",
+        analyzed.diagnostics
+    );
 }
 
 fn find<'a>(files: &'a [diffscope::FileChange], path: &str) -> &'a diffscope::FileChange {
