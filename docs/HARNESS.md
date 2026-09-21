@@ -35,6 +35,8 @@ The process reads one request per line from standard input and writes and flushe
 | `get_function_change` | One function, with its hunks and diagnostics. Requires `file` and `symbol`. |
 | `get_analysis_diagnostics` | Diagnostics, optionally for one `file`. |
 
+Every method but `get_analysis_diagnostics` and `analyze` also reports what each changed file reaches: how many modules import it, and the tests likely to cover it. That comes from an index of the target revision's module graph, which is built on first use and reused, so those methods cost more on a comparison's first query. [`DEFINITIONS.md`](DEFINITIONS.md) defines how the graph is built and what "related" means.
+
 `params` accepts `file`, `symbol`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`, and `offset`. Parameters that do not apply to the method are unused; an unknown parameter is rejected rather than ignored. [`DEFINITIONS.md`](DEFINITIONS.md) defines what each query returns and how results are ranked.
 
 A whole analysis of a 49-file diff exceeds 1 MB, most of it functions the change did not touch. The same comparison answers `get_change_summary` in under 10 KB. Prefer a query, then narrow, rather than retrieving everything.
@@ -45,7 +47,9 @@ The adapter is long-lived and keeps a small number of recent analyses, so the us
 
 Entries are keyed by the commits the two revisions resolve to, never by the revision names. `HEAD` and a branch name point at different commits over time, so caching against a name would serve a stale analysis after the branch moved; a commit is immutable. Resolving the two names costs one `rev-parse` each, against an analysis that costs orders of magnitude more.
 
-Reuse is not observable in results: a reused analysis answers identically to a fresh one. Measured on the corpus in [`PERFORMANCE.md`](PERFORMANCE.md), the first query of a comparison takes 114 ms and each later query of the same comparison 2.5 ms.
+The import graph is cached separately and keyed by the target commit alone, because it describes one revision rather than a comparison: every comparison ending at the same commit shares one graph, however many bases they start from.
+
+Reuse is not observable in results: a reused analysis answers identically to a fresh one. Measured on the corpus in [`PERFORMANCE.md`](PERFORMANCE.md), a comparison's first query costs 114 ms without the import graph and 540 ms with it; later queries of the same comparison cost 2.5 ms and 9.3 ms.
 
 ## Success response
 

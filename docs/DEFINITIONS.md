@@ -123,6 +123,22 @@ Ordering resolves overlap deliberately: a snapshot under `__tests__` is `generat
 
 These are heuristics over naming conventions, not facts about a project. Every result carries its classification, so a caller that disagrees can rank on the underlying numbers instead.
 
+## Import graph
+
+Everything above describes files a diff contains. What a change reaches is a question about files it does not contain, so it is answered from an index of the target revision's module graph.
+
+- Every source file in the target tree is scanned for the specifiers it imports or re-exports. Dynamic `import(...)` is not followed: its argument need not be a literal, and guessing at one would invent edges.
+- Only each file's import region is parsed. An import statement's specifier follows the last `import` or `from` token in the statement, so the file is read up to that token plus 512 bytes. On a real Vue revision this recovers every import of all 491 TypeScript files while parsing 56% of their bytes. A file is additionally capped at 64 KiB and reports that it was cut, so an edge is never silently missing.
+- Specifiers resolve against the paths actually present in the revision, trying `.ts`, `.tsx`, `.mts`, `.cts`, `.d.ts`, `.js`, and `.jsx`, then `index` inside a directory.
+- `compilerOptions.paths` from the revision's `tsconfig.json` is applied, longest pattern first. In a monorepo most cross-package imports are written through these aliases — 18.4% of a Vue revision's specifiers are `@vue/*` — and without them every cross-package edge disappears. The file is read with comments and trailing commas tolerated, because TypeScript accepts both. A missing or malformed config yields no aliases rather than an error.
+- A specifier that resolves to nothing is external, almost always an installed package. It is counted, not guessed at.
+
+### Related tests
+
+A test is offered as related to a changed file when it **imports that file directly** (confidence `0.9`) or when its **name matches** the file's, after extensions and test suffixes are removed (confidence `0.8`). Each result states which rule found it.
+
+Indirect imports are deliberately not offered. Through a package's barrel module almost every test reaches almost every file: on a real Vue revision one shared utility is reached by 166 modules within two hops, and the tests that surface are the compiler's, not the utility's. That reach is still reported, as `nearby_importers`, because a large number is itself a useful signal that a file is widely re-exported.
+
 ## Risk
 
 Risk ranks changed functions by how much review attention they are likely to need. It is a ranking aid: it does not judge whether code is good, and it cannot know what a change was for.
@@ -138,6 +154,7 @@ Each rule that applies contributes points and one reason:
 | 1 | An added function whose cognitive complexity is already at least 10. |
 | 3 | The function's name is no longer exported. |
 | 1 | The function's name is newly exported. |
+| 2 / 1 | The file is imported directly by at least 20 / 5 modules. |
 | 1 | The file is classified `source`. |
 
 A score of 5 or more is `high`, 2 or more is `medium`, and anything else is `low`. A match confidence below `1.0` adds a reason but no points, because uncertainty about identity is not by itself a reason to review.

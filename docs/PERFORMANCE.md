@@ -71,6 +71,27 @@ Measured on the Vue comparison below, driving `diffscope --jsonl` with a batch o
 
 The first query pays for the analysis; each later query of the same comparison costs about 2.5 ms, roughly 45 times less. Reuse is bounded by entry count and by the function records retained across entries, and it is not observable in results: a test asserts that a reused analysis answers identically to a fresh one.
 
+## Import graph cost
+
+The graph is built over a whole revision, so it is measured separately. On the Vue target revision below (702 files, 491 TypeScript, 4.2 MiB):
+
+| Phase | Time |
+| --- | ---: |
+| `ls-tree` | 2.7 ms |
+| `cat-file --batch`, 488 blobs | 21.7 ms |
+| parse and scan imports | 381.5 ms |
+| resolve specifiers | ~30 ms |
+| **whole index** | **412 ms** |
+
+Parsing dominates, which is why only each file's import region is read. Parsing the files whole costs 676 ms for the same 1,920 specifiers, so the bounded prefix saves 44% and loses no edge. Anchoring more tightly, on a quoted `from '`, would parse 20% of the bytes instead of 56%, but loses one file's imports; the index is built once per revision and cached, so the cheaper anchor is not worth an edge that silently does not exist.
+
+Queries that use the graph therefore cost more on a comparison's first request:
+
+| Requests, one comparison | Median | Marginal per extra query |
+| --- | ---: | ---: |
+| 1 query, with import graph | 539.7 ms | — |
+| 5 queries, with import graph | 576.7 ms | 9.27 ms |
+
 Response size is the reason the queries exist. For the same 49-file Vue comparison:
 
 | Response | Bytes |

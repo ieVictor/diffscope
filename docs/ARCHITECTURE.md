@@ -29,6 +29,8 @@ CLI / harness adapters
 - **Application layer:** Coordinates revision resolution, analysis, and result generation.
 - **Git adapter:** Reads revisions, diffs, renames, hunks, and blobs without modifying the working tree.
 - **Language analyzers:** Use Tree-sitter grammars and language-specific rules to identify functions and calculate metrics.
+- **Import index:** Resolves each revision's module graph, so a change can be related to the files and tests that reach it.
+- **Query layer:** Projects one analysis into the answer a caller asked for. It filters, ranks, and scores; it performs no analysis of its own.
 - **Interfaces:** The CLI and harness adapters translate inputs and outputs without implementing analysis logic.
 
 Dependencies point inward: interfaces and infrastructure depend on the core, never the reverse.
@@ -46,7 +48,11 @@ Dependencies point inward: interfaces and infrastructure depend on the core, nev
 
 ## Performance model
 
-- Analyze only affected files and functions.
+- Analyze only affected files and functions. The import graph is the one
+  deliberate exception: "what breaks if this changes?" is a question about the
+  files a diff does not contain, so that index is built over a whole revision.
+  It parses only each file's import region, is keyed by the commit it
+  describes, and is built only for the queries that use it.
 - Read blobs directly from Git; do not create temporary checkouts.
 - Process independent files in parallel.
 - Cache analysis by blob identity, language, and analyzer version when measurement justifies it.
