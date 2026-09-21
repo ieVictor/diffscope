@@ -151,19 +151,19 @@ impl Repository {
         files: &mut [FileChange],
     ) -> Result<(), DiffScopeError> {
         for file in &mut *files {
-            let path = file
-                .target_path
-                .as_ref()
-                .or(file.base_path.as_ref())
-                .ok_or_else(|| {
-                    DiffScopeError::InvalidGitOutput("file change without any path".to_owned())
-                })?;
+            let (hunks, is_binary) = {
+                let pathspec = diff_pathspec(file)?;
+                (
+                    self.diff_hunks(base_commit, target_commit, pathspec)?,
+                    self.is_binary(base_commit, target_commit, pathspec)?,
+                )
+            };
 
-            file.hunks = self.diff_hunks(base_commit, target_commit, path)?;
+            file.hunks = hunks;
             file.added_lines = file.hunks.iter().map(|hunk| hunk.added_lines).sum();
             file.removed_lines = file.hunks.iter().map(|hunk| hunk.removed_lines).sum();
 
-            if self.is_binary(base_commit, target_commit, path)? {
+            if is_binary {
                 file.status = FileStatus::Binary;
                 file.base_blob = blob_content_for_binary(file.old_blob_id.as_deref());
                 file.target_blob = blob_content_for_binary(file.new_blob_id.as_deref());
@@ -185,17 +185,33 @@ impl Repository {
         &self,
         base_commit: &str,
         target_commit: &str,
-        path: &str,
+        pathspec: DiffPathspec<'_>,
     ) -> Result<Vec<DiffHunk>, DiffScopeError> {
-        let output = self.git_lossy([
-            "diff",
-            "--unified=0",
-            "--no-ext-diff",
-            base_commit,
-            target_commit,
-            "--",
-            path,
-        ])?;
+        let output = match pathspec {
+            DiffPathspec::Single(path) => self.git_lossy([
+                "diff",
+                "--unified=0",
+                "--no-ext-diff",
+                base_commit,
+                target_commit,
+                "--",
+                path,
+            ])?,
+            DiffPathspec::Rename {
+                base_path,
+                target_path,
+            } => self.git_lossy([
+                "diff",
+                "--unified=0",
+                "--no-ext-diff",
+                "--find-renames",
+                base_commit,
+                target_commit,
+                "--",
+                base_path,
+                target_path,
+            ])?,
+        };
         parse_hunks(&output)
     }
 
@@ -203,10 +219,26 @@ impl Repository {
         &self,
         base_commit: &str,
         target_commit: &str,
-        path: &str,
+        pathspec: DiffPathspec<'_>,
     ) -> Result<bool, DiffScopeError> {
-        let output =
-            self.git_lossy(["diff", "--numstat", base_commit, target_commit, "--", path])?;
+        let output = match pathspec {
+            DiffPathspec::Single(path) => {
+                self.git_lossy(["diff", "--numstat", base_commit, target_commit, "--", path])?
+            }
+            DiffPathspec::Rename {
+                base_path,
+                target_path,
+            } => self.git_lossy([
+                "diff",
+                "--numstat",
+                "--find-renames",
+                base_commit,
+                target_commit,
+                "--",
+                base_path,
+                target_path,
+            ])?,
+        };
         Ok(output.lines().any(|line| line.starts_with("-\t-\t")))
     }
 
@@ -326,6 +358,37 @@ fn run_git_bytes<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Vec<u8>,
             command: format!("git {}", args.join(" ")),
             message,
         })
+    }
+}
+
+/// Path arguments that restrict a per-file diff to one changed file.
+///
+/// A rename must name both endpoints so that Git pairs them again inside the
+/// restricted pathspec. Diffing only the target path reports a rename as a
+/// whole-file addition.
+#[derive(Debug, Clone, Copy)]
+enum DiffPathspec<'a> {
+    Single(&'a str),
+    Rename {
+        base_path: &'a str,
+        target_path: &'a str,
+    },
+}
+
+fn diff_pathspec(file: &FileChange) -> Result<DiffPathspec<'_>, DiffScopeError> {
+    match (
+        file.status,
+        file.base_path.as_deref(),
+        file.target_path.as_deref(),
+    ) {
+        (FileStatus::Renamed, Some(base_path), Some(target_path)) => Ok(DiffPathspec::Rename {
+            base_path,
+            target_path,
+        }),
+        (_, _, Some(path)) | (_, Some(path), None) => Ok(DiffPathspec::Single(path)),
+        (_, None, None) => Err(DiffScopeError::InvalidGitOutput(
+            "file change without any path".to_owned(),
+        )),
     }
 }
 
