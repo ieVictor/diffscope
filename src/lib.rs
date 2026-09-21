@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod application;
 pub mod git;
 pub mod harness;
+pub mod imports;
 pub mod languages;
 pub mod metrics;
 pub mod output;
@@ -34,6 +35,13 @@ pub struct ChangeInventory {
     pub target: ResolvedRevision,
     pub files: Vec<FileChange>,
     pub summary: ChangeSummary,
+}
+
+/// One blob reachable from a commit's tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub object_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

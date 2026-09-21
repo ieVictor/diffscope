@@ -524,6 +524,50 @@ fn is_short_circuit_operator(node: Node<'_>) -> bool {
         .any(|child| matches!(child.kind(), "&&" | "||" | "??"))
 }
 
+impl TypeScriptAnalyzer {
+    /// Collect the module specifiers a source prefix imports or re-exports.
+    ///
+    /// The input may be a truncated file, so the tree is expected to contain
+    /// errors near its end. Tree-sitter still yields the statements it did
+    /// parse, which is every import that fitted in the prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tree-sitter does not produce a syntax tree.
+    pub fn scan_imports(&mut self, source: &[u8]) -> Result<BTreeSet<String>, DiffScopeError> {
+        let Ok(source_text) = std::str::from_utf8(source) else {
+            return Ok(BTreeSet::new());
+        };
+        let tree = self
+            .parser
+            .parse(source_text, None)
+            .ok_or_else(|| DiffScopeError::Language("tree-sitter returned no tree".to_owned()))?;
+
+        let mut specifiers = BTreeSet::new();
+        collect_specifiers(tree.root_node(), source_text, &mut specifiers);
+        Ok(specifiers)
+    }
+}
+
+/// Walk for the `source` of every import and re-export statement.
+///
+/// A plain `export { a }` has no source and adds no edge; only a statement that
+/// names another module does. Dynamic `import(...)` is deliberately not
+/// followed: its argument is an expression that need not be a literal, and
+/// guessing at one would invent edges that may not exist.
+fn collect_specifiers(node: Node<'_>, source: &str, specifiers: &mut BTreeSet<String>) {
+    if matches!(node.kind(), "import_statement" | "export_statement")
+        && let Some(module) = node.child_by_field_name("source")
+        && let Some(text) = node_text(module, source)
+    {
+        specifiers.insert(text.trim_matches(['\'', '"', '`']).to_owned());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_specifiers(child, source, specifiers);
+    }
+}
+
 /// Collect the names a module exports, as an importer would write them.
 ///
 /// Only the export surface is described, never what the exported thing is: a

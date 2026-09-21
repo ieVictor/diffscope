@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     BlobContent, ChangeInventory, ChangeSummary, DiffHunk, DiffScopeError, FileChange, FileStatus,
-    ResolvedRevision,
+    ResolvedRevision, TreeEntry,
 };
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -249,6 +249,55 @@ impl Repository {
             .flatten()
             .filter(|oid| *oid != ZERO_OID)
             .collect::<BTreeSet<_>>();
+        self.load_objects(&object_ids)
+    }
+
+    /// List every blob reachable from a commit's tree.
+    ///
+    /// Used to index a whole revision, which is the only way to answer what
+    /// imports a changed file: that question is about files the diff does not
+    /// contain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot list the tree or emits a record that
+    /// does not match the documented `ls-tree` format.
+    pub fn list_tree(&self, commit: &str) -> Result<Vec<TreeEntry>, DiffScopeError> {
+        let output = self.git_bytes([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--format=%(objectname) %(path)",
+            commit,
+        ])?;
+        let mut entries = Vec::new();
+        for record in split_nul(&output) {
+            if record.is_empty() {
+                continue;
+            }
+            let record = utf8(record, "ls-tree record")?;
+            let (object_id, path) = record.split_once(' ').ok_or_else(|| {
+                DiffScopeError::InvalidGitOutput(format!("ls-tree record has no path: {record}"))
+            })?;
+            entries.push(TreeEntry {
+                object_id: object_id.to_owned(),
+                path: path.to_owned(),
+            });
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    /// Read the contents of the named objects in one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot be run or its batch output does not
+    /// match the documented format.
+    pub fn load_objects(
+        &self,
+        object_ids: &BTreeSet<&str>,
+    ) -> Result<HashMap<String, BlobContent>, DiffScopeError> {
         if object_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -300,7 +349,7 @@ impl Repository {
                 command: "git cat-file --batch".to_owned(),
                 message: error.to_string(),
             })?;
-        parse_batch_blobs(&output.stdout, &object_ids)
+        parse_batch_blobs(&output.stdout, object_ids)
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<String, DiffScopeError> {
