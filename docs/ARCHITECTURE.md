@@ -26,15 +26,17 @@ CLI / harness adapters
     └── Query projections (query envelope schema v2)
          ├── Deterministic analysis identity
          ├── Risk and review-priority scoring
-         └── Cursor pagination
+         ├── Cursor pagination
+         └── Change-impact graph with dependency-diff and Mermaid renderings
 ```
 
 - **Core analysis:** A library independent of terminal and harness concerns.
 - **Application layer:** Coordinates revision resolution, analysis, and result generation.
 - **Git adapter:** Reads revisions, diffs, renames, hunks, and blobs without modifying the working tree.
 - **Language analyzers:** Use Tree-sitter grammars and language-specific rules to identify functions and calculate metrics.
-- **Import index:** Resolves each revision's module graph, so a change can be related to the files and tests that reach it.
+- **Import index:** Resolves one revision's module graph, so a change can be related to the files and tests that reach it. It is keyed by the commit it describes and shared by every comparison that touches that commit; a delta query builds it for both compared revisions.
 - **Query layer:** Projects one analysis into the answer a caller asked for. It filters, ranks, and scores; it performs no analysis of its own. A projection is deterministic and its answer never disagrees with the analysis it came from.
+- **Change-impact graph:** Projects one comparison and both revisions' import indexes into an ordered, bounded graph of module relationships with their statuses, plus dependency-diff and Mermaid renderings. Every edge is a relationship an index already resolved; the graph adds identity, status, traversal, bounds, and presentation.
 - **Risk and review-priority models:** Additive, documented scores over measured signals, each rule contributing a structured reason. Intrinsic risk covers complexity and churn; review priority adds public-surface, blast-radius, and source signals.
 - **Interfaces:** The CLI and harness adapters translate inputs and outputs without implementing analysis logic.
 
@@ -72,7 +74,9 @@ Two schemas are versioned separately:
   deliberate exception: "what breaks if this changes?" is a question about the
   files a diff does not contain, so that index is built over a whole revision.
   It parses only each file's import region, is keyed by the commit it
-  describes, and is built only for the queries that use it.
+  describes, and is built only for the queries that use it; a query that
+  compares two revisions' relationships builds both, and each index is reused
+  by every comparison that touches its commit.
 - Read blobs directly from Git; do not create temporary checkouts.
 - Process independent files in parallel.
 - Cache analysis by blob identity, language, and analyzer version when measurement justifies it.

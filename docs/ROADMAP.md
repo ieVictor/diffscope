@@ -116,6 +116,19 @@ Add languages one at a time through the established analyzer contract. Each lang
 
 **Exit condition per language:** It meets the same correctness, reliability, and performance evidence as the first language before being declared supported.
 
+## Milestone 10: Change-impact graph
+
+Describe the dependency and impact changes a comparison introduces, not only the numbers it contains. The first stage resolves relationships DiffScope already has, and answers:
+
+- Which modules import a changed file, and which tests cover it
+- Which of those relationships the comparison added, removed, or left in place
+- What a change reaches, walked from a changed file or the changed set, bounded by direction, depth, and node and edge budgets
+- Whether the topology is materially easier to read as a picture, with a dependency-diff and a Mermaid rendering
+
+The answer is ordered, deterministic, and anchored to one comparison. Function roots, call relations, and collapsed groups are rejected explicitly rather than approximated.
+
+**Exit condition:** A comparison's module-level relationship changes are answerable from the CLI, the JSONL protocol, and the MCP server; the three agree byte for byte; repeated queries are byte identical; every unsupported input is rejected with a message naming what is accepted; and the base index cost is measured rather than estimated.
+
 ## Change acceptance checklist
 
 A change is complete only when:
