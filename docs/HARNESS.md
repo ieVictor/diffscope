@@ -18,6 +18,34 @@ The process reads one request per line from standard input and writes and flushe
 - `repository` is a path accepted by Git; it may point inside the work tree.
 - `base` and `target` are explicit committed Git revisions.
 - Unknown or missing fields produce a `malformed_request` response.
+- `method` and `params` are optional. **A request without a `method` returns the complete analysis**, which is what this protocol has always returned, so existing clients keep working unchanged.
+
+## Methods
+
+```json
+{"protocol_version":1,"id":"request-2","repository":"/path/to/repo","base":"main","target":"HEAD","method":"list_changed_functions","params":{"classification":"source","minimum_risk":"high","limit":10}}
+```
+
+| `method` | Answers |
+| --- | --- |
+| absent, or `analyze` | The complete analysis. |
+| `get_change_summary` | Counts, per-area totals, and a ranked shortlist. |
+| `list_changed_files` | Ranked changed files. |
+| `list_changed_functions` | Ranked changed functions. |
+| `get_function_change` | One function, with its hunks and diagnostics. Requires `file` and `symbol`. |
+| `get_analysis_diagnostics` | Diagnostics, optionally for one `file`. |
+
+`params` accepts `file`, `symbol`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`, and `offset`. Parameters that do not apply to the method are unused; an unknown parameter is rejected rather than ignored. [`DEFINITIONS.md`](DEFINITIONS.md) defines what each query returns and how results are ranked.
+
+A whole analysis of a 49-file diff exceeds 1 MB, most of it functions the change did not touch. The same comparison answers `get_change_summary` in under 10 KB. Prefer a query, then narrow, rather than retrieving everything.
+
+## Reusing an analysis
+
+The adapter is long-lived and keeps a small number of recent analyses, so the usual pattern of an overview, then a filtered page, then one function costs one analysis rather than several.
+
+Entries are keyed by the commits the two revisions resolve to, never by the revision names. `HEAD` and a branch name point at different commits over time, so caching against a name would serve a stale analysis after the branch moved; a commit is immutable. Resolving the two names costs one `rev-parse` each, against an analysis that costs orders of magnitude more.
+
+Reuse is not observable in results: a reused analysis answers identically to a fresh one. Measured on the corpus in [`PERFORMANCE.md`](PERFORMANCE.md), the first query of a comparison takes 114 ms and each later query of the same comparison 2.5 ms.
 
 ## Success response
 
@@ -25,7 +53,7 @@ The process reads one request per line from standard input and writes and flushe
 {"protocol_version":1,"id":"request-1","result":{"schema_version":1}}
 ```
 
-`result` is the same complete schema-versioned object emitted by `diffscope --format json BASE TARGET`. The abbreviated object above is illustrative; the actual result includes every field defined in [`DEFINITIONS.md`](DEFINITIONS.md).
+For a request without a `method`, `result` is the same complete schema-versioned object emitted by `diffscope --format json BASE TARGET`. The abbreviated object above is illustrative; the actual result includes every field defined in [`DEFINITIONS.md`](DEFINITIONS.md). For every other method, `result` is that method's answer.
 
 ## Error response
 
@@ -38,6 +66,9 @@ Stable protocol error codes are:
 - `malformed_request`: invalid JSON or a request that does not match the request shape.
 - `unsupported_protocol_version`: the requested protocol version is not `1`.
 - `analysis_failed`: repository, revision, Git, or analyzer failure.
+- `unknown_method`: the requested `method` is not one of those listed above. The message names the accepted methods.
+- `invalid_params`: a parameter is missing or is not one of its accepted values. The message names the field and what it accepts.
+- `unknown_function`: `get_function_change` named a function the analysis does not contain. The message names the symbols that file does contain, so a caller that guessed can correct itself in one step.
 
 The `id` field is omitted only when it cannot be recovered from a malformed request. Adapter transport failures terminate the process with exit status `1`; request-level errors do not.
 

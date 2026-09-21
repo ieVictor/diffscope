@@ -44,6 +44,28 @@ Measured on 2026-09-20 with:
 
 The complete large-corpus CLI measured `744.5 ms ± 4.3 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 5,076 KiB. These numbers are local reference values, not cross-machine performance guarantees.
 
+## Query cost and analysis reuse
+
+An agent asks several questions about one comparison. Each is a projection of the same analysis, so the adapter keeps a small number of recent analyses keyed by the commits the revisions resolve to.
+
+Measured on the Vue comparison below, driving `diffscope --jsonl` with a batch of requests and taking the median of five runs:
+
+| Requests, one comparison | Median | Marginal cost per extra query |
+| --- | ---: | ---: |
+| 1 query | 114.3 ms | — |
+| 8 queries | 131.9 ms | 2.53 ms |
+
+The first query pays for the analysis; each later query of the same comparison costs about 2.5 ms, roughly 45 times less. Reuse is bounded by entry count and by the function records retained across entries, and it is not observable in results: a test asserts that a reused analysis answers identically to a fresh one.
+
+Response size is the reason the queries exist. For the same 49-file Vue comparison:
+
+| Response | Bytes |
+| --- | ---: |
+| Complete analysis | 1,099,911 |
+| `get_change_summary` | 9,155 |
+| `list_changed_functions`, production source at high risk, limit 10 | 8,729 |
+| `get_function_change` for one function | 1,221 |
+
 ## Real-world corpus
 
 Generated tiers isolate per-file behavior but do not resemble real diffs: the large tier averages 268 bytes per changed file, while real TypeScript diffs average roughly 16 KiB. Real-repository measurements therefore accompany the generated tiers. These corpora are not committed; recreate them by cloning the repositories and using the pinned revisions.

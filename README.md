@@ -9,6 +9,7 @@ It compares revisions and reports:
 - Lines added, removed, and changed
 - Files and functions touched by a diff
 - Before-and-after function metrics, including LOC, cyclomatic complexity, and cognitive complexity
+- Per-function diff churn, changes to a module's export surface, and how confidently each function was matched across revisions
 
 DiffScope is designed around a reusable analysis core. It is available as a command-line application; adapters for coding-agent harnesses can use the same public analysis API.
 
@@ -27,6 +28,20 @@ Use `--repository <PATH>` to select another repository and `--format json` for s
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
 Run `diffscope --jsonl` for the long-lived harness protocol over standard input and output. See [`docs/HARNESS.md`](docs/HARNESS.md) for its versioned request and response contract.
+
+## Queries for coding agents
+
+A complete analysis answers every question at once. For a 49-file diff that is over 1 MB of JSON, four fifths of it functions the change did not touch, which is more than a coding agent should spend its context on.
+
+The harness protocol therefore answers scoped questions: an overview, a filtered and ranked page of candidates, then one function in full. The same comparison summarizes in under 10 KB, and unchanged functions are returned only when asked for. Files are classified as source, test, generated, vendored, lockfile, config, or docs, so a caller can ask for production code alone.
+
+```sh
+echo '{"protocol_version":1,"id":"1","repository":".","base":"main","target":"HEAD",
+       "method":"list_changed_functions",
+       "params":{"classification":"source","minimum_risk":"high","limit":10}}' | diffscope --jsonl
+```
+
+Ranking is a documented, deterministic score over measured quantities, and every result carries the reasons behind it. See [`docs/DEFINITIONS.md`](docs/DEFINITIONS.md) for the queries, the classification rules, and the risk formula.
 
 ## Local development
 

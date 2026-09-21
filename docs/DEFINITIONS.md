@@ -66,14 +66,83 @@ For schema version `1`, TypeScript and TSX functions calculate metrics from Tree
   - qualified name,
   - function kind where the language distinguishes functions, methods, constructors, accessors, closures, etc.,
   - source range.
-- `qualified_name` uses language namespace/module/type nesting where available. Anonymous functions receive a deterministic synthetic name scoped by their containing construct and ordinal position.
+- `qualified_name` uses language namespace/module/type nesting where available, joined with `.`.
+- A function that declares no name of its own is named by the construct that contains it, then by an ordinal within that construct:
+  - When the function is an argument to a call, the call contributes a segment. A call that leads with a string literal contributes that literal, so a test callback is identified as `describe("parser").test("rejects empty input").<anonymous>#1`.
+  - Otherwise the segment is the callee and the argument's position, as `useEffect#0`.
+  - The ordinal counts only the anonymous functions of the same containing construct. It is never counted across the file: a file-wide ordinal makes a function's identity depend on how many anonymous functions precede it, so inserting one callback renames every later one and matching then pairs unrelated bodies.
+  - Call labels are collapsed to single spaces and truncated to 64 bytes, with `...` appended, so that an arbitrarily long string literal cannot produce an arbitrarily long identity.
+- `symbol_id` addresses one function within its file as `<kind>:<qualified_name>`, where kind is `fn`, `method`, `ctor`, or `arrow`. Queries accept either a `symbol_id` or a bare `qualified_name`.
 - Before-and-after matching first uses stable semantic identity: language, qualified name, and kind within matched files.
 - For renamed files, matching uses the base path and target path from the rename pair as the same file identity.
 - If exactly one base function and one target function share the stable semantic identity, they are matched even when their source ranges or signatures changed.
-- If multiple candidates share the same semantic identity on either side, DiffScope reports an `ambiguous_function_match` diagnostic for those candidates and does not guess.
+- If multiple candidates share the same semantic identity on either side, DiffScope reports an `ambiguous_function_match` diagnostic for that identity and then resolves the group rather than discarding it. Dropping the group removed real, parsed functions from the result with no way to ask for them.
+- Every matched pair reports a `match_confidence`:
+
+  | Value | Basis |
+  | ---: | --- |
+  | `1.0` | Exactly one base function and one target function share the identity. |
+  | `0.9` | Resolved from a group of identical identities by identical source, compared with whitespace runs collapsed. |
+  | `0.6` | Resolved from a group of identical identities by source order, after identical sources were paired. |
+
+  Identical sources are paired before order is considered, because an unchanged function is the common case and its partner is unambiguous. A caller that will not act on a guess can require `1.0`; the diagnostic is reported either way.
 - If no target match exists, the function is `removed`. If no base match exists, it is `added`. If a match exists and a diff hunk intersects the function on either side, or its metrics changed, it is `modified`; otherwise it is `unchanged`.
 - A function whose source range only shifts because of an edit elsewhere in the file is `unchanged`. Absolute ranges are not compared: in a large file one edit shifts every function below it, and reporting those as modified hides the functions that actually changed. A function moved within a file still intersects a hunk at its old and its new position, so it remains `modified`.
 - Moved functions within a file are matched by semantic identity, not by line number.
+
+## Line churn
+
+- A diff is read with `--unified=0`, so a hunk header's line span is exactly the span of changed lines on that side and carries no context lines. A function's churn is the intersection of its source range with those spans.
+- `lines_removed` counts changed lines inside the function's base range; `lines_added` counts them inside its target range.
+- `changed_hunks` counts the hunks that touch the function on either side. A pure insertion at a function's boundary touches it without changing a line inside it, so the two numbers can disagree.
+- `hunk_overlap` is the changed lines inside the function over its physical length, measured against the revision the function still exists in, and rounded to two decimals. It separates a small edit inside a large function from a function that is wholly new.
+
+## Export surface
+
+- A module's export surface is the set of names an importer can write, collected from `export` declarations, export clauses including renames, `export default`, and `export *`.
+- A whole-module re-export is recorded as `*`, because the names it forwards live in a file this analysis has not read. A renamed export records only the exported name, not the local one.
+- `exports_added` and `exports_removed` are the differences between the two revisions' sets. A change to a function's signature or body is not a surface change: the name every importer writes is unchanged.
+
+## Path classification
+
+Every changed file is classified from its path alone. No filesystem access, no file contents, so the result is identical for the same path on every machine. Rules are evaluated in this order and the first match wins:
+
+| Order | Classification | Matches |
+| ---: | --- | --- |
+| 1 | `lockfile` | Known lock file names, such as `pnpm-lock.yaml` or `Cargo.lock`. |
+| 2 | `vendored` | A `node_modules`, `vendor`, `third_party`, or `thirdparty` directory. |
+| 3 | `generated` | A `dist`, `.next`, `coverage`, `generated`, or `__snapshots__` directory; a `.snap` file; a `.min.`, `.generated.`, or `.g.` infix. |
+| 4 | `test` | A `__tests__`, `__mocks__`, `test`, `tests`, `spec`, `e2e`, or `testing` directory; a `.spec.`, `.test.`, `_test.`, `-test.`, or `.test-d.` infix; a `test_` prefix. |
+| 5 | `config` | A dotted file or directory name; known config file names; `tsconfig*.json`; a `.config.` infix; a `.toml`, `.yaml`, `.yml`, `.ini`, or `.cfg` extension. |
+| 6 | `docs` | A `.md`, `.mdx`, `.rst`, `.adoc`, or `.txt` extension. |
+| 7 | `source` | Everything else. |
+
+Ordering resolves overlap deliberately: a snapshot under `__tests__` is `generated`, because it is machine-written and not meant to be read as a test.
+
+`build`, `out`, and `target` are excluded from rule 3. They are common enough as ordinary source directory names that matching them anywhere in a path would misreport real source files.
+
+These are heuristics over naming conventions, not facts about a project. Every result carries its classification, so a caller that disagrees can rank on the underlying numbers instead.
+
+## Risk
+
+Risk ranks changed functions by how much review attention they are likely to need. It is a ranking aid: it does not judge whether code is good, and it cannot know what a change was for.
+
+Each rule that applies contributes points and one reason:
+
+| Points | Rule |
+| ---: | --- |
+| 3 / 2 / 1 | Cognitive complexity increased by at least 10 / 5 / 2. |
+| 2 / 1 | Cyclomatic complexity increased by at least 5 / 2. |
+| 2 / 1 | Cognitive complexity is at least 30 / 15 after the change. |
+| 1 | At least 30 lines changed inside the function. |
+| 1 | An added function whose cognitive complexity is already at least 10. |
+| 3 | The function's name is no longer exported. |
+| 1 | The function's name is newly exported. |
+| 1 | The file is classified `source`. |
+
+A score of 5 or more is `high`, 2 or more is `medium`, and anything else is `low`. A match confidence below `1.0` adds a reason but no points, because uncertainty about identity is not by itself a reason to review.
+
+The rules are additive so that no single large but harmless number, such as a reformatted file's churn, can dominate the ranking. Every assessment reports its score and its reasons, so a caller who disagrees with the weighting can ignore the level entirely.
 
 ## Diagnostics
 
@@ -131,6 +200,8 @@ File result fields:
 - `functions`: ordered function change list.
 - `diagnostics`: file-level diagnostics.
 
+- `exports_added` / `exports_removed`: names this change adds to or removes from the module's public surface. Omitted when the surface is unchanged.
+
 Function result fields:
 
 - `id`: deterministic identifier scoped to one analysis result.
@@ -141,9 +212,29 @@ Function result fields:
 - `target_range`: source range after change, absent for removed functions.
 - `metrics_before`: LOC and complexity metrics before change, absent when no base function exists.
 - `metrics_after`: LOC and complexity metrics after change, absent when no target function exists.
+- `change`: `changed_hunks`, `lines_added`, `lines_removed`, and `hunk_overlap` for this function. Omitted for a function the diff does not touch.
+- `match_confidence`: how firmly this pair is believed to be the same function.
 - `diagnostics`: function-level diagnostics.
 
 Metric values are either available numeric values or unavailable with a reason and diagnostic code.
+
+## Queries
+
+A whole analysis answers every question at once and is far larger than any one question needs. Queries project one analysis into the shape a caller asked for. They add no analysis of their own, so a query answer never disagrees with the analysis it came from.
+
+| Query | Returns |
+| --- | --- |
+| `get_change_summary` | File, line, function, and diagnostic counts; changed files per classification; per-area line totals and complexity totals; a short ranked shortlist of review candidates. |
+| `list_changed_files` | Changed files, ranked, with per-file complexity totals and export changes. Filters: `classification`, `minimum_risk`. |
+| `list_changed_functions` | Changed functions, ranked, with metric deltas, churn, risk and its reasons, and match confidence. Filters: `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`. |
+| `get_function_change` | One function in full, with the hunks that touch it and its diagnostics. |
+| `get_analysis_diagnostics` | Diagnostics for the analysis, optionally scoped to one file. |
+
+- **Unchanged functions are never returned by default.** They are the large majority of any analysis. `include_unchanged` retrieves them.
+- Every list paginates. `limit` defaults to 50 and is capped at 200; `offset` skips rows. Each answer reports `returned`, `total`, `has_more`, and `next_offset`.
+- Ranking is total and deterministic. Functions order by risk score, then cognitive delta, then churn, then file path, then symbol. Files order by risk, then total changed lines, then path. Equal rows keep the analysis order, so paging never drops or repeats a row.
+- Change areas are derived from paths. Inside a directory that holds one project per child, such as `packages`, the area is that child; otherwise it is the top-level directory. **An area's name is a path.** DiffScope does not infer a semantic label such as "runtime rendering" for a directory, because nothing in a diff says what a directory is for.
+- Complexity is aggregated per file and per area over every function, including untouched ones. Summing both revisions is what makes a refactor legible as a unit: extracting a helper moves complexity out of one function into a new one, and only the totals show whether the change reduced complexity or merely relocated it.
 
 ## Correctness fixtures and benchmark corpus
 
