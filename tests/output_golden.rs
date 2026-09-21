@@ -162,6 +162,7 @@ fn graph() -> Graph {
         label: Node::basename(path),
         kind: NodeKind::Module,
         path: path.to_owned(),
+        range_start: (0, 0),
         status,
         depth,
     };

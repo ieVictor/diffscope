@@ -33,6 +33,9 @@ const AREAS: u32 = 2;
 /// Node count at which a graph is no longer small enough for
 /// [`linear_and_small`] to suppress what it earned.
 const SMALL_GRAPH_NODES: u32 = 4;
+/// Distinct hop levels changed relationships must sit at for the dependency
+/// diff to stop reading as one neighborhood.
+const LEVELS: u32 = 2;
 
 /// One criterion's contribution, in structured form.
 ///
@@ -152,6 +155,17 @@ pub fn evaluate(graph: &Graph) -> Recommendation {
             changed,
         ));
     }
+    let levels = changed_levels(graph);
+    if levels >= LEVELS {
+        reasons.push(signal(
+            "multiple_levels",
+            format!(
+                "changed relationships appear at {} from the root",
+                counted(levels, "hop level")
+            ),
+            levels,
+        ));
+    }
 
     Recommendation {
         recommended: !reasons.is_empty(),
@@ -161,9 +175,8 @@ pub fn evaluate(graph: &Graph) -> Recommendation {
 
 /// One criterion's outcome.
 ///
-/// Building every signal in one place keeps the six criteria identical in
-/// shape, so a caller can walk the list without asking which reason came from
-/// which rule.
+/// Building every signal in one place keeps the criteria identical in shape, so
+/// a caller can walk the list without asking which reason came from which rule.
 fn signal(code: &'static str, message: String, value: u32) -> Signal {
     Signal {
         code,
@@ -216,6 +229,26 @@ fn branches(graph: &Graph) -> bool {
         .values()
         .chain(outbound.values())
         .any(|degree| *degree > 1)
+}
+
+/// The number of distinct hop levels the changed relationships sit at.
+///
+/// A relationship's level is the deeper of its two endpoints: a changed edge
+/// between the root and something one hop out sits at the first level, and one
+/// between that node and its own neighbor sits at the second. Two levels mean
+/// the change reaches past the root's immediate neighborhood, a shape a
+/// dependency diff states as a flat list a reader has to reconstruct.
+fn changed_levels(graph: &Graph) -> u32 {
+    let depth_of = |id: &str| graph.node(id).map_or(0, |node| node.depth);
+    count(
+        graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.status != EdgeStatus::Unchanged)
+            .map(|edge| depth_of(&edge.from).max(depth_of(&edge.to)))
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
 }
 
 /// The number of distinct change areas the graph's node paths span.
@@ -318,6 +351,7 @@ mod tests {
             label: Node::basename(path),
             kind: NodeKind::Module,
             path: path.to_owned(),
+            range_start: (0, 0),
             status: NodeStatus::Unchanged,
             depth: 1,
         }
@@ -340,6 +374,28 @@ mod tests {
         let mut builder = GraphBuilder::new();
         for &path in paths {
             builder.add_node(node(path));
+        }
+        for &root in roots {
+            builder.add_root(Node::module_id(root));
+        }
+        for &(from, to, status) in edges {
+            builder.add_edge(import(from, to, status));
+        }
+        builder.finish(Limits::default())
+    }
+
+    /// Build a graph whose nodes sit at the depths a walk would have reached
+    /// them at, which is what a level signal measures.
+    fn graph_at(
+        levels: &[(&str, u32)],
+        roots: &[&str],
+        edges: &[(&str, &str, EdgeStatus)],
+    ) -> Graph {
+        let mut builder = GraphBuilder::new();
+        for &(path, depth) in levels {
+            let mut node = node(path);
+            node.depth = depth;
+            builder.add_node(node);
         }
         for &root in roots {
             builder.add_root(Node::module_id(root));
@@ -655,6 +711,68 @@ mod tests {
             reason(&loud, "changed_on_both_sides").message,
             "relationships changed on both sides of the root; 3 relationships in total"
         );
+    }
+
+    #[test]
+    fn multiple_levels_fires_only_when_changed_relationships_sit_at_two_levels() {
+        // Every changed relationship sits at the first hop, so the dependency
+        // diff states the whole change as one flat list.
+        let one_hop = graph_at(
+            &[
+                ("src/root.ts", 0),
+                ("src/a.ts", 1),
+                ("src/b.ts", 1),
+                ("src/c.ts", 1),
+            ],
+            &["src/root.ts"],
+            &[
+                ("src/root.ts", "src/a.ts", EdgeStatus::Added),
+                ("src/root.ts", "src/b.ts", EdgeStatus::Unchanged),
+                ("src/c.ts", "src/root.ts", EdgeStatus::Unchanged),
+            ],
+        );
+        let quiet = evaluate(&one_hop);
+        assert!(!quiet.recommended);
+        assert!(quiet.reasons.is_empty());
+
+        // One changed relationship sits at the first hop and one a hop past it,
+        // which is a shape a flat list makes a reader reconstruct.
+        let two_levels = graph_at(
+            &[
+                ("src/root.ts", 0),
+                ("src/a.ts", 1),
+                ("src/b.ts", 2),
+                ("src/c.ts", 1),
+            ],
+            &["src/root.ts"],
+            &[
+                ("src/root.ts", "src/a.ts", EdgeStatus::Added),
+                ("src/a.ts", "src/b.ts", EdgeStatus::Added),
+                ("src/c.ts", "src/root.ts", EdgeStatus::Unchanged),
+            ],
+        );
+        let loud = evaluate(&two_levels);
+        assert!(loud.recommended);
+        assert_eq!(codes(&loud), ["multiple_levels"]);
+        assert_eq!(reason(&loud, "multiple_levels").value, 2);
+        assert_eq!(
+            reason(&loud, "multiple_levels").message,
+            "changed relationships appear at 2 hop levels from the root"
+        );
+
+        // The negative signal stays authoritative: three nodes in a line earn
+        // the levels and still do not earn a picture.
+        let small = graph_at(
+            &[("src/root.ts", 0), ("src/a.ts", 1), ("src/b.ts", 2)],
+            &["src/root.ts"],
+            &[
+                ("src/root.ts", "src/a.ts", EdgeStatus::Added),
+                ("src/a.ts", "src/b.ts", EdgeStatus::Added),
+            ],
+        );
+        let rec = evaluate(&small);
+        assert!(!rec.recommended);
+        assert_eq!(codes(&rec), ["linear_and_small"]);
     }
 
     #[test]
