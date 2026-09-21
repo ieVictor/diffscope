@@ -1091,7 +1091,7 @@ mod tests {
     fn omits_unchanged_functions_unless_they_are_asked_for() {
         let result = fixture();
 
-        let default = list_changed_functions(&result, &FunctionFilter::default());
+        let default = list_changed_functions(&result, &FunctionFilter::default(), None);
         assert!(
             default
                 .functions
@@ -1105,6 +1105,7 @@ mod tests {
                 include_unchanged: true,
                 ..FunctionFilter::default()
             },
+            None,
         );
         assert!(including.functions.len() > default.functions.len());
     }
@@ -1119,6 +1120,7 @@ mod tests {
                 classification: Some(FileClassification::Source),
                 ..FunctionFilter::default()
             },
+            None,
         );
         assert!(
             source_only
@@ -1139,6 +1141,7 @@ mod tests {
                 minimum_risk: Some(RiskLevel::High),
                 ..FunctionFilter::default()
             },
+            None,
         );
         assert!(
             high_only
@@ -1160,6 +1163,7 @@ mod tests {
                 },
                 ..FunctionFilter::default()
             },
+            None,
         );
 
         let first = list_changed_functions(
@@ -1171,6 +1175,7 @@ mod tests {
                 },
                 ..FunctionFilter::default()
             },
+            None,
         );
         assert_eq!(first.page.returned, 1);
         assert_eq!(first.page.total, all.page.total);
@@ -1186,6 +1191,7 @@ mod tests {
                 },
                 ..FunctionFilter::default()
             },
+            None,
         );
         assert_eq!(first.functions[0].symbol, all.functions[0].symbol);
         assert_eq!(second.functions[0].symbol, all.functions[1].symbol);
@@ -1195,10 +1201,10 @@ mod tests {
     fn addresses_a_function_by_symbol_id_or_by_plain_name() {
         let result = fixture();
 
-        let by_id = get_function_change(&result, "src/renderer.ts", "fn:patch")
+        let by_id = get_function_change(&result, "src/renderer.ts", "fn:patch", None)
             .expect("symbol id resolves");
-        let by_name =
-            get_function_change(&result, "src/renderer.ts", "patch").expect("plain name resolves");
+        let by_name = get_function_change(&result, "src/renderer.ts", "patch", None)
+            .expect("plain name resolves");
 
         assert_eq!(by_id.function.symbol, by_name.function.symbol);
         assert_eq!(by_id.function.qualified_name, "patch");
@@ -1208,7 +1214,7 @@ mod tests {
     fn reports_the_symbols_a_file_does_contain_when_one_is_not_found() {
         let result = fixture();
 
-        let error = get_function_change(&result, "src/renderer.ts", "nonexistent")
+        let error = get_function_change(&result, "src/renderer.ts", "nonexistent", None)
             .expect_err("unknown symbol is rejected");
 
         assert_eq!(error.symbol, "nonexistent");
@@ -1240,7 +1246,7 @@ mod tests {
     #[test]
     fn overview_counts_every_file_and_ranks_candidates() {
         let result = fixture();
-        let summary = change_summary(&result);
+        let summary = change_summary(&result, None);
 
         assert_eq!(summary.files.changed, 2);
         assert_eq!(summary.files.by_classification.get("source"), Some(&1));
@@ -1260,6 +1266,7 @@ mod tests {
                 classification: Some(FileClassification::Source),
                 ..FileFilter::default()
             },
+            None,
         );
         assert_eq!(source.files.len(), 1);
         assert_eq!(source.files[0].path, "src/renderer.ts");

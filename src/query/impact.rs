@@ -133,3 +133,87 @@ fn stem(path: &str) -> &str {
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TestLink, for_file, names_match, stem};
+    use crate::imports::ImportIndex;
+
+    #[test]
+    fn matches_a_test_named_after_the_file_it_covers() {
+        assert!(names_match(
+            "packages/shared/src/looseEqual.ts",
+            "packages/shared/__tests__/looseEqual.spec.ts"
+        ));
+        assert!(!names_match(
+            "packages/shared/src/looseEqual.ts",
+            "packages/shared/__tests__/normalizeProp.spec.ts"
+        ));
+        // A different package may legitimately test a same-named file, so the
+        // match is on the name alone and the caller sees both paths.
+        assert!(names_match(
+            "a/src/cssVars.ts",
+            "b/__tests__/cssVars.spec.ts"
+        ));
+    }
+
+    #[test]
+    fn strips_extensions_and_test_suffixes_from_a_name() {
+        assert_eq!(stem("packages/shared/src/looseEqual.ts"), "looseEqual");
+        assert_eq!(stem("__tests__/looseEqual.spec.ts"), "looseEqual");
+        assert_eq!(stem("setupHelpers.test-d.ts"), "setupHelpers");
+    }
+
+    #[test]
+    fn offers_direct_importers_and_name_matches_but_not_indirect_ones() {
+        // `barrel.ts` re-exports `core.ts`, and a distant test imports the
+        // barrel. Offering that test as related to a `core.ts` change is how a
+        // suggestion list becomes a list of everything.
+        let index = ImportIndex::from_edges(
+            &[
+                ("src/__tests__/core.spec.ts", "src/core.ts"),
+                ("src/barrel.ts", "src/core.ts"),
+                ("other/__tests__/distant.spec.ts", "src/barrel.ts"),
+            ],
+            &["src/__tests__/unrelated.spec.ts"],
+        );
+
+        let impact = for_file(&index, "src/core.ts");
+
+        assert_eq!(impact.direct_importers, 2);
+        // The distant test is still counted as reach.
+        assert_eq!(impact.nearby_importers, 3);
+
+        let offered = impact
+            .related_tests
+            .iter()
+            .map(|test| test.file.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(offered, vec!["src/__tests__/core.spec.ts"]);
+        assert_eq!(impact.related_tests[0].link, TestLink::Imports);
+    }
+
+    #[test]
+    fn ranks_a_direct_import_above_a_name_match() {
+        let index = ImportIndex::from_edges(
+            &[("src/__tests__/importer.spec.ts", "src/core.ts")],
+            &["src/__tests__/core.spec.ts"],
+        );
+
+        let impact = for_file(&index, "src/core.ts");
+        let offered = impact
+            .related_tests
+            .iter()
+            .map(|test| (test.file.as_str(), test.link))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            offered,
+            vec![
+                ("src/__tests__/importer.spec.ts", TestLink::Imports),
+                ("src/__tests__/core.spec.ts", TestLink::Convention),
+            ]
+        );
+        assert!(TestLink::Imports.confidence() > TestLink::Convention.confidence());
+    }
+}

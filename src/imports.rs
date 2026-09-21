@@ -109,6 +109,33 @@ impl ImportIndex {
     }
 }
 
+impl ImportIndex {
+    /// Build an index directly from edges, for tests of code that consumes one.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_edges(edges: &[(&str, &str)], extra_files: &[&str]) -> Self {
+        let mut index = Self::default();
+        for (importer, imported) in edges {
+            index
+                .outbound
+                .entry((*importer).to_owned())
+                .or_default()
+                .insert((*imported).to_owned());
+            index
+                .inbound
+                .entry((*imported).to_owned())
+                .or_default()
+                .insert((*importer).to_owned());
+            index.files.insert((*importer).to_owned());
+            index.files.insert((*imported).to_owned());
+        }
+        for file in extra_files {
+            index.files.insert((*file).to_owned());
+        }
+        index
+    }
+}
+
 /// Build the import graph of one commit's tree.
 ///
 /// # Errors
