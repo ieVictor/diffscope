@@ -375,6 +375,63 @@ mod tests {
     }
 
     #[test]
+    fn keeps_functions_unchanged_when_an_edit_above_only_shifts_them() {
+        // Two lines are inserted near the top of the file. `shifted` moves
+        // down by two lines, but its content, and every metric derived from
+        // it, is identical.
+        let file = file_change(
+            b"const top = 1;\n\nfunction shifted() {\n  return 1;\n}\n",
+            b"const top = 1;\nconst added = 2;\nconst alsoAdded = 3;\n\nfunction shifted() {\n  return 1;\n}\n",
+            1,
+            0,
+            2,
+            2,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+        let function = &mapped.functions[0];
+
+        assert_eq!(mapped.functions.len(), 1);
+        assert_eq!(function.qualified_name, "shifted");
+        assert_eq!(
+            function.base_range.as_ref().map(|range| range.start_line),
+            Some(3)
+        );
+        assert_eq!(
+            function.target_range.as_ref().map(|range| range.start_line),
+            Some(5)
+        );
+        assert_eq!(function.status, FunctionChangeStatus::Unchanged);
+    }
+
+    #[test]
+    fn reports_functions_the_edit_actually_touches_as_modified() {
+        let file = file_change(
+            b"function untouched() { return 1; }\nfunction edited() { return 2; }\n",
+            b"function untouched() { return 1; }\nfunction edited() { return 3; }\n",
+            2,
+            1,
+            2,
+            1,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+        let status_of = |name: &str| {
+            mapped
+                .functions
+                .iter()
+                .find(|function| function.qualified_name == name)
+                .map_or_else(
+                    || panic!("missing function {name}"),
+                    |function| function.status,
+                )
+        };
+
+        assert_eq!(status_of("untouched"), FunctionChangeStatus::Unchanged);
+        assert_eq!(status_of("edited"), FunctionChangeStatus::Modified);
+    }
+
+    #[test]
     fn matches_functions_across_file_renames() {
         let mut file = file_change(
             b"function stable() { return 1; }\n",
