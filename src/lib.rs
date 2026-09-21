@@ -5,6 +5,7 @@ pub mod harness;
 pub mod languages;
 pub mod metrics;
 pub mod output;
+pub mod query;
 pub mod result;
 
 pub use application::analyze;
