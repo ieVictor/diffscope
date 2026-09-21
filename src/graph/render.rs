@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{Edge, EdgeStatus, Graph, Node, NodeStatus, Relation};
+use super::{Edge, EdgeStatus, Graph, Node, NodeKind, NodeStatus, Relation};
 
 /// Longest label a diagram line may carry before it is truncated.
 ///
@@ -41,12 +41,13 @@ const STATUSES: [NodeStatus; 4] = [
 
 /// Render the graph as a dependency diff: one line per edge, marked by status.
 ///
-/// Endpoints are paths rather than labels, because a diff line is read as a
-/// place in the repository and two files sharing a basename are two different
-/// files. Lines follow the graph's edge order, so a removed relationship and
-/// the added one that replaced it appear together. The result keeps the
-/// trailing newline of its last line and an empty graph renders as nothing at
-/// all, which is what lets a caller print it unmodified.
+/// Endpoints are places in the repository rather than labels: a module is its
+/// path, so two files sharing a basename are two different files, and a
+/// function adds its qualified name to the path, so two functions of one file
+/// are two different lines. Lines follow the graph's edge order, so a removed
+/// relationship and the added one that replaced it appear together. The result
+/// keeps the trailing newline of its last line and an empty graph renders as
+/// nothing at all, which is what lets a caller print it unmodified.
 #[must_use]
 pub fn dependency_diff(graph: &Graph) -> String {
     let mut output = String::new();
@@ -67,16 +68,34 @@ pub fn dependency_diff(graph: &Graph) -> String {
     output
 }
 
-/// One dependency-diff line: the marker, both paths, and the relation when it
-/// is not the common one.
+/// One dependency-diff line: the marker, both endpoints, and the relation when
+/// it is not the common one.
 ///
 /// `imports` goes unnamed because a module diff is read as one by default;
 /// naming it on every line would be noise, and naming the others keeps a
 /// `tested_by` line from reading like an import it is not.
 fn edge_line(marker: &str, from: &Node, to: &Node, relation: Relation) -> String {
     match relation {
-        Relation::Imports => format!("{marker} {} -> {}", from.path, to.path),
-        other => format!("{marker} {} -[{}]-> {}", from.path, other.name(), to.path),
+        Relation::Imports => format!("{marker} {} -> {}", endpoint(from), endpoint(to)),
+        other => format!(
+            "{marker} {} -[{}]-> {}",
+            endpoint(from),
+            other.name(),
+            endpoint(to)
+        ),
+    }
+}
+
+/// The endpoint a dependency-diff line names.
+///
+/// A module is its path, because that is the place in the repository a reader
+/// looks for. A function is its path and its qualified name, because two
+/// functions of one file are two different places and a line naming the file
+/// alone would merge them.
+fn endpoint(node: &Node) -> String {
+    match node.kind {
+        NodeKind::Function => format!("{}::{}", node.path, node.label),
+        NodeKind::Module | NodeKind::Group => node.path.clone(),
     }
 }
 
@@ -259,6 +278,22 @@ mod tests {
             label: Node::basename(path),
             kind: NodeKind::Module,
             path: path.to_owned(),
+            range_start: (0, 0),
+            status,
+            depth: 1,
+        }
+    }
+
+    /// One function node of `path`, labelled with the qualified name a reader
+    /// knows it by.
+    fn function_node(path: &str, qualified_name: &str, status: NodeStatus) -> Node {
+        Node {
+            id: Node::function_id(&format!("{path}#fn:{qualified_name}@target:1:0")),
+            key: String::new(),
+            label: qualified_name.to_owned(),
+            kind: NodeKind::Function,
+            path: path.to_owned(),
+            range_start: (1, 0),
             status,
             depth: 1,
         }
@@ -290,6 +325,37 @@ mod tests {
             builder.add_edge(edge.clone());
         }
         builder.finish(Limits::default())
+    }
+
+    /// A graph of nodes of any kind, which is what a function-rooted answer
+    /// delivers.
+    fn graph_with(nodes: &[Node], edges: &[Edge]) -> Graph {
+        let mut builder = GraphBuilder::new();
+        for node in nodes {
+            builder.add_node(node.clone());
+        }
+        for edge in edges {
+            builder.add_edge(edge.clone());
+        }
+        builder.finish(Limits::default())
+    }
+
+    /// An edge between two nodes, whatever kind they are.
+    fn edge_between(
+        from: &Node,
+        to: &Node,
+        status: EdgeStatus,
+        relation: Relation,
+        resolution: Resolution,
+    ) -> Edge {
+        Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            relation,
+            status,
+            resolution,
+            evidence: None,
+        }
     }
 
     /// The fixed `classDef` block every document opens with, derived from the
@@ -549,6 +615,62 @@ mod tests {
         let graph = graph_of(&[("src/one\ttwo\nthree.ts", NodeStatus::Removed)], &[]);
 
         assert!(mermaid(&graph).contains("n0[\"one two three.ts · removed\"]"));
+    }
+
+    #[test]
+    fn the_dependency_diff_separates_two_functions_of_one_file() {
+        let module = node("src/a.ts", NodeStatus::Modified);
+        let first = function_node("src/a.ts", "first", NodeStatus::Added);
+        let second = function_node("src/a.ts", "second", NodeStatus::Added);
+        let graph = graph_with(
+            &[module.clone(), first.clone(), second.clone()],
+            &[
+                edge_between(
+                    &module,
+                    &first,
+                    EdgeStatus::Added,
+                    Relation::Contains,
+                    Resolution::Declaration,
+                ),
+                edge_between(
+                    &module,
+                    &second,
+                    EdgeStatus::Added,
+                    Relation::Contains,
+                    Resolution::Declaration,
+                ),
+            ],
+        );
+
+        assert_eq!(
+            dependency_diff(&graph),
+            concat!(
+                "+ src/a.ts -[contains]-> src/a.ts::first\n",
+                "+ src/a.ts -[contains]-> src/a.ts::second\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_function_label_keeps_the_sanitization_and_budget_a_module_label_gets() {
+        let long = format!("Namespace.{}", "a".repeat(80));
+        let graph = graph_with(&[function_node("src/a.ts", &long, NodeStatus::Added)], &[]);
+        let declared = mermaid(&graph)
+            .lines()
+            .find(|line| line.contains("n0["))
+            .expect("the function is declared")
+            .to_owned();
+        assert_eq!(
+            declared,
+            format!("    n0[\"{}... · added\"]", &long[..MAX_LABEL_BYTES])
+        );
+
+        let hostile = "Outer.in\"ner\nname";
+        let graph = graph_with(
+            &[function_node("src/a.ts", hostile, NodeStatus::Unchanged)],
+            &[],
+        );
+        assert!(mermaid(&graph).contains("n0[\"Outer.inner name\"]"));
     }
 
     #[test]

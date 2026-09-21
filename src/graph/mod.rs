@@ -146,8 +146,11 @@ impl Relation {
     /// The relations this version resolves, in the order they are reported.
     ///
     /// The vocabulary is larger than the set; a relation outside this list is
-    /// rejected by name rather than answered with silence.
-    pub const SUPPORTED: &'static [Self] = &[Self::Imports, Self::TestedBy];
+    /// rejected by name rather than answered with silence. A newly resolved
+    /// relation is appended, so a default request keeps the prefix it already
+    /// reported in the order it reported it.
+    pub const SUPPORTED: &'static [Self] =
+        &[Self::Imports, Self::TestedBy, Self::Calls, Self::Contains];
 
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -193,6 +196,12 @@ impl Relation {
 pub enum Resolution {
     /// An import statement whose specifier resolved to a path in the revision.
     ResolvedSpecifier,
+    /// A call whose callee is a plain identifier declared in the caller's own
+    /// file, resolved against the names that revision declares.
+    DirectLocalSymbol,
+    /// A containment the analysis itself declares: a module declares a
+    /// function.
+    Declaration,
     /// A test file imports the module directly.
     TestImportsModule,
     /// A test file's name matches the module's, after extensions and suffixes.
@@ -204,6 +213,8 @@ impl Resolution {
     pub fn name(self) -> &'static str {
         match self {
             Self::ResolvedSpecifier => "resolved_specifier",
+            Self::DirectLocalSymbol => "direct_local_symbol",
+            Self::Declaration => "declaration",
             Self::TestImportsModule => "test_imports_module",
             Self::TestNameMatchesModule => "test_name_matches_module",
         }
@@ -212,14 +223,15 @@ impl Resolution {
     /// Confidence that the relationship this edge reports is real.
     ///
     /// Fixed per resolution rather than computed, so two runs cannot disagree
-    /// and a reader can look up what a number meant. The two test values are
-    /// the ones [`crate::query::impact::TestLink`] already publishes, so a test
-    /// reported at `0.9` by a detail answer cannot appear here at some other
-    /// number.
+    /// and a reader can look up what a number meant. A local call and a
+    /// declared containment are facts of the one parsed file, so both are
+    /// exact; the two test values are the ones
+    /// [`crate::query::impact::TestLink`] already publishes, so a test reported
+    /// at `0.9` by a detail answer cannot appear here at some other number.
     #[must_use]
     pub fn confidence(self) -> f64 {
         match self {
-            Self::ResolvedSpecifier => 1.0,
+            Self::ResolvedSpecifier | Self::DirectLocalSymbol | Self::Declaration => 1.0,
             Self::TestImportsModule => 0.9,
             Self::TestNameMatchesModule => 0.8,
         }
@@ -333,6 +345,13 @@ pub struct Node {
     pub kind: NodeKind,
     /// Repository-relative path: the target side when there is one.
     pub path: String,
+    /// Where the node starts in its file, as `(start_line, start_column)`, or
+    /// `(0, 0)` for a module, which has no position of its own.
+    ///
+    /// Two functions of one file share a kind, a path, and sometimes a name;
+    /// their positions are what separate them, and ordering by position is the
+    /// order a reader meets them in the file.
+    pub range_start: (u32, u32),
     pub status: NodeStatus,
     /// Fewest hops by which the walk reached this node. Zero for a root.
     pub depth: u32,
@@ -357,9 +376,15 @@ impl Node {
         path.rsplit('/').next().unwrap_or(path).to_owned()
     }
 
-    /// Total order over nodes: kind, then path, then label.
-    fn order(&self) -> (NodeKind, &str, &str) {
-        (self.kind, self.path.as_str(), self.label.as_str())
+    /// Total order over nodes: kind, then path, then source position, then
+    /// label.
+    fn order(&self) -> (NodeKind, &str, (u32, u32), &str) {
+        (
+            self.kind,
+            self.path.as_str(),
+            self.range_start,
+            self.label.as_str(),
+        )
     }
 }
 
@@ -742,6 +767,7 @@ mod tests {
             label: Node::basename(path),
             kind: NodeKind::Module,
             path: path.to_owned(),
+            range_start: (0, 0),
             status,
             depth,
         }
@@ -789,9 +815,19 @@ mod tests {
     fn only_the_supported_relations_parse() {
         assert_eq!(Relation::parse("imports"), Some(Relation::Imports));
         assert_eq!(Relation::parse("tested_by"), Some(Relation::TestedBy));
-        assert_eq!(Relation::parse("calls"), None);
+        assert_eq!(Relation::parse("calls"), Some(Relation::Calls));
+        assert_eq!(Relation::parse("contains"), Some(Relation::Contains));
+        assert_eq!(Relation::parse("possible_call"), None);
         assert_eq!(Relation::parse("depends_on"), None);
-        assert_eq!(Relation::accepted(), "imports, tested_by");
+        assert_eq!(Relation::accepted(), "imports, tested_by, calls, contains");
+    }
+
+    #[test]
+    fn the_local_resolutions_are_exact_and_named_as_published() {
+        assert_eq!(Resolution::DirectLocalSymbol.name(), "direct_local_symbol");
+        assert!((Resolution::DirectLocalSymbol.confidence() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(Resolution::Declaration.name(), "declaration");
+        assert!((Resolution::Declaration.confidence() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -830,6 +866,37 @@ mod tests {
                 .map(|node| (node.key.as_str(), node.path.as_str()))
                 .collect::<Vec<_>>(),
             vec![("n0", "src/a.ts"), ("n1", "src/b.ts"), ("n2", "src/c.ts")]
+        );
+    }
+
+    #[test]
+    fn two_functions_of_one_file_order_by_source_position() {
+        let function = |line: u32, name: &str| Node {
+            id: Node::function_id(&format!("src/a.ts#fn:{name}@target:{line}:0")),
+            key: String::new(),
+            label: name.to_owned(),
+            kind: NodeKind::Function,
+            path: "src/a.ts".to_owned(),
+            range_start: (line, 0),
+            status: NodeStatus::Unchanged,
+            depth: 1,
+        };
+
+        let mut builder = GraphBuilder::new();
+        // Inserted latest-first, so the delivered order can only come from the
+        // nodes' own positions.
+        builder.add_node(function(40, "second"));
+        builder.add_node(function(10, "first"));
+        builder.add_node(node("src/a.ts", NodeStatus::Unchanged, 0));
+
+        let graph = builder.finish(Limits::default());
+        assert_eq!(
+            graph
+                .nodes()
+                .iter()
+                .map(|node| node.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.ts", "first", "second"]
         );
     }
 
