@@ -238,10 +238,12 @@ fn tool_specs() -> Vec<ToolSpec> {
             tool: describe(
                 "get_impact_graph",
                 "Show the shape of what one comparison reaches: the modules importing a changed \
-                 file, the tests related to it, and which of those relationships the change added \
-                 or removed.",
+                 file, the tests related to it, and — rooted at a function — the functions it \
+                 calls in its own file and the ones that call it there, with which of those \
+                 relationships the change added or removed.",
                 Schema::new()
                     .optional("file", root_file_argument())
+                    .optional("function_id", root_function_argument())
                     .optional("direction", direction_argument())
                     .optional("relations", relations_argument())
                     .optional("depth", depth_argument())
@@ -388,6 +390,15 @@ fn root_file_argument() -> Value {
     })
 }
 
+fn root_function_argument() -> Value {
+    json!({
+        "type": "string",
+        "description": "Root the graph at one function, by the `function_id` an earlier listing \
+                        reported. Without one, the graph is centered on every changed file. \
+                        Mutually exclusive with `file`.",
+    })
+}
+
 fn direction_argument() -> Value {
     json!({
         "type": "string",
@@ -402,7 +413,7 @@ fn direction_argument() -> Value {
 fn relations_argument() -> Value {
     json!({
         "type": "array",
-        "items": { "type": "string", "enum": ["imports", "tested_by"] },
+        "items": { "type": "string", "enum": ["imports", "tested_by", "calls", "contains"] },
         "description": "Which relationships get_impact_graph may follow. Defaults to every \
                         relation this version resolves.",
     })

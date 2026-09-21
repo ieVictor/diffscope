@@ -112,7 +112,7 @@ struct GraphArguments {
     #[arg(long, value_name = "PATH", conflicts_with = "function")]
     file: Option<String>,
 
-    /// Root the graph at one function.
+    /// Root the graph at one function, by the `function_id` a listing reports.
     #[arg(long, value_name = "FUNCTION_ID")]
     function: Option<String>,
 
@@ -389,12 +389,19 @@ fn revision_name<'a>(answer: &'a Value, revision: &str) -> Result<&'a str, Strin
 }
 
 /// The root the walk started from, or the changed set when none was named.
+///
+/// A module root reads as its path, which is what a reader opens. A function
+/// root reads as its identity instead, because a path alone would not say which
+/// function of that file the graph is centered on.
 fn root_line(answer: &Value) -> String {
-    let named = answer
-        .get("data")
-        .and_then(|data| data.get("root"))
-        .and_then(|root| root.get("path").or_else(|| root.get("id")))
-        .and_then(Value::as_str);
+    let root = answer.get("data").and_then(|data| data.get("root"));
+    let named = match root {
+        Some(root) if root.get("kind").and_then(Value::as_str) == Some("function") => {
+            root.get("id").and_then(Value::as_str)
+        }
+        Some(root) => root.get("path").and_then(Value::as_str),
+        None => None,
+    };
     match named {
         Some(name) => format!("Root: {name}"),
         None => "Root: none (centered on the changed set)".to_owned(),

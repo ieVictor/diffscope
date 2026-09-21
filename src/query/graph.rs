@@ -52,6 +52,9 @@ pub struct GraphRequest {
     /// The changed file the graph is centered on. Absent centers it on the
     /// changed set.
     pub root: Option<String>,
+    /// The function the graph is centered on, when a caller named one. A graph
+    /// has one center, so at most one of the two roots is ever present.
+    pub function_root: Option<String>,
     pub direction: Direction,
     /// The relations the walk may follow, in the supported order.
     pub relations: Vec<Relation>,
@@ -73,7 +76,8 @@ pub struct GraphRequest {
 pub struct Requested<'a> {
     /// The changed file to center the graph on.
     pub file: Option<&'a str>,
-    /// The function to center the graph on. Rejected by this version.
+    /// The function to center the graph on, by the identity the analysis
+    /// reports for it.
     pub function_id: Option<&'a str>,
     /// Which way the walk follows edges; [`Direction::default`] when absent.
     pub direction: Option<Direction>,
@@ -102,8 +106,10 @@ impl GraphRequest {
         result: &AnalysisResult,
         requested: &Requested<'_>,
     ) -> Result<Self, GraphRequestError> {
+        let (root, function_root) = root(result, requested)?;
         Ok(Self {
-            root: root(result, requested)?,
+            root,
+            function_root,
             direction: requested.direction.unwrap_or_default(),
             relations: relations(requested.relations)?,
             depth: requested.depth,
@@ -123,9 +129,7 @@ impl GraphRequest {
     pub fn applied(&self) -> AppliedGraphQuery {
         AppliedGraphQuery {
             file: self.root.clone(),
-            // Nothing else can root a graph in this version: `validate`
-            // rejects the parameter that would.
-            function_id: None,
+            function_id: self.function_root.clone(),
             direction: self.direction.name(),
             relations: self
                 .relations
@@ -160,6 +164,7 @@ pub fn project(
         target,
         &graph::build::Request {
             roots: &roots,
+            function_root: request.function_root.as_deref(),
             direction: request.direction,
             relations: &request.relations,
             depth: request.depth,
@@ -167,14 +172,14 @@ pub fn project(
             limits: request.limits,
         },
     );
-    answer_of(&graph, request)
+    answer_of(&graph, request, root_view(result, request))
 }
 
 /// Project one built graph into the shape an answer carries.
-fn answer_of(graph: &Graph, request: &GraphRequest) -> GraphAnswer {
+fn answer_of(graph: &Graph, request: &GraphRequest, root: Option<RootView>) -> GraphAnswer {
     let recommendation = graph::recommend::evaluate(graph);
     GraphAnswer {
-        root: request.root.as_deref().map(root_view),
+        root,
         graph: GraphView {
             nodes: graph.nodes().iter().map(NodeView::of).collect(),
             edges: graph.edges().iter().map(EdgeView::of).collect(),
@@ -208,7 +213,7 @@ fn answer_of(graph: &Graph, request: &GraphRequest) -> GraphAnswer {
     }
 }
 
-/// The root a graph is centered on, when it is centered on one file.
+/// The root a graph is centered on: one changed file, or one function of one.
 #[derive(Debug, Clone, Serialize)]
 pub struct RootView {
     pub kind: &'static str,
@@ -216,12 +221,40 @@ pub struct RootView {
     pub path: String,
 }
 
-fn root_view(path: &str) -> RootView {
-    RootView {
+/// The root an answer names, when the request named one.
+///
+/// A file root reads as the changed path it centers on. A function root reads
+/// as the function's identity, with the path of the file that declares it, so
+/// a reader sees where the function sits without resolving the identity
+/// itself. The path is the one the function's node carries, so a root and a
+/// node never disagree about where a function is.
+fn root_view(result: &AnalysisResult, request: &GraphRequest) -> Option<RootView> {
+    if let Some(function) = request.function_root.as_deref() {
+        return declaring_path(result, function).map(|path| RootView {
+            kind: NodeKind::Function.name(),
+            id: Node::function_id(function),
+            path: path.to_owned(),
+        });
+    }
+    request.root.as_deref().map(|path| RootView {
         kind: NodeKind::Module.name(),
         id: Node::module_id(path),
         path: path.to_owned(),
-    }
+    })
+}
+
+/// The display path of the file that declares the function, when the analysis
+/// contains it.
+fn declaring_path<'a>(result: &'a AnalysisResult, function_id: &str) -> Option<&'a str> {
+    result
+        .files
+        .iter()
+        .find(|file| {
+            file.functions
+                .iter()
+                .any(|function| super::function_id(file, function) == function_id)
+        })
+        .map(display_path)
 }
 
 /// One node of the delivered graph.
@@ -384,35 +417,38 @@ impl GraphRequestError {
     }
 }
 
-/// The validated root a request names, if it names one.
+/// The validated roots a request names, if it names any.
 ///
 /// `file` and `function_id` are mutually exclusive because a graph has one
 /// center; naming neither centers it on every changed file, which is the
-/// default a reviewer most often wants. A function root is rejected rather
-/// than approximated: placing it needs the call resolution a later milestone
-/// adds, and answering a different question than the one asked is worse than
-/// saying so.
+/// default a reviewer most often wants. Returns the file root and the function
+/// root in that order, at most one of them present. A root the analysis does
+/// not contain is rejected with the identities it does, so a caller that
+/// guessed can correct itself in one step instead of guessing again.
 fn root(
     result: &AnalysisResult,
     requested: &Requested<'_>,
-) -> Result<Option<String>, GraphRequestError> {
+) -> Result<(Option<String>, Option<String>), GraphRequestError> {
     match (requested.file, requested.function_id) {
         (Some(_), Some(_)) => Err(GraphRequestError::new(
-            "`file` and `function_id` are mutually exclusive, and this version roots a graph at \
-             `file` alone; name one changed `file`, or neither to center the graph on every \
+            "`file` and `function_id` are mutually exclusive, and a graph has one center; name \
+             one changed `file` or one `function_id`, or neither to center the graph on every \
              changed file"
                 .to_owned(),
         )),
-        (None, Some(_)) => Err(GraphRequestError::new(
-            "`function_id` cannot root a graph in this version: function roots need call \
-             resolution, and this version roots a graph at a changed `file`; name a changed \
-             `file`, or neither to center the graph on every changed file"
-                .to_owned(),
-        )),
-        (None, None) => Ok(None),
+        (None, Some(function)) => {
+            if declaring_path(result, function).is_some() {
+                Ok((None, Some(function.to_owned())))
+            } else {
+                Err(GraphRequestError::new(describe_unknown_function(
+                    function, result,
+                )))
+            }
+        }
+        (None, None) => Ok((None, None)),
         (Some(file), None) => {
             if changed_paths(result).contains(&file) {
-                Ok(Some(file.to_owned()))
+                Ok((Some(file.to_owned()), None))
             } else {
                 Err(GraphRequestError::new(describe_unknown_file(file, result)))
             }
@@ -423,6 +459,41 @@ fn root(
 /// The changed paths of this analysis, in the analysis's own order.
 fn changed_paths(result: &AnalysisResult) -> Vec<&str> {
     result.files.iter().map(display_path).collect()
+}
+
+/// The message for a `function_id` the analysis does not contain.
+///
+/// Mirrors `describe_unknown` in the harness and `describe_unknown_file`
+/// below: the identities to offer are the analysis's own, ranked so the
+/// likeliest correction comes first, and the list is summarized rather than
+/// truncated silently. The ranking is the one `get_function_change` uses, so
+/// the same unknown identity draws the same suggestions from either method.
+fn describe_unknown_function(requested: &str, result: &AnalysisResult) -> String {
+    // `closest_function_ids` caps its list at the length a message shows, so
+    // the summary here only has to report how many it left out.
+    let known = super::closest_function_ids(result, requested);
+    if known.is_empty() {
+        return format!(
+            "`function_id` must name a function in this analysis: no `{requested}` in this \
+             analysis, which contains no functions"
+        );
+    }
+    let total = result
+        .files
+        .iter()
+        .map(|file| file.functions.len())
+        .sum::<usize>();
+    let remainder = total.saturating_sub(known.len());
+    let more = if remainder == 0 {
+        String::new()
+    } else {
+        format!(" and {remainder} more")
+    };
+    format!(
+        "`function_id` must name a function in this analysis: no `{requested}` in this analysis, \
+         which contains {}{more}",
+        known.join(", ")
+    )
 }
 
 /// The message for a `file` the comparison did not change.
@@ -544,12 +615,13 @@ mod tests {
     fn a_relation_list_is_normalized_to_the_supported_order() {
         let named = [
             "tested_by".to_owned(),
+            "calls".to_owned(),
             "imports".to_owned(),
             "imports".to_owned(),
         ];
         assert_eq!(
-            relations(&named).expect("both relations are supported"),
-            vec![Relation::Imports, Relation::TestedBy]
+            relations(&named).expect("every named relation is supported"),
+            vec![Relation::Imports, Relation::TestedBy, Relation::Calls]
         );
         // An empty list is the documented default, not an empty graph.
         assert_eq!(
@@ -560,15 +632,17 @@ mod tests {
 
     #[test]
     fn an_unsupported_relation_is_rejected_by_name() {
-        let error = relations(&["calls".to_owned()])
-            .expect_err("this version resolves no call relationship");
+        let error =
+            relations(&["extends".to_owned()]).expect_err("this version resolves no extends edge");
         assert!(error.message.contains("`relations`"), "{}", error.message);
         assert!(
-            error.message.contains("imports, tested_by"),
+            error
+                .message
+                .contains("imports, tested_by, calls, contains"),
             "{}",
             error.message
         );
-        assert!(error.message.contains("calls"), "{}", error.message);
+        assert!(error.message.contains("extends"), "{}", error.message);
     }
 
     #[test]
