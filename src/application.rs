@@ -1,8 +1,14 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     AnalysisRequest, DiffScopeError, FileChange, FileStatus,
-    analysis::{FunctionMappingDiagnostic, FunctionMappingDiagnosticCode, map_changed_functions},
+    analysis::{
+        FileFunctionChanges, FunctionMappingDiagnostic, FunctionMappingDiagnosticCode,
+        map_changed_functions,
+    },
     inventory_changes,
     languages::{DiagnosticSeverity, detect_language},
     result::{
@@ -28,8 +34,10 @@ pub fn analyze(request: &AnalysisRequest) -> Result<AnalysisResult, DiffScopeErr
     let mut unsupported_files = 0;
     let mut next_function_id = 1_u64;
 
-    for file in &inventory.files {
-        let (result, supported) = analyze_file(file, &mut next_function_id)?;
+    let mapped_files = map_files(&inventory.files)?;
+
+    for (file, mapped) in inventory.files.iter().zip(mapped_files) {
+        let (result, supported) = build_file_result(file, mapped, &mut next_function_id);
         if supported {
             supported_files += 1;
         } else {
@@ -77,14 +85,85 @@ pub fn analyze(request: &AnalysisRequest) -> Result<AnalysisResult, DiffScopeErr
     })
 }
 
-fn analyze_file(
+/// Map every changed file to its function changes, using the available cores.
+///
+/// Parsing both revisions of a file is the dominant cost of an analysis and is
+/// independent per file. Workers claim files from one shared cursor rather than
+/// taking a fixed slice each, so a single very large file cannot leave the
+/// other workers idle.
+///
+/// Each result carries the index of its input, and results are restored to
+/// input order before they are returned. Parallel execution therefore does not
+/// affect result ordering, and a failing analysis reports the error of the
+/// earliest file exactly as a sequential pass does.
+fn map_files(files: &[FileChange]) -> Result<Vec<FileFunctionChanges>, DiffScopeError> {
+    let workers = worker_count(files.len());
+    if workers < 2 {
+        return files.iter().map(map_changed_functions).collect();
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let mut claimed = Vec::with_capacity(files.len());
+    let mut worker_lost = false;
+
+    std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mapped = Vec::new();
+                    while let Some(index) = claim_index(&cursor, files.len()) {
+                        if let Some(file) = files.get(index) {
+                            mapped.push((index, map_changed_functions(file)));
+                        }
+                    }
+                    mapped
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            match handle.join() {
+                Ok(mapped) => claimed.extend(mapped),
+                Err(_) => worker_lost = true,
+            }
+        }
+    });
+
+    if worker_lost {
+        return Err(DiffScopeError::Language(
+            "a file analysis worker terminated unexpectedly".to_owned(),
+        ));
+    }
+
+    claimed.sort_by_key(|(index, _)| *index);
+    claimed
+        .into_iter()
+        .map(|(_, mapped)| mapped)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn worker_count(file_count: usize) -> usize {
+    if file_count < 2 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    available.min(file_count)
+}
+
+/// Claim the next unanalyzed file index, or report that none is left.
+fn claim_index(cursor: &AtomicUsize, file_count: usize) -> Option<usize> {
+    let index = cursor.fetch_add(1, Ordering::Relaxed);
+    (index < file_count).then_some(index)
+}
+
+fn build_file_result(
     file: &FileChange,
+    mapped: FileFunctionChanges,
     next_function_id: &mut u64,
-) -> Result<(FileResult, bool), DiffScopeError> {
+) -> (FileResult, bool) {
     let path = file.target_path.as_deref().or(file.base_path.as_deref());
     let language = path.and_then(|path| detect_language(Path::new(path)));
     let is_binary = file.status == FileStatus::Binary;
-    let mapped = map_changed_functions(file)?;
     let mut diagnostics = mapped
         .diagnostics
         .iter()
@@ -124,7 +203,7 @@ fn analyze_file(
         })
         .collect();
 
-    Ok((
+    (
         FileResult {
             base_path: file.base_path.clone(),
             target_path: file.target_path.clone(),
@@ -138,7 +217,7 @@ fn analyze_file(
             diagnostics,
         },
         language.is_some() && !is_binary,
-    ))
+    )
 }
 
 fn mapping_diagnostic(diagnostic: &FunctionMappingDiagnostic, path: Option<&str>) -> Diagnostic {
