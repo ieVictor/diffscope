@@ -70,8 +70,7 @@ struct FunctionKey {
 /// Returns an error when language analysis for an available supported source
 /// blob fails before producing an analysis result.
 pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, DiffScopeError> {
-    let base_functions = analyze_blob(file.base_path.as_deref(), &file.base_blob)?;
-    let target_functions = analyze_blob(file.target_path.as_deref(), &file.target_blob)?;
+    let (base_functions, target_functions) = analyze_both_blobs(file)?;
     let mut diagnostics = Vec::new();
     diagnostics.extend(language_diagnostics(&base_functions.diagnostics));
     diagnostics.extend(language_diagnostics(&target_functions.diagnostics));
@@ -164,6 +163,58 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
         functions,
         diagnostics,
     })
+}
+
+/// Parsing work below this many bytes is not worth handing to another thread.
+///
+/// The saving from parsing both revisions at once is bounded by the smaller of
+/// the two parses, so the smaller blob decides. Measured parse throughput is a
+/// few MiB per second, which puts this threshold at roughly ten milliseconds of
+/// work -- far above the cost of starting a thread, and far below the size at
+/// which a file dominates an analysis.
+const PARALLEL_BLOB_THRESHOLD: usize = 64 * 1024;
+
+/// Analyze a file's base and target blobs, concurrently when both are large.
+///
+/// The two blobs are independent. A diff dominated by one very large file
+/// cannot be spread across files, so parsing its two revisions at once is the
+/// only available parallelism. Small blobs stay on the current thread, which
+/// keeps file-heavy diffs from oversubscribing the machine with a second
+/// thread per file.
+///
+/// A base failure takes precedence over a target failure, exactly as it does
+/// when the two blobs are analyzed in sequence.
+fn analyze_both_blobs(file: &FileChange) -> Result<(BlobFunctions, BlobFunctions), DiffScopeError> {
+    if !both_blobs_are_large(file) {
+        let base = analyze_blob(file.base_path.as_deref(), &file.base_blob)?;
+        let target = analyze_blob(file.target_path.as_deref(), &file.target_blob)?;
+        return Ok((base, target));
+    }
+
+    let (base, target) = std::thread::scope(|scope| {
+        let base = scope.spawn(|| analyze_blob(file.base_path.as_deref(), &file.base_blob));
+        let target = analyze_blob(file.target_path.as_deref(), &file.target_blob);
+        (base.join(), target)
+    });
+
+    let Ok(base) = base else {
+        return Err(DiffScopeError::Language(
+            "a blob analysis worker terminated unexpectedly".to_owned(),
+        ));
+    };
+    Ok((base?, target?))
+}
+
+fn both_blobs_are_large(file: &FileChange) -> bool {
+    blob_len(&file.base_blob) >= PARALLEL_BLOB_THRESHOLD
+        && blob_len(&file.target_blob) >= PARALLEL_BLOB_THRESHOLD
+}
+
+fn blob_len(blob: &BlobContent) -> usize {
+    match blob {
+        BlobContent::Available(source) => source.len(),
+        BlobContent::Missing | BlobContent::NotApplicable | BlobContent::Binary => 0,
+    }
 }
 
 #[derive(Debug, Default)]
