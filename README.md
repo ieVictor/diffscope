@@ -213,11 +213,56 @@ $ diffscope --format json HEAD~1 HEAD | jq .summary
 }
 ```
 
+`diffscope graph` answers the relationships of the same comparison instead of its numbers: which modules import a changed file, which tests cover it, and which of those relationships the change added or removed. It walks from one changed file (`--file`) or from the whole changed set, and it renders the result as a dependency diff:
+
+```console
+$ diffscope graph --file packages/compiler-sfc/src/style/cssVars.ts --format diff origin/main HEAD
+  packages/compiler-sfc/__tests__/cssVars.spec.ts -[tested_by]-> packages/compiler-sfc/src/style/cssVars.ts
+  packages/compiler-sfc/src/compileStyle.ts -> packages/compiler-sfc/src/style/cssVars.ts
+- packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/style/legacyParser.ts
++ packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/style/parse.ts
+```
+
+Each line is one relationship, ordered by source, relation, and target: `-` marks what the change removed, `+` what it added, and an unchanged line is the context the graph kept. `imports` is the unnamed default, and a relation other than it is named.
+
+`--format mermaid` emits a `flowchart LR` document instead: a fixed style per node status, a dashed form for a removed relationship, and a dashed form carrying the confidence for a relationship resolved below certainty:
+
+```mermaid
+flowchart LR
+    classDef added fill:#e6ffed,stroke:#22863a
+    classDef removed fill:#ffeef0,stroke:#cb2431
+    classDef modified fill:#fff5b1,stroke:#b08800
+    classDef unchanged fill:#f6f8fa,stroke:#d1d5db
+    n0["cssVars.spec.ts"] -. "~0.8" .-> n2
+    n1["compileStyle.ts"] --> n2
+    n2["cssVars.ts · modified"] -. "removed" .-> n3["legacyParser.ts · removed"]
+    n2 --> n4["parse.ts · added"]
+    class n0 unchanged
+    class n1 unchanged
+    class n2 modified
+    class n3 removed
+    class n4 added
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--file <PATH>` | Root the graph at one changed file. With no root, the graph is centered on the changed set. |
+| `--function <FUNCTION_ID>` | Root the graph at one function. Function roots need call resolution, which DiffScope does not perform: naming one is rejected with a message saying `file` is what it accepts. |
+| `--direction <upstream\|downstream\|both>` | Which way to walk. Default `both`. |
+| `--relations <NAMES>` | Comma-separated relations. Defaults to all supported: `imports`, `tested_by`. |
+| `--depth <N>` | Hops from the root. Default `1`, clamped to 1–3. |
+| `--view <delta\|base\|target>` | Which revision's relationships to show. Default `delta`. |
+| `--max-nodes <N>` | Node budget. Default `30`, clamped to 3–100. |
+| `--max-edges <N>` | Edge budget. Default `60`, clamped to 3–200. |
+| `--format <text\|diff\|mermaid\|json>` | Output form. Default `text`: the comparison, the root, the dependency diff, and whether a diagram is recommended. `diff` and `mermaid` print that rendering alone, so the output can be piped, and `json` prints the same answer the query API returns. |
+
+A relation outside `imports` and `tested_by` and a root that is not a changed file are rejected with an error naming what is accepted, rather than answered with a misleadingly empty graph.
+
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
 ## MCP server
 
-`diffscope mcp` serves five read-only tools over one Git comparison. Every call names the comparison explicitly, so a tool cannot analyze the wrong tree:
+`diffscope mcp` serves six read-only tools over one Git comparison. Every call names the comparison explicitly, so a tool cannot analyze the wrong tree:
 
 | Tool | Answers |
 | --- | --- |
@@ -226,13 +271,14 @@ The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Rendere
 | `list_changed_functions` | Ranked changed functions, each addressed by `function_id`, with metrics, churn, risk, and review priority. |
 | `get_function_change` | One function by `function_id`: its hunks, its reach, and its diagnostics. |
 | `get_analysis_diagnostics` | Diagnostics, optionally scoped to one `file`. |
+| `get_impact_graph` | The module relationships a comparison added, removed, or left in place, walked from one changed file or the changed set, with optional dependency-diff and Mermaid renderings. |
 
 Every tool requires:
 
 - `repository` — a path to the repository or to any path inside its work tree. Relative paths resolve against the server process's working directory.
 - `base` and `target` — committed Git revisions, resolved by the repository's own ref rules. The working tree and index are never inputs.
 
-The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. A tool returns the same envelope as the JSONL protocol — the analysis identity, the applied query with its defaults, the answer, and, for the two list tools, a page — as both a text block and structured content. Passing a page's `next_cursor` back unchanged continues the list.
+The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. `get_impact_graph` takes the shape of the walk instead: `direction` (`upstream`, `downstream`, or `both`), `relations` (any subset of `imports` and `tested_by`), `depth` (default 1, clamped to 1–3), `view` (`delta`, `base`, or `target`), `max_nodes` (default 30, clamped to 3–100), `max_edges` (default 60, clamped to 3–200), and `render` (any subset of `diff` and `mermaid`). A tool returns the same envelope as the JSONL protocol — the analysis identity, the applied query with its defaults, the answer, and, for the two list tools, a page — as both a text block and structured content. Passing a page's `next_cursor` back unchanged continues the list.
 
 Failures are visible in the tool result rather than lost: an unknown `function_id` returns an error naming the closest known ids, and a cursor that belongs to another analysis is rejected instead of silently answering from the wrong list. The process keeps a small number of recent analyses, so the usual summary, then list, then detail sequence analyzes the comparison once.
 
@@ -261,7 +307,7 @@ Each answer carries the resolved base and target commits and the query that prod
 
 ## Low-level JSONL protocol
 
-Adapters that manage a DiffScope process themselves use `--jsonl`. It reads one request per line from standard input and writes and flushes exactly one response per non-empty line to standard output, continuing after request-level errors. The transport protocol version is `2`, and its query envelope is a separately versioned schema (`schema_version: 2`). The MCP server exposes the same five queries over the same projection code; the JSONL protocol additionally has an `analyze` method that returns the complete analysis document.
+Adapters that manage a DiffScope process themselves use `--jsonl`. It reads one request per line from standard input and writes and flushes exactly one response per non-empty line to standard output, continuing after request-level errors. The transport protocol version is `2`, and its query envelope is a separately versioned schema (`schema_version: 2`). The MCP server exposes the same six queries over the same projection code; the JSONL protocol additionally has an `analyze` method that returns the complete analysis document.
 
 ```sh
 echo '{"protocol_version":2,"id":"1","repository":".","base":"main","target":"HEAD",
