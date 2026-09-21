@@ -140,6 +140,21 @@ A file's two revisions are independent, so parsing them at once is the only para
 
 Holding two syntax trees of the same large file at once costs memory: `ts-checker` peak RSS rises from 69,492 KiB to 126,488 KiB. Corpora whose files are mostly below the threshold change little, from 44,100 KiB to 47,864 KiB on `vue-minor` and not at all on `vue-span`. Output remains byte-identical to a sequential analysis on every corpus.
 
+### Analysis size limit
+
+Profiling the real-world corpora showed that peak memory tracks the size of individual files, not the number of changed files: 4,000 changed files of a few KiB each peak at 95,824 KiB, while one changed 13.5 MiB file peaks at 1,535,628 KiB. A syntax tree costs roughly 20 to 57 times the source it describes, depending on syntax density, and both revisions of a file are analyzed at once.
+
+Source blobs above [`MAX_ANALYZED_BLOB_BYTES`](../src/languages/mod.rs) (5 MiB) are therefore inventoried but not parsed, as [`DEFINITIONS.md`](DEFINITIONS.md) requires. The file keeps its status, hunks, and line counts, and reports an `oversized_file` diagnostic instead of function metrics.
+
+| Corpus | Before the limit | With the limit |
+| --- | ---: | ---: |
+| one 13.5 MiB file, wall time | 7.038 s | 190.7 ms |
+| one 13.5 MiB file, peak RSS | 1,535,628 KiB | 58,004 KiB |
+
+Output for every corpus whose files are below the limit is byte-identical to output from before it, including `ts-checker`, whose 2.9 MiB `checker.ts` stays fully analyzed.
+
+The limit bounds any single file, not the total of many. The `codegen` corpus -- 16 changed files of 1.36 MiB each, all below the limit -- still peaks near 1.3 GiB, because up to twelve files are analyzed at once and each holds two syntax trees. Bounding the bytes in flight rather than the number of files is the measured next step.
+
 ### Cumulative effect
 
 Against the first real-world measurement, before whole-range diff collection and parallel analysis:
@@ -153,4 +168,6 @@ Against the first real-world measurement, before whole-range diff collection and
 | vue-span | 4.568 s | 578.8 ms | 7.89x |
 | ts-checker | 1.376 s | 715.8 ms | 1.92x |
 
-Further optimization requires a new measurement. Remaining candidates, in the order the current measurements justify them: reusing one Tree-sitter parser per worker instead of constructing one per blob; and rendering output without buffering the entire result.
+Further optimization requires a new measurement. Phase timings collected on a 13.5 MiB file attribute 47% of analysis CPU to Tree-sitter parsing and 53% to the function collector, of which complexity accounts for roughly two thirds; Git access, grouping, matching, sorting, and rendering are each under 3%. On the `codegen` corpus the balance inverts and Git dominates at 83%, split evenly between the patch and numstat calls, which compute the same diff twice; requesting both from one invocation was measured and does not help, because Git recomputes internally.
+
+Remaining candidates, in the order the current measurements justify them: computing both complexity metrics in one traversal instead of two, measured at 7% to 14% end to end with byte-identical output; bounding the bytes analyzed at once; deriving binary status from loaded blob content instead of a second Git diff; and rendering output without buffering the entire result.
