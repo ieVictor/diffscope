@@ -1,6 +1,9 @@
 mod typescript;
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use crate::{DiffScopeError, metrics::FunctionMetrics};
 
@@ -97,8 +100,15 @@ const IMPORT_SCAN_MARGIN: usize = 512;
 /// What one file imports, and whether the whole file was examined.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportScan {
-    /// Module specifiers exactly as written, before any resolution.
-    pub specifiers: BTreeSet<String>,
+    /// Module specifiers exactly as written, before any resolution, each with
+    /// the 1-based line its statement sits on.
+    ///
+    /// The specifier is what an edge is resolved from and the line is where a
+    /// reader checks that the edge exists, so the scan reports the two
+    /// together. A specifier imported twice is one edge with one site, and the
+    /// earliest line seen for it is kept. The keys are ordered exactly as the
+    /// set of specifiers was, so nothing about the scan's determinism moves.
+    pub specifiers: BTreeMap<String, u32>,
     /// The file was longer than [`MAX_IMPORT_SCAN_BYTES`] and was not read whole.
     pub truncated: bool,
 }
@@ -157,7 +167,7 @@ impl ImportScanner {
             Language::Tsx => &mut self.tsx,
         };
         let mut specifiers = analyzer.scan_imports(head)?;
-        specifiers.retain(|specifier| !specifier.is_empty());
+        specifiers.retain(|specifier, _| !specifier.is_empty());
         Ok(ImportScan {
             specifiers,
             truncated,
