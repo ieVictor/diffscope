@@ -131,7 +131,6 @@ impl<'source> FunctionCollector<'source> {
         self.functions.push(FunctionDefinition {
             language: self.language,
             kind,
-            symbol_id: symbol_id(kind, &qualified_name),
             qualified_name,
             range: SourceRange::from_tree_sitter(node.range())?,
             metrics: function_metrics(node, self.source)?,
@@ -190,16 +189,6 @@ const ANONYMOUS_NAME: &str = "<anonymous>";
 /// arbitrarily long. Truncation is deterministic so the same source always
 /// produces the same identity.
 const MAX_SEGMENT_BYTES: usize = 64;
-
-fn symbol_id(kind: FunctionKind, qualified_name: &str) -> String {
-    let tag = match kind {
-        FunctionKind::Function => "fn",
-        FunctionKind::Method => "method",
-        FunctionKind::Constructor => "ctor",
-        FunctionKind::ArrowFunction => "arrow",
-    };
-    format!("{tag}:{qualified_name}")
-}
 
 fn function_kind(node: Node<'_>, source: &str) -> Option<FunctionKind> {
     match node.kind() {

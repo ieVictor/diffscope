@@ -32,9 +32,6 @@ pub struct SourceRange {
 pub struct FunctionDefinition {
     pub language: Language,
     pub kind: FunctionKind,
-    /// Stable identity of this function within its file, independent of line
-    /// numbers. Callers pass it back to address one function.
-    pub symbol_id: String,
     pub qualified_name: String,
     pub range: SourceRange,
     pub metrics: FunctionMetrics,
@@ -126,6 +123,23 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
     match language {
         Language::TypeScript | Language::Tsx => TypeScriptAnalyzer::new(language)?.analyze(source),
     }
+}
+
+/// Address one function within its file, independently of line numbers.
+///
+/// The kind is included because a name alone does not separate a method from an
+/// arrow function assigned to a property of the same name. Callers pass this
+/// back to ask about one function, and a bare qualified name is also accepted
+/// when it is unambiguous.
+#[must_use]
+pub fn symbol_id(kind: FunctionKind, qualified_name: &str) -> String {
+    let tag = match kind {
+        FunctionKind::Function => "fn",
+        FunctionKind::Method => "method",
+        FunctionKind::Constructor => "ctor",
+        FunctionKind::ArrowFunction => "arrow",
+    };
+    format!("{tag}:{qualified_name}")
 }
 
 /// Hash source text, treating every run of whitespace as a single space.

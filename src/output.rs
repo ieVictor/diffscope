@@ -125,7 +125,7 @@ fn render_diagnostic(output: &mut String, diagnostic: &Diagnostic, indent: &str)
     );
 }
 
-fn file_status(status: FileStatus) -> &'static str {
+pub(crate) fn file_status(status: FileStatus) -> &'static str {
     match status {
         FileStatus::Added => "added",
         FileStatus::Deleted => "deleted",
@@ -135,7 +135,7 @@ fn file_status(status: FileStatus) -> &'static str {
     }
 }
 
-fn function_status(status: FunctionChangeStatus) -> &'static str {
+pub(crate) fn function_status(status: FunctionChangeStatus) -> &'static str {
     match status {
         FunctionChangeStatus::Added => "added",
         FunctionChangeStatus::Removed => "removed",
@@ -144,14 +144,14 @@ fn function_status(status: FunctionChangeStatus) -> &'static str {
     }
 }
 
-fn language(language: Language) -> &'static str {
+pub(crate) fn language(language: Language) -> &'static str {
     match language {
         Language::TypeScript => "typescript",
         Language::Tsx => "tsx",
     }
 }
 
-fn function_kind(kind: FunctionKind) -> &'static str {
+pub(crate) fn function_kind(kind: FunctionKind) -> &'static str {
     match kind {
         FunctionKind::Function => "function",
         FunctionKind::Method => "method",
@@ -160,7 +160,7 @@ fn function_kind(kind: FunctionKind) -> &'static str {
     }
 }
 
-fn severity(severity: DiagnosticSeverity) -> &'static str {
+pub(crate) fn severity(severity: DiagnosticSeverity) -> &'static str {
     match severity {
         DiagnosticSeverity::Info => "info",
         DiagnosticSeverity::Warning => "warning",
@@ -168,7 +168,7 @@ fn severity(severity: DiagnosticSeverity) -> &'static str {
     }
 }
 
-fn diagnostic_code(code: DiagnosticCode) -> &'static str {
+pub(crate) fn diagnostic_code(code: DiagnosticCode) -> &'static str {
     match code {
         DiagnosticCode::UnsupportedLanguage => "unsupported_language",
         DiagnosticCode::BinaryFile => "binary_file",
