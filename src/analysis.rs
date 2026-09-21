@@ -255,12 +255,20 @@ fn key_for(function: &FunctionDefinition) -> FunctionKey {
     }
 }
 
+/// Decide whether a matched function changed between the two revisions.
+///
+/// A function is modified when a diff hunk touches it on either side, or when
+/// its metrics differ. Absolute source ranges are deliberately not compared:
+/// an edit anywhere above a function shifts every later function's line
+/// numbers, and reporting those as modified buries the functions that really
+/// changed. Moved functions still intersect a hunk at both their old and new
+/// positions, so they remain modified.
 fn function_changed(
     base_function: &FunctionDefinition,
     target_function: &FunctionDefinition,
     hunks: &[DiffHunk],
 ) -> bool {
-    base_function.range != target_function.range
+    base_function.metrics != target_function.metrics
         || hunks.iter().any(|hunk| {
             range_intersects_hunk_side(&base_function.range, hunk.base_start, hunk.base_count)
                 || range_intersects_hunk_side(
