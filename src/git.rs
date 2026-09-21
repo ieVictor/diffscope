@@ -187,7 +187,7 @@ impl Repository {
         target_commit: &str,
         path: &str,
     ) -> Result<Vec<DiffHunk>, DiffScopeError> {
-        let output = self.git([
+        let output = self.git_lossy([
             "diff",
             "--unified=0",
             "--no-ext-diff",
@@ -205,7 +205,8 @@ impl Repository {
         target_commit: &str,
         path: &str,
     ) -> Result<bool, DiffScopeError> {
-        let output = self.git(["diff", "--numstat", base_commit, target_commit, "--", path])?;
+        let output =
+            self.git_lossy(["diff", "--numstat", base_commit, target_commit, "--", path])?;
         Ok(output.lines().any(|line| line.starts_with("-\t-\t")))
     }
 
@@ -278,6 +279,10 @@ impl Repository {
         run_git(&self.root, args)
     }
 
+    fn git_lossy<const N: usize>(&self, args: [&str; N]) -> Result<String, DiffScopeError> {
+        run_git_lossy(&self.root, args)
+    }
+
     fn git_bytes<const N: usize>(&self, args: [&str; N]) -> Result<Vec<u8>, DiffScopeError> {
         run_git_bytes(&self.root, args)
     }
@@ -288,6 +293,18 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String, DiffSc
     String::from_utf8(bytes).map_err(|error| {
         DiffScopeError::InvalidGitOutput(format!("git emitted non-UTF-8 text: {error}"))
     })
+}
+
+/// Run Git and decode its output with lossy UTF-8 replacement.
+///
+/// Diff output embeds content from the analyzed repository, which is untrusted
+/// and need not be valid UTF-8. Git writes every field this module parses out
+/// of a diff -- hunk headers, line prefixes, and numstat columns -- as ASCII,
+/// so replacing invalid sequences inside content preserves those fields while
+/// keeping one malformed file from failing the whole analysis.
+fn run_git_lossy<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String, DiffScopeError> {
+    let bytes = run_git_bytes(cwd, args)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn run_git_bytes<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Vec<u8>, DiffScopeError> {
