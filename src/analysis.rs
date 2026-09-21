@@ -483,6 +483,71 @@ mod tests {
     }
 
     #[test]
+    fn analyzes_large_blobs_on_separate_threads_with_the_same_result() {
+        use std::fmt::Write as _;
+
+        // Both revisions exceed PARALLEL_BLOB_THRESHOLD, so they are parsed
+        // concurrently. The mapping must match what a sequential parse of the
+        // same sources produces.
+        let mut base = String::new();
+        let mut target = String::new();
+        for index in 0..2_000 {
+            writeln!(
+                base,
+                "export function fn{index}(value: number): number {{ return value + {index}; }}"
+            )
+            .expect("write base fixture");
+            let body = if index == 1_000 {
+                "if (value > 0) { return value; } return 0;".to_owned()
+            } else {
+                format!("return value + {index};")
+            };
+            writeln!(
+                target,
+                "export function fn{index}(value: number): number {{ {body} }}"
+            )
+            .expect("write target fixture");
+        }
+
+        assert!(base.len() > super::PARALLEL_BLOB_THRESHOLD);
+        assert!(target.len() > super::PARALLEL_BLOB_THRESHOLD);
+
+        let file = file_change(base.as_bytes(), target.as_bytes(), 1_001, 1, 1_001, 1);
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+
+        assert_eq!(mapped.functions.len(), 2_000);
+        assert!(mapped.diagnostics.is_empty());
+
+        let edited = mapped
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "fn1000")
+            .expect("edited function is mapped");
+        assert_eq!(edited.status, FunctionChangeStatus::Modified);
+        assert_eq!(
+            edited
+                .metrics_before
+                .as_ref()
+                .map(|metrics| metrics.cyclomatic_complexity),
+            Some(1)
+        );
+        assert_eq!(
+            edited
+                .metrics_after
+                .as_ref()
+                .map(|metrics| metrics.cyclomatic_complexity),
+            Some(2)
+        );
+
+        let untouched = mapped
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "fn0")
+            .expect("untouched function is mapped");
+        assert_eq!(untouched.status, FunctionChangeStatus::Unchanged);
+    }
+
+    #[test]
     fn matches_functions_across_file_renames() {
         let mut file = file_change(
             b"function stable() { return 1; }\n",
@@ -557,8 +622,8 @@ mod tests {
     }
 
     fn file_change(
-        base: &'static [u8],
-        target: &'static [u8],
+        base: &[u8],
+        target: &[u8],
         base_start: u32,
         base_count: u32,
         target_start: u32,
