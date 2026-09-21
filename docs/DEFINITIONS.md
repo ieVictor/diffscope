@@ -1,6 +1,11 @@
 # Stable Definitions
 
-This document defines DiffScope result semantics for schema version `1`. Later milestones must preserve these definitions unless a documented defect requires an additive clarification or a future schema version.
+This document defines DiffScope result semantics. Two schemas are versioned separately:
+
+- The **core output schema**, version `1`, is the complete analysis document emitted by `--format json` and by the JSONL `analyze` method. It is versioned independently of the query API.
+- The **query envelope schema**, version `2`, is the shape of the JSONL query API: a common envelope that carries the projection inputs, the applied query, the method answer, and a page. The query layer projects one analysis into the answer a caller asked for; it adds no analysis of its own, so a query answer never disagrees with the analysis it came from.
+
+Unless a section names a schema, its definitions apply to both.
 
 ## Revision and diff semantics
 
@@ -50,7 +55,7 @@ Complexity metrics are language-specific implementations of these shared concept
 
 ### TypeScript metric rules
 
-For schema version `1`, TypeScript and TSX functions calculate metrics from Tree-sitter function, method, constructor, and arrow-function nodes.
+TypeScript and TSX functions calculate metrics from Tree-sitter function, method, constructor, and arrow-function nodes.
 
 - LOC is measured over the complete function node range.
 - Source LOC removes `//` line comments and `/* ... */` block comments before counting non-blank lines. Comment markers inside string and template literals are treated as source text.
@@ -72,7 +77,9 @@ For schema version `1`, TypeScript and TSX functions calculate metrics from Tree
   - Otherwise the segment is the callee and the argument's position, as `useEffect#0`.
   - The ordinal counts only the anonymous functions of the same containing construct. It is never counted across the file: a file-wide ordinal makes a function's identity depend on how many anonymous functions precede it, so inserting one callback renames every later one and matching then pairs unrelated bodies.
   - Call labels are collapsed to single spaces and truncated to 64 bytes, with `...` appended, so that an arbitrarily long string literal cannot produce an arbitrarily long identity.
-- `symbol_id` addresses one function within its file as `<kind>:<qualified_name>`, where kind is `fn`, `method`, `ctor`, or `arrow`. Queries accept either a `symbol_id` or a bare `qualified_name`.
+- The query layer addresses one function by `function_id`, a deterministic identifier unique within an analysis. It is built from the function's path, its symbol identity, the revision side the definition sits on, and its position there: `<path>#<symbol>@<base|target>:<line>:<column>`. A present target function is addressed at its target range, because that is what a caller reads and reviews; a removed function is addressed at its base range. A definition with neither range — no such case is produced today — would be addressed as `none` at line and column `0`. Two functions that share a name in one file — an addition and a removal, or one name declared on both sides — stay distinct.
+- `symbol` is the human-readable identity `<kind>:<qualified_name>`, where kind is `fn`, `method`, `ctor`, or `arrow`. Query function records carry `symbol` and `qualified_name` next to `function_id`; only `function_id` is accepted by a detail query.
+- The complete analysis document (core output schema version 1) keeps its own per-function `id`, a deterministic sequential identifier scoped to one analysis result. It is not a query handle.
 - Before-and-after matching first uses stable semantic identity: language, qualified name, and kind within matched files.
 - For renamed files, matching uses the base path and target path from the rename pair as the same file identity.
 - If exactly one base function and one target function share the stable semantic identity, they are matched even when their source ranges or signatures changed.
@@ -139,33 +146,52 @@ A test is offered as related to a changed file when it **imports that file direc
 
 Indirect imports are deliberately not offered. Through a package's barrel module almost every test reaches almost every file: on a real Vue revision one shared utility is reached by 166 modules within two hops, and the tests that surface are the compiler's, not the utility's. That reach is still reported, as `nearby_importers`, because a large number is itself a useful signal that a file is widely re-exported.
 
-## Risk
+## Risk and review priority
 
-Risk ranks changed functions by how much review attention they are likely to need. It is a ranking aid: it does not judge whether code is good, and it cannot know what a change was for.
+Two additive, deterministic scores rank changed functions. Both are ranking aids: they do not judge whether code is good, and they cannot know what a change was for.
 
-Each rule that applies contributes points and one reason:
+- **Intrinsic risk** scores what a function's own code became: complexity and churn. It deliberately excludes the module's reach and the file's classification.
+- **Review priority** starts from the intrinsic score and adds what the function's position exposes: its name in the module's public surface, how many modules import the file containing it, and whether that file is production source.
 
-| Points | Rule |
-| ---: | --- |
-| 3 / 2 / 1 | Cognitive complexity increased by at least 10 / 5 / 2. |
-| 2 / 1 | Cyclomatic complexity increased by at least 5 / 2. |
-| 2 / 1 | Cognitive complexity is at least 30 / 15 after the change. |
-| 1 | At least 30 lines changed inside the function. |
-| 1 | An added function whose cognitive complexity is already at least 10. |
-| 3 | The function's name is no longer exported. |
-| 1 | The function's name is newly exported. |
-| 2 / 1 | The file is imported directly by at least 20 / 5 modules. |
-| 1 | The file is classified `source`. |
+Each score is an assessment object with `model`, `maximum_score`, `score`, `level`, and `reasons`. Every reason is `{code, message, value}`; `value` carries the measured integer when the rule has one and is omitted otherwise. The models are `diffscope-risk-v1` (maximum score 8) and `diffscope-review-priority-v1` (maximum score 14).
 
-A score of 5 or more is `high`, 2 or more is `medium`, and anything else is `low`. A match confidence below `1.0` adds a reason but no points, because uncertainty about identity is not by itself a reason to review.
+Each rule that applies contributes points and one reason.
 
-The rules are additive so that no single large but harmless number, such as a reformatted file's churn, can dominate the ranking. Every assessment reports its score and its reasons, so a caller who disagrees with the weighting can ignore the level entirely.
+Intrinsic risk:
+
+| Points | Code | Trigger | Message |
+| ---: | --- | --- | --- |
+| 3 / 2 / 1 | `cognitive_complexity_increased` | Cognitive complexity increased by at least 10 / 5 / 2. | `cognitive complexity increased by {n}` |
+| 2 / 1 | `cyclomatic_complexity_increased` | Cyclomatic complexity increased by at least 5 / 2. | `cyclomatic complexity increased by {n}` |
+| 2 / 1 | `cognitive_complexity_after` | Cognitive complexity is at least 30 / 15 after the change. | `cognitive complexity is {n} after the change` |
+| 1 | `high_churn` | At least 30 lines changed inside the function. | `{n} lines changed inside the function` |
+| 0 | `match_confidence` | Match confidence below `1.0`. | `matched with {f} confidence; verify it is the same function` |
+
+An added function has no before, so its complexity is scored absolutely. These rules replace both the increase rule and the after rule, and never use "increased" wording:
+
+| Points | Code | Trigger | Message |
+| ---: | --- | --- | --- |
+| 3 / 2 / 1 | `added_function_cognitive_complexity` | Cognitive complexity is at least 30 / 15 / 10. | `new function has cognitive complexity {n}` |
+| 2 / 1 | `added_function_cyclomatic_complexity` | Cyclomatic complexity is at least 20 / 10. | `new function has cyclomatic complexity {n}` |
+
+Review priority adds, after the intrinsic reasons (the match-confidence caveat stays last, as it does in intrinsic risk):
+
+| Points | Code | Trigger | Message |
+| ---: | --- | --- | --- |
+| 3 | `export_removed` | The function's name is no longer exported. | `no longer exported; every importer of this name breaks` |
+| 1 | `export_added` | The function's name is newly exported. | `newly part of the module's public surface` |
+| 2 / 1 | `containing_module_direct_importers` | The containing module is imported directly by at least 20 / 5 modules. | `containing module is imported directly by {n} modules` |
+| 1 | `production_source` | The containing file is classified `source`. | `production source file` |
+
+Both models bucket the same way: a score of 5 or more is `high`, 2 or more is `medium`, and anything else is `low` (levels serialize as those lowercase strings). `review_priority.score` is at least `risk.score`, so its level is never below intrinsic risk's.
+
+The rules are additive so that no single large but harmless number, such as a reformatted file's churn, can dominate the ranking. A match confidence below `1.0` adds a reason but no points, because uncertainty about identity is not by itself a reason to review. Every assessment reports its score and its reasons, so a caller who disagrees with the weighting can ignore the level entirely and rank on the underlying numbers.
 
 ## Diagnostics
 
 Diagnostics are structured, deterministic, and attached to the narrowest applicable scope: repository, file, or function.
 
-Required diagnostic categories for schema version `1`:
+Required diagnostic categories:
 
 - `unsupported_language`
 - `binary_file`
@@ -178,7 +204,7 @@ Required diagnostic categories for schema version `1`:
 - `ambiguous_function_match`
 - `metric_unavailable`
 
-Diagnostics include a stable code, severity (`info`, `warning`, or `error`), human message, optional path, optional range, and optional related entity identifiers. Diagnostics are sorted by severity, code, path, range, and message.
+Diagnostics include a stable code, severity (`info`, `warning`, or `error`), human message, optional path, optional range, and optional related entity identifiers. Diagnostics are sorted by severity, code, path, range, and message. Query answers report diagnostic counts as `info`, `warnings`, `errors`, and `total`, so a caller can size the whole list before reading it.
 
 ## Deterministic ordering
 
@@ -189,9 +215,9 @@ Diagnostics include a stable code, severity (`info`, `warning`, or `error`), hum
 - JSON object field order is not semantically meaningful, but golden outputs may use a stable renderer order.
 - Parallel execution must not affect result ordering, including when analysis is throttled to bound memory.
 
-## Schema version 1 result model
+## Core output schema version 1 result model
 
-The machine-readable output has `schema_version: 1` and contains only data derived from explicit inputs.
+The complete analysis document has `schema_version: 1` and contains only data derived from explicit inputs. It is emitted by `--format json` and by the JSONL `analyze` method.
 
 Top-level fields:
 
@@ -221,14 +247,14 @@ File result fields:
 
 Function result fields:
 
-- `id`: deterministic identifier scoped to one analysis result.
+- `id`: deterministic sequential identifier scoped to one analysis result, such as `function-1`. The query layer addresses functions by `function_id` instead.
 - `status`: `added`, `removed`, `modified`, or `unchanged`.
 - `kind`: language-specific function kind.
 - `qualified_name`: qualified function name or deterministic synthetic name.
 - `base_range`: source range before change, absent for added functions.
 - `target_range`: source range after change, absent for removed functions.
 - `metrics_before`: LOC and complexity metrics before change, absent when no base function exists.
-- `metrics_after`: LOC and complexity metrics after change, absent when no target function exists.
+- `metrics_after`: LOC and complexity metrics after the change, absent when no target function exists.
 - `change`: `changed_hunks`, `lines_added`, `lines_removed`, and `hunk_overlap` for this function. Omitted for a function the diff does not touch.
 - `match_confidence`: how firmly this pair is believed to be the same function.
 - `diagnostics`: function-level diagnostics.
@@ -237,21 +263,30 @@ Metric values are either available numeric values or unavailable with a reason a
 
 ## Queries
 
-A whole analysis answers every question at once and is far larger than any one question needs. Queries project one analysis into the shape a caller asked for. They add no analysis of their own, so a query answer never disagrees with the analysis it came from.
+A whole analysis answers every question at once and is far larger than any one question needs. Queries project one analysis into the shape a caller asked for. They add no analysis of their own, so a query answer never disagrees with the analysis it came from. The JSONL harness protocol carries them; [`HARNESS.md`](HARNESS.md) defines the transport, and the sections here define the semantics.
 
 | Query | Returns |
 | --- | --- |
 | `get_change_summary` | File, line, function, and diagnostic counts; changed files per classification; per-area line totals and complexity totals; a short ranked shortlist of review candidates. |
-| `list_changed_files` | Changed files, ranked, with per-file complexity totals and export changes. Filters: `classification`, `minimum_risk`. |
-| `list_changed_functions` | Changed functions, ranked, with metric deltas, churn, risk and its reasons, and match confidence. Filters: `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`. |
-| `get_function_change` | One function in full, with the hunks that touch it and its diagnostics. |
+| `list_changed_files` | Changed files, ranked, with per-file complexity totals, risk and review priority, change shape, and export changes. Filters: `classification`, `minimum_risk`. |
+| `list_changed_functions` | Changed functions, ranked, with metric deltas, churn, risk and review priority, and match confidence. Filters: `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`. |
+| `get_function_change` | One function in full, with the hunks that touch it, its reach, and its diagnostics. Addressed by `function_id` only. |
 | `get_analysis_diagnostics` | Diagnostics for the analysis, optionally scoped to one file. |
 
-- **Unchanged functions are never returned by default.** They are the large majority of any analysis. `include_unchanged` retrieves them.
-- Every list paginates. `limit` defaults to 50 and is capped at 200; `offset` skips rows. Each answer reports `returned`, `total`, `has_more`, and `next_offset`.
-- Ranking is total and deterministic. Functions order by risk score, then cognitive delta, then churn, then file path, then symbol. Files order by risk, then total changed lines, then path. Equal rows keep the analysis order, so paging never drops or repeats a row.
+Every query answer is wrapped in the common envelope:
+
+- `analysis`: the projection inputs — an opaque, deterministic analysis id, the query envelope schema version (`2`), the tool version, and the resolved base and target revisions. The id is a digest of the resolved base commit, the resolved target commit, the tool version, and the envelope schema version, so it is identical for the same inputs in every process and changes when any input changes.
+- `query`: the canonical applied parameters and defaults, so a response can be interpreted without its request.
+- `data`: the method's answer, defined below.
+- `page`: present for the two list methods, absent otherwise.
+
+- **Unchanged functions are never returned by default.** They are the large majority of any analysis. `include_unchanged` retrieves them. `minimum_risk` compares a row's intrinsic-risk level; `min_complexity_delta` compares the larger of a function's cognitive and cyclomatic deltas.
+- Every list paginates by opaque cursor. `limit` defaults to 50 and is clamped to 1–200. A cursor binds the schema version, analysis id, method, normalized applied query, and continuation position; a cursor presented with any of those changed is rejected as `invalid_params` rather than answered from the wrong list. Because an analysis is immutable, a continuation recorded in a cursor stays valid for the life of that analysis.
+- Every list answer reports `returned`, `total`, `has_more`, and `next_cursor`. `next_cursor` is always present: `null` on the last page, a cursor string otherwise.
+- Ranking is total and deterministic. Functions order by review-priority score, then intrinsic-risk score, then cognitive delta, then churn, then file path, then symbol. Files order by review-priority level, then intrinsic-risk level, then total changed lines, then path. Change areas order by review-priority level, then intrinsic-risk level, then file count, then name. Equal rows keep the analysis order, so paging never drops or repeats a row.
 - Change areas are derived from paths. Inside a directory that holds one project per child, such as `packages`, the area is that child; otherwise it is the top-level directory. **An area's name is a path.** DiffScope does not infer a semantic label such as "runtime rendering" for a directory, because nothing in a diff says what a directory is for.
 - Complexity is aggregated per file and per area over every function, including untouched ones. Summing both revisions is what makes a refactor legible as a unit: extracting a helper moves complexity out of one function into a new one, and only the totals show whether the change reduced complexity or merely relocated it.
+- `change_shape`, reported on `list_changed_files` file records, is a statement about the shape of the change: `complexity_extraction` when a substantial added helper — an added function whose cognitive complexity after the change is at least 5 — coincides with no net file cognitive-complexity increase and with a modified or removed function that loses cognitive complexity. A pure extraction conserves the file total (the helper takes exactly what the function gave up), and conservation counts; a change that merely rearranged the same complexity without shrinking any function is `other`, which is also the value for every change that does not match all conditions.
 
 ### Query result fields
 
@@ -261,19 +296,21 @@ Shared shapes:
 - `complexity`: `cyclomatic_before`, `cyclomatic_after`, `cyclomatic_delta`, `cognitive_before`, `cognitive_after`, `cognitive_delta`, `source_loc_before`, `source_loc_after`.
 - `metrics`: `physical_loc`, `source_loc`, `cyclomatic_complexity`, `cognitive_complexity`, each an object of `before`, `after`, and `delta`. `before` is absent for an added function and `after` for a removed one.
 - `change`: `changed_hunks`, `lines_added`, `lines_removed`, `hunk_overlap`. Absent for a function the diff does not touch.
-- `risk`: `level`, `score`, `reasons`.
+- `risk`: the intrinsic assessment: `model`, `maximum_score`, `score`, `level`, `reasons`.
+- `review_priority`: the review-priority assessment, in the same shape.
+- `reason`: `code`, `message`, and `value` when the rule measured an integer.
 - `impact`: `direct_importers`, `nearby_importers`, `related_tests`, each related test carrying `file`, `reason`, and `confidence`. The whole object is absent when the import graph was not built, which is not the same as nothing reaching the file.
-- `page`: `returned`, `total`, `has_more`, and `next_offset` when more remain.
+- `page`: `returned`, `total`, `has_more`, and `next_cursor`.
 
-`get_change_summary`: `base` and `target` (each `id`, `display_name`); `files` (`changed`, `supported`, `unsupported`, `by_classification`); `lines`; `functions` (`added`, `removed`, `modified`, `unchanged`); `diagnostics` (`warnings`, `errors`); `change_areas`, each with `name`, `files`, `lines`, `risk`, and `complexity`; and `review_candidates`, each with `file`, `symbol`, `status`, `complexity_delta` (`cyclomatic`, `cognitive`), `risk`, and `match_confidence`.
+`get_change_summary` data: `base` and `target` (each `id`, `display_name`); `files` (`changed`, `supported`, `unsupported`, `by_classification`); `lines`; `functions` (`added`, `removed`, `modified`, `unchanged`); `diagnostics` (`info`, `warnings`, `errors`, `total`); `change_areas`, each with `name`, `files`, `lines`, `risk`, `review_priority` (each a level, not the full assessment), and `complexity`; and up to five `review_candidates`, each with `function_id`, `file`, `symbol`, `status`, `complexity_delta` (`cyclomatic`, `cognitive`), `risk`, `review_priority` (each a level), and `match_confidence`.
 
-`list_changed_files`: `files` and `page`. Each file carries `path`, `renamed_from` when the path changed, `status`, `classification`, `language`, `area`, `lines`, `functions`, `complexity`, `risk`, `exports` (`added`, `removed`), `impact`, and `diagnostics`.
+`list_changed_files` data: `files` and `page`. Each file carries `path`, `renamed_from` when the path changed, `status`, `classification`, `language`, `area`, `lines`, `functions`, `complexity`, `risk`, `review_priority`, `change_shape`, `exports` (`added`, `removed`), `impact`, and `diagnostics`.
 
-`list_changed_functions`: `functions` and `page`. Each function carries `file`, `symbol`, `qualified_name`, `kind`, `status`, `classification`, `metrics`, `change`, `risk`, `match_confidence`, and `range` (`before` and `after`, each `start_line` and `end_line`).
+`list_changed_functions` data: `functions` and `page`. Each function carries `function_id`, `file`, `symbol`, `qualified_name`, `kind`, `status`, `classification`, `metrics`, `change`, `risk`, `review_priority`, `match_confidence`, and `range` (`before` and `after`, each `start_line` and `end_line`).
 
-`get_function_change`: one function's fields as above, plus `hunks` (`base_start`, `base_count`, `target_start`, `target_count`) for the hunks touching it, `impact`, and `diagnostics`. Naming a symbol the file does not contain is an error whose message lists the symbols it does contain.
+`get_function_change` data: `function` (the same record the list returns), `hunks` (`base_start`, `base_count`, `target_start`, `target_count`) for the hunks touching it, `impact`, and `diagnostics`. Naming a `function_id` the analysis does not contain is an error whose message names the closest known function ids.
 
-`get_analysis_diagnostics`: `diagnostics`, each with `code`, `severity`, `message`, `path`, and `related_entity_ids`; plus `counts` (`warnings`, `errors`).
+`get_analysis_diagnostics` data: `diagnostics`, each with `code`, `severity`, `message`, `path`, and `related_entity_ids`; plus `counts` (`info`, `warnings`, `errors`, `total`).
 
 ## Correctness fixtures and benchmark corpus
 

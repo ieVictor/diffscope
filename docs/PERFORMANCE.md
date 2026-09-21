@@ -42,12 +42,14 @@ Measured on 2026-09-21 with:
 | medium | 22.40 ms | 924.40 KiB/s | 6.97 ms |
 | large | 20.95 ms | 2.93 MiB/s | 12.77 ms |
 
-Projecting an analysis into one answer runs on every request, including those served from a cached analysis, so it is the floor on query latency. Over the large tier's 360 function records:
+Projecting an analysis into one answer runs on every request, including those served from a cached analysis, so it is the floor on query latency. Over the large tier's 360 function records, recorded before the query schema cutover:
 
 | Projection | Median estimate |
 | --- | ---: |
 | `get_change_summary` | 303.7 us |
 | `list_changed_functions` | 193.5 us |
+
+The current projections do more per row than these measurements did — two score assessments, the change shape, and `function_id` construction — so the figures are historical reference values rather than current measurements.
 
 The complete large-corpus CLI measured `23.0 ms +/- 0.5 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 4,320 KiB. These numbers are local reference values, not cross-machine performance guarantees.
 
@@ -87,7 +89,7 @@ Both commits were measured in the same session, which is the only comparison tha
 
 An agent asks several questions about one comparison. Each is a projection of the same analysis, so the adapter keeps a small number of recent analyses keyed by the commits the revisions resolve to.
 
-Measured on the Vue comparison below, driving `diffscope --jsonl` with a batch of requests and taking the median of five runs:
+Measured on the Vue comparison below, driving `diffscope --jsonl` with a batch of requests and taking the median of five runs. The figures were recorded with the version-1 protocol; the version-2 envelope adds serialization of the analysis block, the query echo, and the page to each response, which is a small constant against these times.
 
 | Requests, one comparison | Median | Marginal cost per extra query |
 | --- | ---: | ---: |
@@ -117,9 +119,9 @@ Queries that use the graph therefore cost more on a comparison's first request:
 | 1 query, with import graph | 539.7 ms | — |
 | 5 queries, with import graph | 576.7 ms | 9.27 ms |
 
-Response size is the reason the queries exist. For the same 49-file Vue comparison:
+Response size is the reason the queries exist. These figures were recorded under transport protocol version 1 (offset pagination, file-and-symbol detail) and are historical: the version-2 envelope adds the analysis block, the canonical query echo, `function_id` identifiers, and cursor state to every response, so current byte counts differ. What they establish is the ratio — a summary is orders of magnitude smaller than the complete analysis it projects — and that ratio is the reason the queries exist.
 
-| Response | Bytes |
+| Response, protocol version 1 | Bytes |
 | --- | ---: |
 | Complete analysis | 1,099,911 |
 | `get_change_summary` | 9,155 |

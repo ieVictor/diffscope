@@ -20,9 +20,13 @@ CLI / harness adapters
     └── LOC and complexity metrics
          │
          ▼
- Versioned result model
+ Complete analysis (core output schema v1)
     ├── Human-readable output
-    └── JSON / JSONL output
+    ├── JSON output
+    └── Query projections (query envelope schema v2)
+         ├── Deterministic analysis identity
+         ├── Risk and review-priority scoring
+         └── Cursor pagination
 ```
 
 - **Core analysis:** A library independent of terminal and harness concerns.
@@ -30,7 +34,8 @@ CLI / harness adapters
 - **Git adapter:** Reads revisions, diffs, renames, hunks, and blobs without modifying the working tree.
 - **Language analyzers:** Use Tree-sitter grammars and language-specific rules to identify functions and calculate metrics.
 - **Import index:** Resolves each revision's module graph, so a change can be related to the files and tests that reach it.
-- **Query layer:** Projects one analysis into the answer a caller asked for. It filters, ranks, and scores; it performs no analysis of its own.
+- **Query layer:** Projects one analysis into the answer a caller asked for. It filters, ranks, and scores; it performs no analysis of its own. A projection is deterministic and its answer never disagrees with the analysis it came from.
+- **Risk and review-priority models:** Additive, documented scores over measured signals, each rule contributing a structured reason. Intrinsic risk covers complexity and churn; review priority adds public-surface, blast-radius, and source signals.
 - **Interfaces:** The CLI and harness adapters translate inputs and outputs without implementing analysis logic.
 
 Dependencies point inward: interfaces and infrastructure depend on the core, never the reverse.
@@ -45,6 +50,21 @@ Dependencies point inward: interfaces and infrastructure depend on the core, nev
 6. Match functions across revisions.
 7. Calculate LOC, cyclomatic complexity, and cognitive complexity.
 8. Produce deterministic, schema-versioned results.
+
+## Query protocol
+
+The JSONL harness protocol answers scoped questions instead of returning the whole analysis:
+
+- A successful response carries a common envelope: `analysis`, `query`, `data`, and — for list methods — `page`.
+- `analysis` identifies the projection inputs: an opaque, deterministic analysis id, the query envelope schema version, the tool version, and the resolved base and target revisions. The id is a function of the resolved commits, the tool version, and the schema version, so it changes when any of them does.
+- `query` echoes the canonical parameters and defaults that were applied, so a response can be interpreted without the request.
+- Lists paginate by opaque cursor. A cursor binds the schema version, analysis id, method, normalized query, and continuation position; a mismatched cursor is rejected as `invalid_params` rather than answered from the wrong list.
+- Function drill-down is addressed by `function_id`, an identifier that is collision-safe within one analysis and stable for the same inputs.
+
+Two schemas are versioned separately:
+
+- The **core output schema** (`schema_version: 1`) is the complete analysis document emitted by `--format json` and by the JSONL `analyze` method. It is versioned independently of the query API.
+- The **query envelope schema** (`schema_version: 2`) is the shape of the JSONL query API described above, carried by transport protocol version 2.
 
 ## Performance model
 

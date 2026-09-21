@@ -23,25 +23,25 @@ Compare two committed Git revisions from the repository containing the current d
 diffscope <BASE> <TARGET>
 ```
 
-Use `--repository <PATH>` to select another repository and `--format json` for schema-versioned JSON. Human output is the default. Successful and partially supported analyses exit with status `0`, analysis failures with `1`, and invalid command-line usage with `2`.
+Use `--repository <PATH>` to select another repository and `--format json` for the complete analysis document, a versioned schema (`schema_version: 1`). Human output is the default. Successful and partially supported analyses exit with status `0`, analysis failures with `1`, and invalid command-line usage with `2`.
 
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
-Run `diffscope --jsonl` for the long-lived harness protocol over standard input and output. See [`docs/HARNESS.md`](docs/HARNESS.md) for its versioned request and response contract.
+Run `diffscope --jsonl` for the long-lived harness protocol over standard input and output. The transport protocol version is `2`, and its query envelope is a separately versioned schema (`schema_version: 2`). See [`docs/HARNESS.md`](docs/HARNESS.md) for its request and response contract.
 
 ## Queries for coding agents
 
 A complete analysis answers every question at once. For a 49-file diff that is over 1 MB of JSON, four fifths of it functions the change did not touch, which is more than a coding agent should spend its context on.
 
-The harness protocol therefore answers scoped questions: an overview, a filtered and ranked page of candidates, then one function in full. The same comparison summarizes in under 10 KB, and unchanged functions are returned only when asked for. Files are classified as source, test, generated, vendored, lockfile, config, or docs, so a caller can ask for production code alone.
+The harness protocol therefore answers scoped questions: an overview, a filtered and ranked page of candidates, then one function in full. Every successful response carries the same envelope — the analysis it projected, the canonical query and defaults it applied, the answer, and, for list methods, a page — so an answer can be interpreted without the request that produced it. Lists paginate by opaque cursor, and one function is drilled into by the `function_id` a list reports.
+
+Files are classified as source, test, generated, vendored, lockfile, config, or docs, so a caller can ask for production code alone. Ranking is a documented, deterministic score over measured quantities: each function carries an intrinsic-risk score and a review-priority score, and every score carries structured reasons with stable codes, so a caller can rank on the numbers or on the reasons behind them. See [`docs/DEFINITIONS.md`](DEFINITIONS.md) for the queries, the classification rules, and the scoring models.
 
 ```sh
-echo '{"protocol_version":1,"id":"1","repository":".","base":"main","target":"HEAD",
+echo '{"protocol_version":2,"id":"1","repository":".","base":"main","target":"HEAD",
        "method":"list_changed_functions",
        "params":{"classification":"source","minimum_risk":"high","limit":10}}' | diffscope --jsonl
 ```
-
-Ranking is a documented, deterministic score over measured quantities, and every result carries the reasons behind it. See [`docs/DEFINITIONS.md`](docs/DEFINITIONS.md) for the queries, the classification rules, and the risk formula.
 
 ## Local development
 
