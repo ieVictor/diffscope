@@ -275,6 +275,8 @@ fn build_file_result(
                 target_range: function.target_range,
                 metrics_before: function.metrics_before,
                 metrics_after: function.metrics_after,
+                calls_before: function.calls_before,
+                calls_after: function.calls_after,
                 churn: function.churn,
                 match_confidence: function.match_confidence,
                 diagnostics: Vec::new(),
