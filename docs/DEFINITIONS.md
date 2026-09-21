@@ -253,6 +253,28 @@ A whole analysis answers every question at once and is far larger than any one q
 - Change areas are derived from paths. Inside a directory that holds one project per child, such as `packages`, the area is that child; otherwise it is the top-level directory. **An area's name is a path.** DiffScope does not infer a semantic label such as "runtime rendering" for a directory, because nothing in a diff says what a directory is for.
 - Complexity is aggregated per file and per area over every function, including untouched ones. Summing both revisions is what makes a refactor legible as a unit: extracting a helper moves complexity out of one function into a new one, and only the totals show whether the change reduced complexity or merely relocated it.
 
+### Query result fields
+
+Shared shapes:
+
+- `lines`: `added`, `removed`.
+- `complexity`: `cyclomatic_before`, `cyclomatic_after`, `cyclomatic_delta`, `cognitive_before`, `cognitive_after`, `cognitive_delta`, `source_loc_before`, `source_loc_after`.
+- `metrics`: `physical_loc`, `source_loc`, `cyclomatic_complexity`, `cognitive_complexity`, each an object of `before`, `after`, and `delta`. `before` is absent for an added function and `after` for a removed one.
+- `change`: `changed_hunks`, `lines_added`, `lines_removed`, `hunk_overlap`. Absent for a function the diff does not touch.
+- `risk`: `level`, `score`, `reasons`.
+- `impact`: `direct_importers`, `nearby_importers`, `related_tests`, each related test carrying `file`, `reason`, and `confidence`. The whole object is absent when the import graph was not built, which is not the same as nothing reaching the file.
+- `page`: `returned`, `total`, `has_more`, and `next_offset` when more remain.
+
+`get_change_summary`: `base` and `target` (each `id`, `display_name`); `files` (`changed`, `supported`, `unsupported`, `by_classification`); `lines`; `functions` (`added`, `removed`, `modified`, `unchanged`); `diagnostics` (`warnings`, `errors`); `change_areas`, each with `name`, `files`, `lines`, `risk`, and `complexity`; and `review_candidates`, each with `file`, `symbol`, `status`, `complexity_delta` (`cyclomatic`, `cognitive`), `risk`, and `match_confidence`.
+
+`list_changed_files`: `files` and `page`. Each file carries `path`, `renamed_from` when the path changed, `status`, `classification`, `language`, `area`, `lines`, `functions`, `complexity`, `risk`, `exports` (`added`, `removed`), `impact`, and `diagnostics`.
+
+`list_changed_functions`: `functions` and `page`. Each function carries `file`, `symbol`, `qualified_name`, `kind`, `status`, `classification`, `metrics`, `change`, `risk`, `match_confidence`, and `range` (`before` and `after`, each `start_line` and `end_line`).
+
+`get_function_change`: one function's fields as above, plus `hunks` (`base_start`, `base_count`, `target_start`, `target_count`) for the hunks touching it, `impact`, and `diagnostics`. Naming a symbol the file does not contain is an error whose message lists the symbols it does contain.
+
+`get_analysis_diagnostics`: `diagnostics`, each with `code`, `severity`, `message`, `path`, and `related_entity_ids`; plus `counts` (`warnings`, `errors`).
+
 ## Correctness fixtures and benchmark corpus
 
 Milestone 1 defines the required fixture inventory; later milestones implement them as executable tests.
