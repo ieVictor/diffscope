@@ -34,8 +34,18 @@ fn analysis(criterion: &mut Criterion) {
             .iter()
             .map(|file| file.functions.len())
             .sum::<usize>();
+        // Call collection runs inside the collector's own traversal, so it is
+        // part of the time measured below rather than a phase of its own. The
+        // count is reported because the cost is proportional to it: without the
+        // number, a tier's figure cannot be read as evidence about calls.
+        let call_count = baseline
+            .files
+            .iter()
+            .flat_map(|file| &file.functions)
+            .map(|function| function.calls_before.len() + function.calls_after.len())
+            .sum::<usize>();
         eprintln!(
-            "{tier}: changed_files={}, changed_functions={function_count}, analyzed_bytes={analyzed_bytes}",
+            "{tier}: changed_files={}, changed_functions={function_count}, analyzed_bytes={analyzed_bytes}, collected_calls={call_count}",
             baseline.summary.changed_files
         );
 
@@ -119,6 +129,7 @@ fn impact_graph(criterion: &mut Criterion) {
         // both directions, every supported relation, and canonical bounds.
         let request = Request {
             roots: &[],
+            function_root: None,
             direction: Direction::Both,
             relations: Relation::SUPPORTED,
             depth: canonical_depth(None),
