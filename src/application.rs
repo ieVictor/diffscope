@@ -258,6 +258,8 @@ fn build_file_result(
     diagnostics.dedup();
     sort_diagnostics(&mut diagnostics);
 
+    let exports_added = mapped.exports_added.clone();
+    let exports_removed = mapped.exports_removed.clone();
     let functions = mapped
         .functions
         .into_iter()
@@ -291,6 +293,8 @@ fn build_file_result(
             removed_lines: file.removed_lines,
             hunks: file.hunks.clone(),
             functions,
+            exports_added,
+            exports_removed,
             diagnostics,
         },
         language.is_some() && !is_binary,

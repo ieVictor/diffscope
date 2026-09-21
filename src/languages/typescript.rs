@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tree_sitter::{Node, Parser};
 
@@ -45,6 +45,7 @@ impl TypeScriptAnalyzer {
                 return Ok(SourceAnalysis {
                     language: Some(self.language),
                     functions: Vec::new(),
+                    exports: BTreeSet::new(),
                     diagnostics: vec![LanguageDiagnostic {
                         code: LanguageDiagnosticCode::InvalidUtf8,
                         severity: DiagnosticSeverity::Error,
@@ -86,6 +87,7 @@ impl TypeScriptAnalyzer {
         Ok(SourceAnalysis {
             language: Some(self.language),
             functions,
+            exports: collect_exports(root, source_text),
             diagnostics,
         })
     }
@@ -520,6 +522,93 @@ fn is_short_circuit_operator(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|child| matches!(child.kind(), "&&" | "||" | "??"))
+}
+
+/// Collect the names a module exports, as an importer would write them.
+///
+/// Only the export surface is described, never what the exported thing is: a
+/// function that becomes a const of the same name is still the same name to
+/// every caller, and a change that keeps the surface intact does not break
+/// them. Re-exports of a whole module are recorded as `*` because their names
+/// live in a file this analysis has not read.
+fn collect_exports(root: Node<'_>, source: &str) -> BTreeSet<String> {
+    let mut exports = BTreeSet::new();
+    collect_exports_from(root, source, &mut exports);
+    exports
+}
+
+fn collect_exports_from(node: Node<'_>, source: &str, exports: &mut BTreeSet<String>) {
+    if node.kind() == "export_statement" {
+        add_export_names(node, source, exports);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_exports_from(child, source, exports);
+    }
+}
+
+fn add_export_names(statement: Node<'_>, source: &str, exports: &mut BTreeSet<String>) {
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        add_declared_names(declaration, source, exports);
+        return;
+    }
+
+    let mut cursor = statement.walk();
+    let mut named_any = false;
+    for child in statement.named_children(&mut cursor) {
+        match child.kind() {
+            "export_clause" => {
+                let mut clause = child.walk();
+                for specifier in child.named_children(&mut clause) {
+                    let exported = specifier
+                        .child_by_field_name("alias")
+                        .or_else(|| specifier.child_by_field_name("name"));
+                    if let Some(name) = exported.and_then(|name| node_text(name, source)) {
+                        exports.insert(clean_property_name(name));
+                        named_any = true;
+                    }
+                }
+            }
+            "namespace_export" => {
+                exports.insert("*".to_owned());
+                named_any = true;
+            }
+            _ => {}
+        }
+    }
+
+    if named_any {
+        return;
+    }
+    // `export default ...` and bare `export * from "..."` name nothing of their
+    // own, so they are recorded by what they are.
+    let text = node_text(statement, source).unwrap_or_default();
+    if text.starts_with("export default") {
+        exports.insert("default".to_owned());
+    } else if text.starts_with("export *") {
+        exports.insert("*".to_owned());
+    }
+}
+
+fn add_declared_names(declaration: Node<'_>, source: &str, exports: &mut BTreeSet<String>) {
+    match declaration.kind() {
+        "lexical_declaration" | "variable_declaration" => {
+            let mut cursor = declaration.walk();
+            for declarator in declaration.named_children(&mut cursor) {
+                if let Some(name) = declarator
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(name, source))
+                {
+                    exports.insert(clean_property_name(name));
+                }
+            }
+        }
+        _ => {
+            if let Some(name) = explicit_name(declaration, source) {
+                exports.insert(name);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

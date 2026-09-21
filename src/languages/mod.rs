@@ -1,6 +1,6 @@
 mod typescript;
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use crate::{DiffScopeError, metrics::FunctionMetrics};
 
@@ -47,6 +47,11 @@ pub struct FunctionDefinition {
 pub struct SourceAnalysis {
     pub language: Option<Language>,
     pub functions: Vec<FunctionDefinition>,
+    /// Names this module exports, as a caller would import them.
+    ///
+    /// Sorted and deduplicated, so comparing two revisions' sets reports what a
+    /// change adds to or removes from the module's public surface.
+    pub exports: BTreeSet<String>,
     pub diagnostics: Vec<LanguageDiagnostic>,
 }
 
@@ -95,6 +100,7 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
         return Ok(SourceAnalysis {
             language: None,
             functions: Vec::new(),
+            exports: BTreeSet::new(),
             diagnostics: vec![LanguageDiagnostic {
                 code: LanguageDiagnosticCode::UnsupportedLanguage,
                 severity: DiagnosticSeverity::Info,
@@ -108,6 +114,7 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
         return Ok(SourceAnalysis {
             language: Some(language),
             functions: Vec::new(),
+            exports: BTreeSet::new(),
             diagnostics: vec![LanguageDiagnostic {
                 code: LanguageDiagnosticCode::OversizedFile,
                 severity: DiagnosticSeverity::Warning,

@@ -47,6 +47,8 @@ fn result() -> AnalysisResult {
                 removed_lines: 0,
             }],
             functions: Vec::new(),
+            exports_added: Vec::new(),
+            exports_removed: Vec::new(),
             diagnostics: vec![Diagnostic {
                 code: DiagnosticCode::UnsupportedLanguage,
                 severity: DiagnosticSeverity::Info,

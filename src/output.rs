@@ -268,6 +268,10 @@ struct JsonFile<'a> {
     removed_lines: u32,
     hunks: Vec<JsonHunk>,
     functions: Vec<JsonFunction<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exports_added: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exports_removed: Vec<&'a str>,
     diagnostics: Vec<JsonDiagnostic<'a>>,
 }
 
@@ -283,6 +287,8 @@ impl<'a> From<&'a FileResult> for JsonFile<'a> {
             removed_lines: file.removed_lines,
             hunks: file.hunks.iter().map(JsonHunk::from).collect(),
             functions: file.functions.iter().map(JsonFunction::from).collect(),
+            exports_added: file.exports_added.iter().map(String::as_str).collect(),
+            exports_removed: file.exports_removed.iter().map(String::as_str).collect(),
             diagnostics: file.diagnostics.iter().map(JsonDiagnostic::from).collect(),
         }
     }

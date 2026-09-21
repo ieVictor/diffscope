@@ -29,7 +29,7 @@ use crate::{
 };
 
 use classify::FileClassification;
-use risk::{RiskLevel, RiskSignals};
+use risk::{ExportStatus, RiskLevel, RiskSignals};
 
 /// Largest page any query will return, whatever limit is requested.
 const MAX_LIMIT: usize = 200;
@@ -197,7 +197,25 @@ pub struct ChangedFile<'a> {
     pub functions: FunctionCounts,
     pub complexity: AggregateComplexity,
     pub risk: &'static str,
+    /// Names this change adds to and removes from the module's public surface.
+    #[serde(skip_serializing_if = "ExportChange::is_empty")]
+    pub exports: ExportChange<'a>,
     pub diagnostics: DiagnosticCounts,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExportChange<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<&'a str>,
+}
+
+impl ExportChange<'_> {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -469,6 +487,10 @@ pub fn list_changed_files<'a>(result: &'a AnalysisResult, filter: &FileFilter) -
                 functions,
                 complexity: aggregate_complexity(file),
                 risk: risk.as_str(),
+                exports: ExportChange {
+                    added: file.exports_added.iter().map(String::as_str).collect(),
+                    removed: file.exports_removed.iter().map(String::as_str).collect(),
+                },
                 diagnostics: diagnostic_counts(&file.diagnostics),
             })
         })
@@ -555,7 +577,7 @@ pub fn get_function_change<'a>(
             .chain(function.diagnostics.iter())
             .map(DiagnosticView::from)
             .collect(),
-        function: changed_function(path, classification, function),
+        function: changed_function(path, classification, file, function),
     })
 }
 
@@ -662,12 +684,23 @@ fn file_risk(file: &FileResult, classification: FileClassification) -> RiskLevel
     file.functions
         .iter()
         .filter(|function| function.status != FunctionChangeStatus::Unchanged)
-        .map(|function| risk::assess(&signals_for(function, classification)).level)
+        .map(|function| {
+            risk::assess(&signals_for(
+                function,
+                classification,
+                export_status(file, function),
+            ))
+            .level
+        })
         .max()
         .unwrap_or(RiskLevel::Low)
 }
 
-fn signals_for(function: &FunctionResult, classification: FileClassification) -> RiskSignals {
+fn signals_for(
+    function: &FunctionResult,
+    classification: FileClassification,
+    exported: ExportStatus,
+) -> RiskSignals {
     let before = function.metrics_before.as_ref();
     let after = function.metrics_after.as_ref();
     RiskSignals {
@@ -678,7 +711,31 @@ fn signals_for(function: &FunctionResult, classification: FileClassification) ->
         cognitive_after: after.map_or(0, |metrics| metrics.cognitive_complexity),
         churned_lines: function.churn.lines_added + function.churn.lines_removed,
         match_confidence: function.match_confidence,
+        exported,
     }
+}
+
+/// Whether a function's own name moved in or out of the module's exports.
+///
+/// Derived from the file's export delta rather than from the function record,
+/// because a name can leave the public surface while the function it named
+/// stays exactly where it was.
+fn export_status(file: &FileResult, function: &FunctionResult) -> ExportStatus {
+    let name = leaf_name(&function.qualified_name);
+    if file.exports_removed.iter().any(|export| export == name) {
+        ExportStatus::Removed
+    } else if file.exports_added.iter().any(|export| export == name) {
+        ExportStatus::Added
+    } else {
+        ExportStatus::Unchanged
+    }
+}
+
+/// The last segment of a qualified name, which is the name an importer writes.
+fn leaf_name(qualified_name: &str) -> &str {
+    qualified_name
+        .rsplit_once('.')
+        .map_or(qualified_name, |(_, leaf)| leaf)
 }
 
 fn delta(
@@ -718,7 +775,7 @@ fn ranked_functions<'a>(
             {
                 continue;
             }
-            let row = changed_function(path, classification, function);
+            let row = changed_function(path, classification, file, function);
             if filter
                 .minimum_risk
                 .is_some_and(|minimum| RiskLevel::parse(row.risk.level) < Some(minimum))
@@ -764,11 +821,16 @@ fn ranked_functions<'a>(
 fn changed_function<'a>(
     path: &'a str,
     classification: FileClassification,
+    file: &FileResult,
     function: &'a FunctionResult,
 ) -> ChangedFunction<'a> {
     let before = function.metrics_before.as_ref();
     let after = function.metrics_after.as_ref();
-    let assessment = risk::assess(&signals_for(function, classification));
+    let assessment = risk::assess(&signals_for(
+        function,
+        classification,
+        export_status(file, function),
+    ));
     ChangedFunction {
         file: path,
         symbol: symbol_id(function.kind, &function.qualified_name),
@@ -1212,6 +1274,8 @@ mod tests {
                 removed_lines: 5,
             }],
             functions,
+            exports_added: Vec::new(),
+            exports_removed: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

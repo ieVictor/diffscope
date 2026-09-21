@@ -53,6 +53,9 @@ pub struct FileResult {
     pub removed_lines: u32,
     pub hunks: Vec<DiffHunk>,
     pub functions: Vec<FunctionResult>,
+    /// Names added to and removed from this module's public surface.
+    pub exports_added: Vec<String>,
+    pub exports_removed: Vec<String>,
     pub diagnostics: Vec<Diagnostic>,
 }
 

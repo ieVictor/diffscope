@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use crate::{
     BlobContent, DiffHunk, DiffScopeError, FileChange, FileStatus,
@@ -14,6 +17,11 @@ pub struct FileFunctionChanges {
     pub base_path: Option<String>,
     pub target_path: Option<String>,
     pub functions: Vec<FunctionChange>,
+    /// Names the change adds to the module's public surface.
+    pub exports_added: Vec<String>,
+    /// Names the change removes from it. A removal can break every importer,
+    /// which is why the two directions are reported separately.
+    pub exports_removed: Vec<String>,
     pub diagnostics: Vec<FunctionMappingDiagnostic>,
 }
 
@@ -127,16 +135,12 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
         diagnostics.push(unavailable_diagnostic("target"));
     }
 
+    let (exports_added, exports_removed) =
+        export_delta(&base_functions.exports, &target_functions.exports);
+
     let base_by_key = group_by_key(base_functions.functions);
     let target_by_key = group_by_key(target_functions.functions);
-    let mut keys = base_by_key.keys().cloned().collect::<Vec<_>>();
-    keys.extend(
-        target_by_key
-            .keys()
-            .filter(|key| !base_by_key.contains_key(*key))
-            .cloned(),
-    );
-    keys.sort();
+    let keys = merged_keys(&base_by_key, &target_by_key);
 
     let mut functions = Vec::new();
     for key in keys {
@@ -217,6 +221,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
         base_path: file.base_path.clone(),
         target_path: file.target_path.clone(),
         functions,
+        exports_added,
+        exports_removed,
         diagnostics,
     })
 }
@@ -276,6 +282,7 @@ fn blob_len(blob: &BlobContent) -> usize {
 #[derive(Debug, Default)]
 struct BlobFunctions {
     functions: Vec<FunctionDefinition>,
+    exports: BTreeSet<String>,
     diagnostics: Vec<LanguageDiagnostic>,
     unavailable: bool,
 }
@@ -290,6 +297,7 @@ fn analyze_blob(path: Option<&str>, blob: &BlobContent) -> Result<BlobFunctions,
             let analysis = analyze_source(Path::new(path), source)?;
             Ok(BlobFunctions {
                 functions: analysis.functions,
+                exports: analysis.exports,
                 diagnostics: analysis.diagnostics,
                 unavailable: false,
             })
@@ -345,6 +353,30 @@ fn language_diagnostics(diagnostics: &[LanguageDiagnostic]) -> Vec<FunctionMappi
             qualified_name: None,
         })
         .collect()
+}
+
+/// Report what a change adds to and removes from a module's public surface.
+fn export_delta(base: &BTreeSet<String>, target: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+    (
+        target.difference(base).cloned().collect(),
+        base.difference(target).cloned().collect(),
+    )
+}
+
+/// Every identity present in either revision, in one deterministic order.
+fn merged_keys(
+    base_by_key: &BTreeMap<FunctionKey, Vec<FunctionDefinition>>,
+    target_by_key: &BTreeMap<FunctionKey, Vec<FunctionDefinition>>,
+) -> Vec<FunctionKey> {
+    let mut keys = base_by_key.keys().cloned().collect::<Vec<_>>();
+    keys.extend(
+        target_by_key
+            .keys()
+            .filter(|key| !base_by_key.contains_key(*key))
+            .cloned(),
+    );
+    keys.sort();
+    keys
 }
 
 fn group_by_key(

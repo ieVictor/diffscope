@@ -61,6 +61,18 @@ pub struct RiskSignals {
     /// Changed lines inside the function, on either side.
     pub churned_lines: u32,
     pub match_confidence: MatchConfidence,
+    pub exported: ExportStatus,
+}
+
+/// What the change did to this function's name in the module's exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportStatus {
+    /// The name was not added to or removed from the public surface.
+    Unchanged,
+    /// The name is newly exported.
+    Added,
+    /// The name is no longer exported, which breaks every importer of it.
+    Removed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +125,14 @@ pub fn assess(signals: &RiskSignals) -> RiskAssessment {
     }
     if signals.status == FunctionChangeStatus::Added && signals.cognitive_after >= 10 {
         add(1, "new function is already non-trivial".to_owned());
+    }
+    match signals.exported {
+        ExportStatus::Removed => add(
+            3,
+            "no longer exported; every importer of this name breaks".to_owned(),
+        ),
+        ExportStatus::Added => add(1, "newly part of the module's public surface".to_owned()),
+        ExportStatus::Unchanged => {}
     }
     if signals.classification.is_source() {
         add(1, "production source file".to_owned());
