@@ -242,11 +242,14 @@ fn clean_property_name(name: &str) -> String {
 }
 
 fn function_metrics(node: Node<'_>, source: &str) -> Result<FunctionMetrics, DiffScopeError> {
+    // One traversal yields both metrics. Walking the function twice, once per
+    // metric, doubles the most expensive step of the analyzer.
+    let points = complexity_points(node, 0);
     Ok(FunctionMetrics {
         physical_loc: physical_loc(node, source)?,
         source_loc: source_loc(node, source)?,
-        cyclomatic_complexity: cyclomatic_complexity(node),
-        cognitive_complexity: cognitive_complexity(node),
+        cyclomatic_complexity: 1 + points.cyclomatic,
+        cognitive_complexity: points.cognitive,
     })
 }
 
@@ -339,14 +342,6 @@ fn remove_comments(source: &str) -> String {
         }
     }
     output
-}
-
-fn cyclomatic_complexity(node: Node<'_>) -> u32 {
-    1 + complexity_points(node, 0).cyclomatic
-}
-
-fn cognitive_complexity(node: Node<'_>) -> u32 {
-    complexity_points(node, 0).cognitive
 }
 
 #[derive(Debug, Default)]
