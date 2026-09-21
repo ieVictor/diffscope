@@ -9,11 +9,17 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AnalysisRequest, AnalysisResult, DiffScopeError,
     analysis::FunctionChangeStatus,
-    analyze, git, imports,
+    analyze,
+    git::Repository,
+    graph::{Direction, Limits, View, canonical_depth},
+    imports,
     imports::ImportIndex,
     output,
     query::{
-        self, FileFilter, FunctionFilter, Page, classify::FileClassification, risk::RiskLevel,
+        self, FileFilter, FunctionFilter, Page,
+        classify::FileClassification,
+        graph::{GraphRequest, Requested},
+        risk::RiskLevel,
     },
 };
 
@@ -96,9 +102,46 @@ pub struct HarnessError {
     pub message: String,
 }
 
+/// What kind of failure a harness request hit.
+///
+/// The codes are the ones the projections report, so a caller that reads a code
+/// over one transport reads the same code over another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessErrorCode {
+    /// The comparison could not be analyzed.
     AnalysisFailed,
+    /// The request named a method this server does not answer.
+    UnknownMethod,
+    /// The parameters are not a question this analysis can be asked.
+    InvalidParams,
+    /// The request named a function identity the analysis does not contain.
+    UnknownFunction,
+    /// The answer could not be rendered as JSON.
+    SerializationFailed,
+    /// A step failed for a reason that is not the caller's to correct.
+    Internal,
+}
+
+impl HarnessError {
+    /// The error a projection failure becomes, carrying its code and message
+    /// unchanged, so the harness core and the transports report one failure one
+    /// way.
+    fn from_projection(error: ProjectionError) -> Self {
+        Self {
+            code: match error.code {
+                "analysis_failed" => HarnessErrorCode::AnalysisFailed,
+                "invalid_params" => HarnessErrorCode::InvalidParams,
+                "unknown_function" => HarnessErrorCode::UnknownFunction,
+                "serialization_failed" => HarnessErrorCode::SerializationFailed,
+                // `internal_error` is produced only for a step that failed
+                // outside the caller's control, and the projection's codes are
+                // a closed set produced in this module: anything else reaching
+                // here is a bug, not a caller error.
+                _ => HarnessErrorCode::Internal,
+            },
+            message: error.message,
+        }
+    }
 }
 
 /// Analyses retained for reuse across requests.
@@ -118,8 +161,12 @@ const MAX_CACHED_FUNCTIONS: usize = 200_000;
 /// Import graphs retained for reuse.
 ///
 /// A graph is far smaller than an analysis, holding one entry per source file
-/// rather than one per function, so a few cost little.
-const MAX_CACHED_INDEXES: usize = 4;
+/// rather than one per function, so a few cost little. Eight rather than four
+/// because a delta comparison holds two of them: that keeps the four
+/// comparisons' worth of headroom the constant was chosen for, where four
+/// entries would let two alternating comparisons evict each other's indexes on
+/// every query.
+const MAX_CACHED_INDEXES: usize = 8;
 
 /// A long-lived harness process that reuses analyses between requests.
 ///
@@ -169,7 +216,7 @@ impl HarnessSession {
         &self,
         request: &AnalysisRequest,
     ) -> Result<Arc<AnalysisResult>, DiffScopeError> {
-        let repository = git::Repository::open(&request.repository_path)?;
+        let repository = Repository::open(&request.repository_path)?;
         let key = CacheKey {
             repository_root: repository.root().to_path_buf(),
             base_commit: repository
@@ -189,36 +236,37 @@ impl HarnessSession {
         Ok(result)
     }
 
-    /// Build, or reuse, the import graph of a comparison's target revision.
+    /// Build, or reuse, the import graph of one commit.
     ///
     /// The graph describes one revision, not a comparison, so it is keyed by
-    /// the target commit alone: every comparison that ends at the same commit
-    /// shares one index, however many different bases they start from.
+    /// the commit alone: every comparison that touches the same commit shares
+    /// one index, however many different bases or targets name it. Commits
+    /// rather than revision names, because a name like `HEAD` points at
+    /// different commits over time.
+    ///
+    /// Resolving *which* commit to index happens in the caller, because a
+    /// comparison needs the base's graph as well as the target's and both are
+    /// cached through this one lookup.
     ///
     /// # Errors
     ///
-    /// Returns an error when the repository or target revision cannot be
-    /// resolved, or when Git cannot list or read the tree.
+    /// Returns an error when Git cannot list the tree or read its blobs.
     pub fn import_index(
         &self,
-        request: &AnalysisRequest,
+        repository: &Repository,
+        commit: &str,
     ) -> Result<Arc<ImportIndex>, DiffScopeError> {
-        let repository = git::Repository::open(&request.repository_path)?;
         let root = repository.root().to_path_buf();
-        let commit = repository
-            .resolve_revision(&request.target_revision)?
-            .commit_id;
-
-        if let Some(cached) = self.take_index(&root, &commit) {
+        if let Some(cached) = self.take_index(&root, commit) {
             return Ok(cached);
         }
 
-        let index = Arc::new(imports::index_revision(&repository, &commit)?);
+        let index = Arc::new(imports::index_revision(repository, commit)?);
         let mut indexes = lock(&self.indexes);
         indexes.retain(|entry| entry.repository_root != root || entry.commit != commit);
         indexes.push_back(IndexEntry {
             repository_root: root,
-            commit,
+            commit: commit.to_owned(),
             index: Arc::clone(&index),
         });
         while indexes.len() > MAX_CACHED_INDEXES {
@@ -308,6 +356,38 @@ impl HarnessSession {
     }
 }
 
+/// Answer one question and return the complete answer envelope, exactly as a
+/// transport would serialize it: `{"analysis": …, "query": …, "data": …}`.
+///
+/// The CLI asks through here, so a question answered from the command line is
+/// the same projection, in the same envelope, as the same question asked over
+/// JSONL or MCP — and no transport can drift from another.
+///
+/// # Errors
+///
+/// Returns the failure a transport would report, with the same code and
+/// message: a method this server does not answer, parameters its question
+/// cannot be asked with, a comparison that cannot be analyzed, or an answer
+/// that cannot be rendered.
+pub fn answer_json(
+    session: &HarnessSession,
+    request: &AnalysisRequest,
+    method: Option<&str>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, HarnessError> {
+    let method = Method::parse(method).map_err(|message| HarnessError {
+        code: HarnessErrorCode::UnknownMethod,
+        message,
+    })?;
+    let params = QueryParams::decode(params).map_err(HarnessError::from_projection)?;
+    let answer =
+        answer(session, method, request, &params).map_err(HarnessError::from_projection)?;
+    serde_json::to_value(&answer).map_err(|error| HarnessError {
+        code: HarnessErrorCode::SerializationFailed,
+        message: format!("could not render the answer: {error}"),
+    })
+}
+
 // ----------------------------------------------------------------- answers ---
 //
 // One comparison, many questions: the answer to each is a projection of the
@@ -326,18 +406,39 @@ pub(crate) enum Method {
     ListChangedFunctions,
     GetFunctionChange,
     GetAnalysisDiagnostics,
+    /// The modules and tests a change reaches, and what it changed about those
+    /// relationships.
+    GetImpactGraph,
+}
+
+/// Which revisions' import graphs answering a question needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportGraph {
+    /// The analysis alone answers it.
+    None,
+    /// The target revision's graph answers it.
+    Target,
+    /// Neither revision alone answers it: the answer compares the two.
+    Both,
 }
 
 impl Method {
-    /// Whether answering this question needs the revision's import graph.
-    pub(crate) fn needs_import_graph(self) -> bool {
-        matches!(
-            self,
+    /// Which import graphs answering this question needs.
+    ///
+    /// The graph is built only for the questions that use it, because it reads
+    /// every source file of the revision rather than only the changed ones. A
+    /// delta needs both revisions — one can show what exists, only two can
+    /// prove what was removed — which is why this is three-valued rather than
+    /// a flag.
+    pub(crate) fn needs_import_graph(self) -> ImportGraph {
+        match self {
+            Self::Analyze | Self::GetAnalysisDiagnostics => ImportGraph::None,
             Self::ChangeSummary
-                | Self::ListChangedFiles
-                | Self::ListChangedFunctions
-                | Self::GetFunctionChange
-        )
+            | Self::ListChangedFiles
+            | Self::ListChangedFunctions
+            | Self::GetFunctionChange => ImportGraph::Target,
+            Self::GetImpactGraph => ImportGraph::Both,
+        }
     }
 
     /// Whether this question is answered a page at a time.
@@ -354,10 +455,11 @@ impl Method {
             Some("list_changed_functions") => Ok(Self::ListChangedFunctions),
             Some("get_function_change") => Ok(Self::GetFunctionChange),
             Some("get_analysis_diagnostics") => Ok(Self::GetAnalysisDiagnostics),
+            Some("get_impact_graph") => Ok(Self::GetImpactGraph),
             Some(other) => Err(format!(
                 "unknown method `{other}`; expected analyze, get_change_summary, \
                  list_changed_files, list_changed_functions, get_function_change, \
-                 or get_analysis_diagnostics"
+                 get_analysis_diagnostics, or get_impact_graph"
             )),
         }
     }
@@ -410,21 +512,82 @@ pub(crate) fn answer(
         .analysis(request)
         .map_err(|error| analysis_failed(&error))?;
 
-    // The import graph is built only for the questions that use it, because it
-    // reads every source file of the revision rather than only the changed ones.
-    let index = if method.needs_import_graph() {
-        Some(
-            session
-                .import_index(request)
-                .map_err(|error| analysis_failed(&error))?,
-        )
-    } else {
-        None
-    };
+    let indexes = Indexes::resolve(session, method, request, &result)?;
 
     let analysis = analysis_id(&result.base.id, &result.target.id);
-    let projection = project(method, &result, params, index.as_deref(), &analysis)?;
+    let projection = project(method, &result, params, &indexes, &analysis)?;
     Ok(Answer::new(analysis_view(&result, analysis), projection))
+}
+
+/// The import graphs a question was answered with.
+///
+/// Held apart from the analysis because they are built and cached per revision
+/// rather than per comparison: a delta needs both sides, every other question
+/// needs the target alone, and the session's cache serves whoever asks.
+#[derive(Debug, Default)]
+struct Indexes {
+    base: Option<Arc<ImportIndex>>,
+    target: Option<Arc<ImportIndex>>,
+}
+
+impl Indexes {
+    /// Build, or reuse, the graphs the method asked for.
+    ///
+    /// The commits come from the analysis rather than from a second resolution:
+    /// the analysis already resolved both revision names, and its ids are what
+    /// the index cache is keyed by.
+    fn resolve(
+        session: &HarnessSession,
+        method: Method,
+        request: &AnalysisRequest,
+        result: &AnalysisResult,
+    ) -> Result<Self, ProjectionError> {
+        let requirement = method.needs_import_graph();
+        if requirement == ImportGraph::None {
+            return Ok(Self::default());
+        }
+        let repository =
+            Repository::open(&request.repository_path).map_err(|error| analysis_failed(&error))?;
+        let target = session
+            .import_index(&repository, &result.target.id)
+            .map_err(|error| analysis_failed(&error))?;
+        let base = if requirement == ImportGraph::Both {
+            Some(
+                session
+                    .import_index(&repository, &result.base.id)
+                    .map_err(|error| analysis_failed(&error))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            base,
+            target: Some(target),
+        })
+    }
+
+    /// The target revision's graph, which every graph-using method is answered
+    /// with.
+    fn target(&self) -> Option<&ImportIndex> {
+        self.target.as_deref()
+    }
+
+    /// Both revisions' graphs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when one is missing, which is a bug here
+    /// rather than a caller error: [`Method::needs_import_graph`] resolving to
+    /// [`ImportGraph::Both`] is what builds both.
+    fn both(&self) -> Result<(&ImportIndex, &ImportIndex), ProjectionError> {
+        match (self.base.as_deref(), self.target.as_deref()) {
+            (Some(base), Some(target)) => Ok((base, target)),
+            _ => Err(ProjectionError {
+                code: "internal_error",
+                message: "the impact graph needs both revisions' import graphs".to_owned(),
+            }),
+        }
+    }
 }
 
 fn analysis_failed(error: &DiffScopeError) -> ProjectionError {
@@ -444,7 +607,7 @@ fn project(
     method: Method,
     result: &AnalysisResult,
     params: &QueryParams,
-    index: Option<&ImportIndex>,
+    indexes: &Indexes,
     analysis: &str,
 ) -> Result<Projection, ProjectionError> {
     if params.cursor.is_some() && !method.paginated() {
@@ -455,11 +618,15 @@ fn project(
 
     match method {
         Method::Analyze => complete_analysis(result),
-        Method::ChangeSummary => summary(result, index),
-        Method::ListChangedFiles => file_list(result, params, index, analysis),
-        Method::ListChangedFunctions => function_list(result, params, index, analysis),
-        Method::GetFunctionChange => function_detail(result, params, index),
+        Method::ChangeSummary => summary(result, indexes.target()),
+        Method::ListChangedFiles => file_list(result, params, indexes.target(), analysis),
+        Method::ListChangedFunctions => function_list(result, params, indexes.target(), analysis),
+        Method::GetFunctionChange => function_detail(result, params, indexes.target()),
         Method::GetAnalysisDiagnostics => diagnostics(result, params),
+        Method::GetImpactGraph => {
+            let (base, target) = indexes.both()?;
+            impact_graph(result, params, base, target)
+        }
     }
 }
 
@@ -596,6 +763,53 @@ fn function_detail(
     }
 }
 
+/// One impact graph: the modules and tests a change reaches, and which of those
+/// relationships the comparison added or removed.
+///
+/// The request is validated against the analysis before anything is walked:
+/// every rejection a caller can provoke — a root this version cannot resolve, a
+/// path the change does not contain, a relation or rendering this version does
+/// not produce — is reported as `invalid_params` with the field it names.
+fn impact_graph(
+    result: &AnalysisResult,
+    params: &QueryParams,
+    base: &ImportIndex,
+    target: &ImportIndex,
+) -> Result<Projection, ProjectionError> {
+    let direction = parse_enum(
+        params.direction.as_deref(),
+        Direction::parse,
+        "direction",
+        "upstream, downstream, both",
+    )?;
+    let view = parse_enum(
+        params.view.as_deref(),
+        View::parse,
+        "view",
+        "delta, base, target",
+    )?;
+    let request = GraphRequest::validate(
+        result,
+        &Requested {
+            file: params.file.as_deref(),
+            function_id: params.function_id.as_deref(),
+            direction,
+            relations: &params.relations,
+            depth: canonical_depth(params.depth),
+            view,
+            limits: Limits::canonical(params.max_nodes, params.max_edges),
+            render: &params.render,
+        },
+    )
+    .map_err(|error| invalid_params(error.message))?;
+
+    Ok(Projection {
+        query: to_value(&request.applied())?,
+        data: to_value(&query::graph::project(result, base, target, &request))?,
+        page: None,
+    })
+}
+
 /// Diagnostics for the analysis, or for one file of it.
 fn diagnostics(
     result: &AnalysisResult,
@@ -696,6 +910,21 @@ pub(crate) struct QueryParams {
     include_unchanged: Option<bool>,
     limit: Option<usize>,
     cursor: Option<String>,
+    /// Which way an impact graph walks from its root.
+    direction: Option<String>,
+    /// The relations it may follow. Empty means every supported relation.
+    #[serde(default)]
+    relations: Vec<String>,
+    /// Hops it walks from the root.
+    depth: Option<u32>,
+    /// Which revision's relationships it shows.
+    view: Option<String>,
+    /// Node and edge budgets.
+    max_nodes: Option<usize>,
+    max_edges: Option<usize>,
+    /// The renderings to include. Empty means none.
+    #[serde(default)]
+    render: Vec<String>,
 }
 
 impl QueryParams {

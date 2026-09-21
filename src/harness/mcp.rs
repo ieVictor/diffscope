@@ -31,10 +31,10 @@ const INSTRUCTIONS: &str = "\
 Measure the scope and impact of a change between two Git revisions of one repository. Every tool \
 compares a committed base revision with a committed target revision and requires `repository`, `base`, and \
 `target`; there is no default repository, so a call never analyzes a tree the caller did not name. Start \
-with get_change_summary, page through the change with list_changed_files or list_changed_functions \
-(handing `page.next_cursor` back unchanged to continue), read one function in full with \
-get_function_change, and check get_analysis_diagnostics when an analysis looks incomplete. Every tool is \
-read-only and reuses the analyses already made in this session.";
+with get_change_summary, see the shape of what the change reaches with get_impact_graph, page through the \
+change with list_changed_files or list_changed_functions (handing `page.next_cursor` back unchanged to \
+continue), read one function in full with get_function_change, and check get_analysis_diagnostics when an \
+analysis looks incomplete. Every tool is read-only and reuses the analyses already made in this session.";
 
 /// Serve the harness over stdin and stdout until the client disconnects.
 ///
@@ -221,7 +221,7 @@ fn take_string(arguments: &mut JsonObject, field: &str) -> Result<String, ErrorD
 
 // ------------------------------------------------------------------ tools ---
 
-/// The five questions this server answers, in the order they are worth asking.
+/// The six questions this server answers, in the order they are worth asking.
 fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -231,6 +231,24 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "Summarize one comparison: what changed, where, and which functions are worth \
                  reviewing first.",
                 Schema::new(),
+            ),
+        },
+        ToolSpec {
+            method: Method::GetImpactGraph,
+            tool: describe(
+                "get_impact_graph",
+                "Show the shape of what one comparison reaches: the modules importing a changed \
+                 file, the tests related to it, and which of those relationships the change added \
+                 or removed.",
+                Schema::new()
+                    .optional("file", root_file_argument())
+                    .optional("direction", direction_argument())
+                    .optional("relations", relations_argument())
+                    .optional("depth", depth_argument())
+                    .optional("view", view_argument())
+                    .optional("max_nodes", max_nodes_argument())
+                    .optional("max_edges", max_edges_argument())
+                    .optional("render", render_argument()),
             ),
         },
         ToolSpec {
@@ -359,6 +377,87 @@ fn file_argument() -> Value {
     json!({
         "type": "string",
         "description": "Restrict the answer to one file path, as the comparison reports it.",
+    })
+}
+
+fn root_file_argument() -> Value {
+    json!({
+        "type": "string",
+        "description": "Root the graph at one changed file, as the comparison reports it. Without \
+                        one, the graph is centered on every changed file.",
+    })
+}
+
+fn direction_argument() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["upstream", "downstream", "both"],
+        "default": "both",
+        "description": "Which way get_impact_graph walks from its root: upstream follows edges \
+                        backwards, to what reaches the root; downstream follows them forwards, to \
+                        what the root reaches.",
+    })
+}
+
+fn relations_argument() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": ["imports", "tested_by"] },
+        "description": "Which relationships get_impact_graph may follow. Defaults to every \
+                        relation this version resolves.",
+    })
+}
+
+fn depth_argument() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3,
+        "default": 1,
+        "description": "Hops get_impact_graph walks from its root.",
+    })
+}
+
+fn view_argument() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["delta", "base", "target"],
+        "default": "delta",
+        "description": "Which revision's relationships get_impact_graph shows. A view narrows what \
+                        is shown without changing what is true, so an added edge still reads \
+                        `added` under `target`.",
+    })
+}
+
+fn max_nodes_argument() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 3,
+        "maximum": 100,
+        "default": 30,
+        "description": "Nodes get_impact_graph delivers. A graph that exceeds a budget reports \
+                        what it omitted.",
+    })
+}
+
+fn max_edges_argument() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 3,
+        "maximum": 200,
+        "default": 60,
+        "description": "Relationships get_impact_graph delivers. A graph that exceeds a budget \
+                        reports what it omitted.",
+    })
+}
+
+fn render_argument() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": ["diff", "mermaid"] },
+        "default": [],
+        "description": "Renderings to include beside the structured graph: the dependency diff, \
+                        the Mermaid diagram, or neither by default.",
     })
 }
 
