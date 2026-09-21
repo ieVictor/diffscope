@@ -430,7 +430,7 @@ mod tests {
 
     use super::{
         FunctionChangeStatus, FunctionMappingDiagnosticCode, map_changed_functions,
-        range_intersects_hunk_side,
+        overlapping_lines, range_intersects_hunk_side,
     };
 
     #[test]
@@ -724,6 +724,82 @@ mod tests {
             diagnostic.code == FunctionMappingDiagnosticCode::AmbiguousFunctionMatch
                 && diagnostic.qualified_name.as_deref() == Some("duplicate")
         }));
+    }
+
+    #[test]
+    fn counts_only_the_changed_lines_that_fall_inside_a_function() {
+        let range = crate::languages::SourceRange {
+            start_line: 10,
+            start_column: 0,
+            end_line: 20,
+            end_column: 1,
+        };
+
+        // Wholly inside, overlapping each edge, spanning it, and disjoint.
+        assert_eq!(overlapping_lines(&range, 12, 3), 3);
+        assert_eq!(overlapping_lines(&range, 8, 4), 2);
+        assert_eq!(overlapping_lines(&range, 19, 5), 2);
+        assert_eq!(overlapping_lines(&range, 1, 40), 11);
+        assert_eq!(overlapping_lines(&range, 21, 3), 0);
+        // A pure insertion changes no line on this side.
+        assert_eq!(overlapping_lines(&range, 15, 0), 0);
+    }
+
+    #[test]
+    fn attributes_churn_to_the_side_each_function_exists_on() {
+        let file = file_change(
+            b"function removed() {\n  return 1;\n}\n",
+            b"function added() {\n  return 2;\n}\n",
+            1,
+            3,
+            1,
+            3,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+        let churn_of = |name: &str| {
+            mapped
+                .functions
+                .iter()
+                .find(|function| function.qualified_name == name)
+                .map_or_else(
+                    || panic!("missing function {name}"),
+                    |function| function.churn,
+                )
+        };
+
+        let removed = churn_of("removed");
+        assert_eq!(removed.lines_removed, 3);
+        assert_eq!(removed.lines_added, 0);
+
+        let added = churn_of("added");
+        assert_eq!(added.lines_added, 3);
+        assert_eq!(added.lines_removed, 0);
+    }
+
+    #[test]
+    fn counts_a_boundary_insertion_as_a_touched_hunk_without_changed_lines() {
+        // An insertion directly above a function marks it touched, but adds no
+        // line inside it, so churn and hunk count must disagree here.
+        let file = file_change(
+            b"const top = 1;\nfunction shifted() {\n  return 1;\n}\n",
+            b"const top = 1;\nconst added = 2;\nfunction shifted() {\n  return 1;\n}\n",
+            1,
+            0,
+            2,
+            1,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+        let shifted = mapped
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "shifted")
+            .expect("shifted function is mapped");
+
+        assert_eq!(shifted.churn.changed_hunks, 1);
+        assert_eq!(shifted.churn.lines_added, 0);
+        assert_eq!(shifted.churn.lines_removed, 0);
     }
 
     #[test]
