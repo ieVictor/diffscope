@@ -23,6 +23,7 @@ diffScope/
 │   ├── DEFINITIONS.md      # Versioned metric and result semantics
 │   ├── ROADMAP.md          # Forward-only implementation plan
 │   ├── HARNESS.md          # Versioned JSONL harness protocol
+│   ├── PERFORMANCE.md      # Reproducible benchmark methodology and baselines
 │   └── STRUCTURE.MD        # Directory ownership and conventions
 ├── scripts/                # Local setup and maintenance scripts
 ├── AGENTS.MD               # Development rules

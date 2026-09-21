@@ -40,4 +40,7 @@ Run performance benchmarks with:
 ```sh
 just bench
 just bench-cli
+just bench-memory
 ```
+
+See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the generated corpus, methodology, and current baseline.

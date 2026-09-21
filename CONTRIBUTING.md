@@ -23,4 +23,7 @@ Performance-sensitive changes should also run the relevant Criterion and end-to-
 ```sh
 just bench
 just bench-cli
+just bench-memory
 ```
+
+See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for corpus definitions, measurement methodology, and the current local baseline.
