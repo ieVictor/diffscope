@@ -232,6 +232,7 @@ fn mapping_diagnostic(diagnostic: &FunctionMappingDiagnostic, path: Option<&str>
             FunctionMappingDiagnosticCode::MalformedSource => DiagnosticCode::MalformedSource,
             FunctionMappingDiagnosticCode::ParseError => DiagnosticCode::ParseError,
             FunctionMappingDiagnosticCode::InvalidUtf8 => DiagnosticCode::InvalidUtf8,
+            FunctionMappingDiagnosticCode::OversizedFile => DiagnosticCode::OversizedFile,
             FunctionMappingDiagnosticCode::BlobUnavailable => DiagnosticCode::MissingBlob,
         },
         severity: diagnostic.severity,

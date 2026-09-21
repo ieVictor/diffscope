@@ -53,6 +53,7 @@ pub enum FunctionMappingDiagnosticCode {
     MalformedSource,
     ParseError,
     InvalidUtf8,
+    OversizedFile,
     BlobUnavailable,
 }
 
@@ -279,6 +280,9 @@ fn language_diagnostics(diagnostics: &[LanguageDiagnostic]) -> Vec<FunctionMappi
                     FunctionMappingDiagnosticCode::MalformedSource
                 }
                 LanguageDiagnosticCode::ParseError => FunctionMappingDiagnosticCode::ParseError,
+                LanguageDiagnosticCode::OversizedFile => {
+                    FunctionMappingDiagnosticCode::OversizedFile
+                }
             },
             severity: diagnostic.severity,
             message: diagnostic.message.clone(),
