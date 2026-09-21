@@ -1,6 +1,6 @@
-# DiffScope
-
 ![DiffScope banner](docs/banner.png)
+
+# DiffScope
 
 DiffScope is a performance-driven tool for understanding the scope and impact of code changes.
 
