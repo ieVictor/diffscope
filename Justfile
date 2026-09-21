@@ -49,11 +49,20 @@ toml-check:
 coverage:
     cargo llvm-cov --all-features --html
 
+# Generate deterministic small, medium, and large benchmark repositories.
+bench-corpus:
+    ./scripts/generate-benchmark-corpus.sh target/benchmark-corpus
+
 # Run focused in-process benchmarks.
 bench:
     cargo bench --bench analysis
 
-# Measure the complete CLI, including process startup.
-bench-cli:
+# Measure the complete CLI, including process startup and JSON rendering.
+bench-cli: bench-corpus
     cargo build --release
-    hyperfine --warmup 3 './target/release/diffscope'
+    hyperfine --warmup 3 './target/release/diffscope --repository target/benchmark-corpus/large --format json HEAD~1 HEAD > /dev/null'
+
+# Report peak resident memory for the CLI process during a large-corpus analysis.
+bench-memory: bench-corpus
+    cargo build --release
+    ./scripts/measure-peak-memory.sh ./target/release/diffscope --repository target/benchmark-corpus/large --format json HEAD~1 HEAD
