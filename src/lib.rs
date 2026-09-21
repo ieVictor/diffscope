@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod output;
 pub mod query;
 pub mod result;
+pub mod setup;
 
 pub use application::analyze;
 pub use harness::{
