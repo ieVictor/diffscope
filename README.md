@@ -213,7 +213,7 @@ $ diffscope --format json HEAD~1 HEAD | jq .summary
 }
 ```
 
-`diffscope graph` answers the relationships of the same comparison instead of its numbers: which modules import a changed file, which tests cover it, and which of those relationships the change added or removed. It walks from one changed file (`--file`) or from the whole changed set, and it renders the result as a dependency diff:
+`diffscope graph` answers the relationships of the same comparison instead of its numbers: which modules import a changed file, which tests cover it, and — rooted at a function — which functions it calls in its own file and which of them call it there, together with which of those relationships the change added or removed. It walks from one changed file (`--file`), from one function (`--function`), or from the whole changed set, and it renders the result as a dependency diff:
 
 ```console
 $ diffscope graph --file packages/compiler-sfc/src/style/cssVars.ts --format diff origin/main HEAD
@@ -247,16 +247,16 @@ flowchart LR
 | Option | Meaning |
 | --- | --- |
 | `--file <PATH>` | Root the graph at one changed file. With no root, the graph is centered on the changed set. |
-| `--function <FUNCTION_ID>` | Root the graph at one function. Function roots need call resolution, which DiffScope does not perform: naming one is rejected with a message saying `file` is what it accepts. |
+| `--function <FUNCTION_ID>` | Root the graph at one function, by the `function_id` a listing reports. Mutually exclusive with `--file`. |
 | `--direction <upstream\|downstream\|both>` | Which way to walk. Default `both`. |
-| `--relations <NAMES>` | Comma-separated relations. Defaults to all supported: `imports`, `tested_by`. |
+| `--relations <NAMES>` | Comma-separated relations. Defaults to all supported: `imports`, `tested_by`, `calls`, `contains`. |
 | `--depth <N>` | Hops from the root. Default `1`, clamped to 1–3. |
 | `--view <delta\|base\|target>` | Which revision's relationships to show. Default `delta`. |
 | `--max-nodes <N>` | Node budget. Default `30`, clamped to 3–100. |
 | `--max-edges <N>` | Edge budget. Default `60`, clamped to 3–200. |
 | `--format <text\|diff\|mermaid\|json>` | Output form. Default `text`: the comparison, the root, the dependency diff, and whether a diagram is recommended. `diff` and `mermaid` print that rendering alone, so the output can be piped, and `json` prints the same answer the query API returns. |
 
-A relation outside `imports` and `tested_by` and a root that is not a changed file are rejected with an error naming what is accepted, rather than answered with a misleadingly empty graph.
+A relation outside `imports`, `tested_by`, `calls`, and `contains`, a root the comparison does not contain, and naming both `--file` and `--function` are rejected with an error naming what is accepted, rather than answered with a misleadingly empty graph. Calls are resolved only inside one file and only for a plain-identifier callee, so a call to an import or through a member expression produces no `calls` edge in this version; an ambiguous or unresolved name produces none either.
 
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
@@ -271,14 +271,14 @@ The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Rendere
 | `list_changed_functions` | Ranked changed functions, each addressed by `function_id`, with metrics, churn, risk, and review priority. |
 | `get_function_change` | One function by `function_id`: its hunks, its reach, and its diagnostics. |
 | `get_analysis_diagnostics` | Diagnostics, optionally scoped to one `file`. |
-| `get_impact_graph` | The module relationships a comparison added, removed, or left in place, walked from one changed file or the changed set, with optional dependency-diff and Mermaid renderings. |
+| `get_impact_graph` | The relationships a comparison added, removed, or left in place — module imports and test links, and, rooted at a `function_id`, the calls it makes in its own file and receives there — with optional dependency-diff and Mermaid renderings. |
 
 Every tool requires:
 
 - `repository` — a path to the repository or to any path inside its work tree. Relative paths resolve against the server process's working directory.
 - `base` and `target` — committed Git revisions, resolved by the repository's own ref rules. The working tree and index are never inputs.
 
-The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. `get_impact_graph` takes the shape of the walk instead: `direction` (`upstream`, `downstream`, or `both`), `relations` (any subset of `imports` and `tested_by`), `depth` (default 1, clamped to 1–3), `view` (`delta`, `base`, or `target`), `max_nodes` (default 30, clamped to 3–100), `max_edges` (default 60, clamped to 3–200), and `render` (any subset of `diff` and `mermaid`). A tool returns the same envelope as the JSONL protocol — the analysis identity, the applied query with its defaults, the answer, and, for the two list tools, a page — as both a text block and structured content. Passing a page's `next_cursor` back unchanged continues the list.
+The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. `get_impact_graph` takes the shape of the walk instead: `file` or `function_id` (mutually exclusive roots; with neither, the graph is centered on the changed set), `direction` (`upstream`, `downstream`, or `both`), `relations` (any subset of `imports`, `tested_by`, `calls`, and `contains`), `depth` (default 1, clamped to 1–3), `view` (`delta`, `base`, or `target`), `max_nodes` (default 30, clamped to 3–100), `max_edges` (default 60, clamped to 3–200), and `render` (any subset of `diff` and `mermaid`). A tool returns the same envelope as the JSONL protocol — the analysis identity, the applied query with its defaults, the answer, and, for the two list tools, a page — as both a text block and structured content. Passing a page's `next_cursor` back unchanged continues the list.
 
 Failures are visible in the tool result rather than lost: an unknown `function_id` returns an error naming the closest known ids, and a cursor that belongs to another analysis is rejected instead of silently answering from the wrong list. The process keeps a small number of recent analyses, so the usual summary, then list, then detail sequence analyzes the comparison once.
 
