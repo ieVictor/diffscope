@@ -28,7 +28,7 @@ Criterion uses 1 second of warm-up, at least 10 samples, and a 3 second requeste
 
 ## Baseline
 
-Measured on 2026-09-20 with:
+Measured on 2026-09-21 with:
 
 - AMD Ryzen 5 3600, 6 cores / 12 threads
 - 15.5 GiB RAM
@@ -36,13 +36,26 @@ Measured on 2026-09-20 with:
 - Git 2.55.0
 - Linux, warm filesystem cache
 
-| Tier | Median estimate | Throughput |
-| --- | ---: | ---: |
-| small | 39.91 ms | 60.07 KiB/s |
-| medium | 273.23 ms | 75.79 KiB/s |
-| large | 778.72 ms | 80.69 KiB/s |
+| Tier | Analysis | Throughput | Import graph |
+| --- | ---: | ---: | ---: |
+| small | 11.86 ms | 202.22 KiB/s | 3.24 ms |
+| medium | 22.40 ms | 924.40 KiB/s | 6.97 ms |
+| large | 20.95 ms | 2.93 MiB/s | 12.77 ms |
 
-The complete large-corpus CLI measured `744.5 ms ± 4.3 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 5,076 KiB. These numbers are local reference values, not cross-machine performance guarantees.
+Projecting an analysis into one answer runs on every request, including those served from a cached analysis, so it is the floor on query latency. Over the large tier's 360 function records:
+
+| Projection | Median estimate |
+| --- | ---: |
+| `get_change_summary` | 303.7 us |
+| `list_changed_functions` | 193.5 us |
+
+The complete large-corpus CLI measured `23.0 ms +/- 0.5 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 4,320 KiB. These numbers are local reference values, not cross-machine performance guarantees.
+
+### A superseded baseline
+
+An earlier table recorded 39.91 ms, 273.23 ms, and 778.72 ms for the three tiers, and 744.5 ms for the complete CLI. Those numbers do not reproduce. Re-measuring the commit they described, on the same machine, Rust, Git, and corpus, gives the figures above: the corpus is byte-for-byte identical, reporting the same 240 changed files, 360 functions, and 64,341 analyzed bytes.
+
+The cause was not determined and is not guessed at here. It is recorded because a baseline nobody can reproduce is worse than no baseline: Criterion compares each run against whatever it last stored, so a stale figure silently turns an unchanged measurement into a reported 97% improvement. Comparisons that need to isolate one change measure both commits in the same session, as the section below does.
 
 ## Effect of identity scoping and churn measurement
 
@@ -56,7 +69,19 @@ Container-scoped identities, per-function churn, body hashing for ambiguous matc
 
 The difference is within run-to-run noise on every tier: the added work is not measurable against the cost of parsing.
 
-These numbers do not reproduce the baseline table above, which was recorded in a different session. Criterion compares against whatever it last stored, so its reported change is meaningless across sessions; the table here is an A/B of two commits measured together, which is the only comparison that isolates the change. The baseline table should be re-recorded before it is relied on again.
+The generated tiers are too small to show the cost, so the same two commits were measured against real repositories, where they do:
+
+| Corpus | Before | After | Before RSS | After RSS |
+| --- | ---: | ---: | ---: | ---: |
+| vue-commit | 54.5 ms | 61.6 ms | 13,136 KiB | 13,736 KiB |
+| vue-minor | 407.6 ms | 450.1 ms | 47,688 KiB | 57,544 KiB |
+| vue-span | 554.0 ms | 606.0 ms | 55,788 KiB | 65,276 KiB |
+
+The work costs roughly 10% in wall time and up to 21% in peak memory on the largest corpus. Most of the memory is identity: a container-scoped name such as `describe("Suspense").test("pending branch").<anonymous>#1` is many times the size of `<anonymous>#26`, and a large revision holds thousands of them. The rest is the body hash, churn counts, and export sets held per function and per file.
+
+That cost buys a correct answer. The short names were not merely terser; they made a function's identity depend on how many anonymous functions preceded it in its file, so inserting one callback renumbered every later one and matched unrelated bodies to each other. Correctness before speed is the project's first rule, and this is what it costs here.
+
+Both commits were measured in the same session, which is the only comparison that isolates a change. Criterion's own reported difference is against whatever it last stored, which may be another session's numbers, so it is not used here.
 
 ## Query cost and analysis reuse
 
@@ -120,12 +145,14 @@ Measured on the machine and toolchain described above, warm filesystem cache, Hy
 
 | Corpus | Wall time | Peak RSS |
 | --- | ---: | ---: |
-| vue-commit | 104.4 ms ± 1.1 ms | 8,860 KiB |
-| vue-week | 391.7 ms ± 2.8 ms | — |
-| vue-patches | 679.3 ms ± 4.0 ms | — |
-| vue-minor | 1.919 s ± 0.006 s | 29,356 KiB |
-| vue-span | 2.020 s ± 0.020 s | 32,768 KiB |
-| ts-checker | 1.222 s ± 0.005 s | 69,160 KiB |
+| vue-commit | 61.6 ms +/- 0.8 ms | 13,736 KiB |
+| vue-week | 114.9 ms +/- 3.2 ms | 31,184 KiB |
+| vue-patches | 175.3 ms +/- 4.0 ms | 37,576 KiB |
+| vue-minor | 450.1 ms +/- 1.3 ms | 57,544 KiB |
+| vue-span | 606.0 ms +/- 7.5 ms | 65,276 KiB |
+| ts-checker | not re-measured | — |
+
+`ts-checker` requires a `microsoft/TypeScript` clone that was not available when this table was recorded. Its row is left empty rather than carried over from an earlier session, for the reason given under the superseded baseline.
 
 Summary line totals match `git diff --numstat --find-renames` exactly for every corpus.
 
@@ -254,6 +281,8 @@ Against the first real-world measurement, before whole-range diff collection and
 | vue-minor | 3.638 s | 437.4 ms | 8.32x |
 | vue-span | 4.568 s | 578.8 ms | 7.89x |
 | ts-checker | 1.376 s | 715.8 ms | 1.92x |
+
+The `Current` column above predates the identity, churn, export, and import-graph work, and is superseded by the real-world table earlier in this document. It is kept because it records what the listed optimizations achieved, which is still true of them.
 
 Further optimization requires a new measurement. Phase timings collected on a 13.5 MiB file attribute 47% of analysis CPU to Tree-sitter parsing and 53% to the function collector, of which complexity accounts for roughly two thirds; Git access, grouping, matching, sorting, and rendering are each under 3%. On the `codegen` corpus the balance inverts and Git dominates at 83%, split evenly between the patch and numstat calls, which compute the same diff twice; requesting both from one invocation was measured and does not help, because Git recomputes internally.
 
