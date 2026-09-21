@@ -16,6 +16,7 @@ This document defines DiffScope result semantics for schema version `1`. Later m
 - Diff hunks use Git line numbering: one-based line numbers and line counts per side. Empty ranges are represented by count `0` at Git's reported insertion/deletion anchor.
 - Added and removed line totals count physical diff lines from textual hunks only. Context lines are excluded. Binary deltas do not contribute line counts.
 - Unavailable blobs, missing revisions, unsupported object types, and Git errors produce diagnostics and prevent affected downstream metrics rather than panics.
+- Source blobs larger than 5 MiB are inventoried with their file status and diff statistics but are not parsed. They report an `oversized_file` diagnostic and no function metrics. Analyzed repositories are untrusted and commonly contain generated or vendored sources of arbitrary size; a syntax tree costs many times the source it describes, and both revisions of a file are analyzed, so an unbounded file size is an unbounded memory requirement.
 
 ## LOC definitions
 
@@ -25,7 +26,7 @@ This document defines DiffScope result semantics for schema version `1`. Later m
 - Comment-only lines are lines whose first non-whitespace token belongs entirely to a language comment and which contain no executable/source token outside comments.
 - Mixed code-and-comment lines count as source LOC.
 - For whole-file diff totals, line counts are textual diff lines, not `physical_loc` or `source_loc`.
-- LOC is calculated only for textual source files in supported languages. Unsupported languages and binary files report an unavailable metric reason.
+- LOC is calculated only for textual source files in supported languages. Unsupported languages, binary files, and files above the analysis size limit report an unavailable metric reason.
 
 ## Complexity definitions
 
