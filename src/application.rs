@@ -274,6 +274,7 @@ fn build_file_result(
                 metrics_before: function.metrics_before,
                 metrics_after: function.metrics_after,
                 churn: function.churn,
+                match_confidence: function.match_confidence,
                 diagnostics: Vec::new(),
             }
         })

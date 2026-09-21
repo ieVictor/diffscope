@@ -28,6 +28,35 @@ pub struct FunctionChange {
     pub metrics_before: Option<FunctionMetrics>,
     pub metrics_after: Option<FunctionMetrics>,
     pub churn: FunctionChurn,
+    pub match_confidence: MatchConfidence,
+}
+
+/// How firmly a before-and-after pair is believed to be the same function.
+///
+/// Identity alone resolves almost every function. When several functions in one
+/// file share an identity, the group is resolved by what the functions contain
+/// and then by their order, and the result says which. Callers that will not
+/// act on a guess can require [`MatchConfidence::Exact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchConfidence {
+    /// Resolved by position within a group of identical identities.
+    Positional,
+    /// Resolved from a group of identical identities by identical source.
+    IdenticalBody,
+    /// One base function and one target function share the identity.
+    Exact,
+}
+
+impl MatchConfidence {
+    /// The documented numeric value reported to callers.
+    #[must_use]
+    pub fn as_fraction(self) -> f64 {
+        match self {
+            Self::Exact => 1.0,
+            Self::IdenticalBody => 0.9,
+            Self::Positional => 0.6,
+        }
+    }
 }
 
 /// How much of a diff actually lands inside one function.
@@ -115,7 +144,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
         let target: &[FunctionDefinition] = target_by_key.get(&key).map_or(&[], Vec::as_slice);
 
         if base.len() > 1 || target.len() > 1 {
-            diagnostics.push(ambiguous_diagnostic(key.qualified_name));
+            diagnostics.push(ambiguous_diagnostic(key.qualified_name.clone()));
+            functions.extend(resolve_ambiguous_group(&key, base, target, file));
             continue;
         }
 
@@ -140,6 +170,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                         Some(&target_function.range),
                         &file.hunks,
                     ),
+                    match_confidence: MatchConfidence::Exact,
                     base_range: Some(base_function.range.clone()),
                     target_range: Some(target_function.range.clone()),
                     metrics_before: Some(base_function.metrics.clone()),
@@ -152,6 +183,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 kind: key.kind,
                 qualified_name: key.qualified_name,
                 churn: function_churn(Some(&base_function.range), None, &file.hunks),
+                match_confidence: MatchConfidence::Exact,
                 base_range: Some(base_function.range.clone()),
                 target_range: None,
                 metrics_before: Some(base_function.metrics.clone()),
@@ -163,6 +195,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 kind: key.kind,
                 qualified_name: key.qualified_name,
                 churn: function_churn(None, Some(&target_function.range), &file.hunks),
+                match_confidence: MatchConfidence::Exact,
                 base_range: None,
                 target_range: Some(target_function.range.clone()),
                 metrics_before: None,
@@ -354,6 +387,110 @@ fn function_changed(
                     hunk.target_count,
                 )
         })
+}
+
+/// Pair up functions that share one identity within a file.
+///
+/// Several functions in one file can legitimately carry the same identity: two
+/// `setup` methods inside one test, two callbacks passed to the same call. The
+/// identity alone cannot separate them, and dropping the whole group removes
+/// real functions from the analysis entirely.
+///
+/// The group is resolved in two passes. Functions whose source is byte-identical
+/// after whitespace collapsing are paired first, because an unchanged function
+/// is the common case and its partner is unambiguous. Whatever remains is paired
+/// in source order, which is the only ordering both revisions agree on. Every
+/// pair records how it was found, and the ambiguity diagnostic is still
+/// reported, so a caller is never silently handed a guess.
+fn resolve_ambiguous_group(
+    key: &FunctionKey,
+    base: &[FunctionDefinition],
+    target: &[FunctionDefinition],
+    file: &FileChange,
+) -> Vec<FunctionChange> {
+    let mut remaining_base = base.iter().map(Some).collect::<Vec<_>>();
+    let mut remaining_target = target.iter().map(Some).collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+
+    for slot in &mut remaining_base {
+        let Some(base_function) = *slot else {
+            continue;
+        };
+        let matched = remaining_target.iter().position(|candidate| {
+            candidate.is_some_and(|candidate| candidate.body_hash == base_function.body_hash)
+        });
+        if let Some(target_index) = matched {
+            let target_function = remaining_target[target_index].take();
+            *slot = None;
+            pairs.push((
+                Some(base_function),
+                target_function,
+                MatchConfidence::IdenticalBody,
+            ));
+        }
+    }
+
+    let mut leftover_target = remaining_target.into_iter().flatten();
+    for base_function in remaining_base.into_iter().flatten() {
+        pairs.push((
+            Some(base_function),
+            leftover_target.next(),
+            MatchConfidence::Positional,
+        ));
+    }
+    for target_function in leftover_target {
+        pairs.push((None, Some(target_function), MatchConfidence::Positional));
+    }
+
+    let mut changes = pairs
+        .into_iter()
+        .map(|(base_function, target_function, confidence)| {
+            ambiguous_change(key, base_function, target_function, confidence, file)
+        })
+        .collect::<Vec<_>>();
+    changes.sort_by(compare_function_changes);
+    changes
+}
+
+/// Build one change from a pair resolved out of an ambiguous group.
+fn ambiguous_change(
+    key: &FunctionKey,
+    base_function: Option<&FunctionDefinition>,
+    target_function: Option<&FunctionDefinition>,
+    confidence: MatchConfidence,
+    file: &FileChange,
+) -> FunctionChange {
+    let status = match (base_function, target_function) {
+        (Some(_), None) => FunctionChangeStatus::Removed,
+        (None, Some(_)) => FunctionChangeStatus::Added,
+        (Some(base_function), Some(target_function)) => {
+            if file.status == FileStatus::Added {
+                FunctionChangeStatus::Added
+            } else if file.status == FileStatus::Deleted {
+                FunctionChangeStatus::Removed
+            } else if function_changed(base_function, target_function, &file.hunks) {
+                FunctionChangeStatus::Modified
+            } else {
+                FunctionChangeStatus::Unchanged
+            }
+        }
+        (None, None) => FunctionChangeStatus::Unchanged,
+    };
+
+    let base_range = base_function.map(|function| function.range.clone());
+    let target_range = target_function.map(|function| function.range.clone());
+    FunctionChange {
+        status,
+        language: key.language,
+        kind: key.kind,
+        qualified_name: key.qualified_name.clone(),
+        churn: function_churn(base_range.as_ref(), target_range.as_ref(), &file.hunks),
+        match_confidence: confidence,
+        base_range,
+        target_range,
+        metrics_before: base_function.map(|function| function.metrics.clone()),
+        metrics_after: target_function.map(|function| function.metrics.clone()),
+    }
 }
 
 /// Measure the diff that lands inside one function.

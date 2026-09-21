@@ -135,6 +135,7 @@ impl<'source> FunctionCollector<'source> {
             qualified_name,
             range: SourceRange::from_tree_sitter(node.range())?,
             metrics: function_metrics(node, self.source)?,
+            body_hash: super::body_hash(node_text(node, self.source).unwrap_or_default()),
         });
         Ok(())
     }

@@ -38,6 +38,12 @@ pub struct FunctionDefinition {
     pub qualified_name: String,
     pub range: SourceRange,
     pub metrics: FunctionMetrics,
+    /// Hash of the function's source with whitespace runs collapsed.
+    ///
+    /// Used only to pair functions that share one identity, so that a group of
+    /// same-named functions can be matched by what they contain rather than
+    /// abandoned. It is never serialized and never compared across processes.
+    pub body_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +126,32 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
     match language {
         Language::TypeScript | Language::Tsx => TypeScriptAnalyzer::new(language)?.analyze(source),
     }
+}
+
+/// Hash source text, treating every run of whitespace as a single space.
+///
+/// FNV-1a is written out rather than using the standard hasher because the
+/// standard hasher's output is explicitly allowed to change between Rust
+/// releases, and pairing behavior should not change with the compiler.
+#[must_use]
+pub(crate) fn body_hash(text: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    let mut pending_space = false;
+    for byte in text.trim().bytes() {
+        if byte.is_ascii_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            hash = (hash ^ u64::from(b' ')).wrapping_mul(PRIME);
+            pending_space = false;
+        }
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    hash
 }
 
 pub fn detect_language(path: &Path) -> Option<Language> {

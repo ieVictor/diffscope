@@ -327,6 +327,7 @@ struct JsonFunction<'a> {
     metrics_after: Option<JsonMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     change: Option<JsonChurn>,
+    match_confidence: f64,
     diagnostics: Vec<JsonDiagnostic<'a>>,
 }
 
@@ -341,6 +342,7 @@ impl<'a> From<&'a FunctionResult> for JsonFunction<'a> {
             target_range: function.target_range.as_ref().map(JsonRange::from),
             metrics_before: function.metrics_before.as_ref().map(JsonMetrics::from),
             metrics_after: function.metrics_after.as_ref().map(JsonMetrics::from),
+            match_confidence: function.match_confidence.as_fraction(),
             change: JsonChurn::new(
                 &function.churn,
                 function
