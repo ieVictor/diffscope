@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command};
+use std::{fmt::Write as _, fs, path::Path, process::Command};
 
 use diffscope::{
     AnalysisRequest, BlobContent, DiagnosticCode, FileStatus, analysis::FunctionChangeStatus,
@@ -179,6 +179,74 @@ fn non_utf8_file_content_reports_a_diagnostic_instead_of_failing() {
         "expected an invalid_utf8 diagnostic, got {:?}",
         analyzed.diagnostics
     );
+}
+
+#[test]
+fn parallel_analysis_preserves_file_and_function_order() {
+    let repo = TestRepo::new("parallel_order");
+    repo.git(["init"]);
+    repo.git(["config", "user.email", "diffscope@example.invalid"]);
+    repo.git(["config", "user.name", "DiffScope"]);
+
+    // Enough files to occupy every worker, in an order Git does not report
+    // alphabetically by accident, and one much larger file so that workers
+    // finish at different times.
+    for index in 0..40 {
+        let body = if index == 17 { 400 } else { 1 };
+        let mut source = String::new();
+        for line in 0..body {
+            writeln!(
+                source,
+                "export function file{index}fn{line}(value: number): number {{\n  if (value > {line}) {{\n    return value;\n  }}\n  return {line};\n}}"
+            )
+            .expect("write fixture source");
+        }
+        repo.write(&format!("src/file{index:02}.ts"), &source);
+    }
+    repo.git(["add", "."]);
+    repo.git(["commit", "-m", "base"]);
+    let base = repo.rev_parse("HEAD");
+
+    for index in 0..40 {
+        repo.write(
+            &format!("src/file{index:02}.ts"),
+            &format!("export function file{index}fn0(value: number): number {{\n  return value + {index};\n}}\n"),
+        );
+    }
+    repo.git(["add", "-A"]);
+    repo.git(["commit", "-m", "target"]);
+    let target = repo.rev_parse("HEAD");
+
+    let request = AnalysisRequest {
+        repository_path: repo.path().to_path_buf(),
+        base_revision: base,
+        target_revision: target,
+    };
+
+    let first = analyze(&request).expect("analysis succeeds");
+    let second = analyze(&request).expect("analysis succeeds");
+
+    assert_eq!(first, second, "parallel analysis must be deterministic");
+    assert_eq!(first.files.len(), 40);
+
+    let paths = first
+        .files
+        .iter()
+        .filter_map(|file| file.target_path.clone())
+        .collect::<Vec<_>>();
+    let mut sorted_paths = paths.clone();
+    sorted_paths.sort();
+    assert_eq!(paths, sorted_paths, "files must stay ordered by path");
+
+    let ids = first
+        .files
+        .iter()
+        .flat_map(|file| file.functions.iter().map(|function| function.id.clone()))
+        .collect::<Vec<_>>();
+    let expected_ids = (1..=ids.len())
+        .map(|index| format!("function-{index}"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, expected_ids, "function ids must follow file order");
 }
 
 fn find<'a>(files: &'a [diffscope::FileChange], path: &str) -> &'a diffscope::FileChange {
