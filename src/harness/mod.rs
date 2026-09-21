@@ -406,8 +406,8 @@ pub(crate) enum Method {
     ListChangedFunctions,
     GetFunctionChange,
     GetAnalysisDiagnostics,
-    /// The modules and tests a change reaches, and what it changed about those
-    /// relationships.
+    /// The modules, tests, and functions a change reaches, and what it changed
+    /// about those relationships.
     GetImpactGraph,
 }
 
@@ -763,13 +763,15 @@ fn function_detail(
     }
 }
 
-/// One impact graph: the modules and tests a change reaches, and which of those
-/// relationships the comparison added or removed.
+/// One impact graph: the modules and tests a change reaches, and — when the
+/// request names a function — the functions that function calls in its own
+/// file and the ones that call it there, with which of those relationships the
+/// comparison added or removed.
 ///
 /// The request is validated against the analysis before anything is walked:
-/// every rejection a caller can provoke — a root this version cannot resolve, a
-/// path the change does not contain, a relation or rendering this version does
-/// not produce — is reported as `invalid_params` with the field it names.
+/// every rejection a caller can provoke — a root the analysis does not contain,
+/// a relation or rendering this version does not produce — is reported as
+/// `invalid_params` with the field it names.
 fn impact_graph(
     result: &AnalysisResult,
     params: &QueryParams,
