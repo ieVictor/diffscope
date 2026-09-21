@@ -73,6 +73,36 @@ pub struct FunctionDefinition {
     pub body_hash: u64,
 }
 
+/// One name a module exports, and what stands behind it.
+///
+/// [`SourceAnalysis::exports`] answers "is this name part of the surface?",
+/// which is all an export-surface delta needs. Resolving a call needs the
+/// opposite direction: knowing `"stripComments"` is exported does not say
+/// which function it is, so the record keeps the name behind the export and
+/// the position of the definition when the export names one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedSymbol {
+    /// Name in the module the export reads from: the local name for
+    /// `export { a as b }`, and the source name for
+    /// `export { a as b } from "x"`, which is what the next hop looks up.
+    pub local: String,
+    /// Specifier this name is forwarded from, when it is a re-export.
+    ///
+    /// `None` means the name is declared here, so a lookup stops. `Some`
+    /// means the definition lives in another module and resolution continues
+    /// there, one bounded hop at a time.
+    pub from: Option<String>,
+    /// Where the function this name declares is written, when it declares one
+    /// in this file.
+    ///
+    /// A name exported as a constant, a class, or a type carries `None`: the
+    /// graph reports calls into functions, and a range for something that is
+    /// not one would be evidence for an edge that does not exist.
+    pub function: Option<SourceRange>,
+    /// 1-based line the export is written on.
+    pub line: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceAnalysis {
     pub language: Option<Language>,
@@ -82,6 +112,21 @@ pub struct SourceAnalysis {
     /// Sorted and deduplicated, so comparing two revisions' sets reports what a
     /// change adds to or removes from the module's public surface.
     pub exports: BTreeSet<String>,
+    /// The same names, each with what stands behind it, keyed by the exported
+    /// name.
+    ///
+    /// This is a parallel record rather than a richer `exports`, so the
+    /// export-surface delta keeps comparing the sets it always compared. A
+    /// whole-module re-export is never a key here: `exports` records it as `*`
+    /// precisely because the names it forwards live in a file this analysis
+    /// has not read, and two `export *` clauses would collide on one key.
+    pub exported_symbols: BTreeMap<String, ExportedSymbol>,
+    /// Specifiers this module re-exports from, including `export * from`.
+    ///
+    /// A re-export is a structural relationship of its own, and one that
+    /// breaks callers when it goes away, so it is recorded whether or not the
+    /// names behind it could be read.
+    pub re_exported_modules: BTreeSet<String>,
     pub diagnostics: Vec<LanguageDiagnostic>,
 }
 
@@ -124,6 +169,50 @@ pub const MAX_IMPORT_SCAN_BYTES: usize = 64 * 1024;
 /// worth an edge that silently does not exist.
 const IMPORT_SCAN_MARGIN: usize = 512;
 
+/// What one name an import statement binds refers to in the module it came
+/// from.
+///
+/// The distinction is what makes a cross-file call resolvable: `b()` where
+/// `import { a as b } from "x"` means the exported name `a`, and `ns.name()`
+/// where `import * as ns from "x"` means the exported name `name`. A record
+/// that kept only the local name would resolve neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportedName {
+    /// A named import, under the name the exporting module publishes.
+    Named(String),
+    /// The module's default export.
+    Default,
+    /// The module itself, bound as a namespace object.
+    Namespace,
+}
+
+/// One name a file imports, and where it came from.
+///
+/// The specifier is kept unresolved, as written, because resolution needs the
+/// revision's file set and its `tsconfig.json` aliases, and neither belongs to
+/// a single file's scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBinding {
+    /// What the local name refers to in the module it came from.
+    pub imported: ImportedName,
+    /// Module specifier exactly as written, before any resolution.
+    pub specifier: String,
+    /// 1-based line the import statement's specifier sits on, matching the
+    /// line [`ImportScan::specifiers`] reports for the same statement.
+    pub line: u32,
+}
+
+/// Everything one parse of a file's import region yields.
+///
+/// Specifiers and bindings are read from the same statements in one walk: a
+/// second pass to collect the names behind specifiers the first pass already
+/// visited would double the cost of the scan that covers a whole revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportFacts {
+    pub specifiers: BTreeMap<String, u32>,
+    pub bindings: BTreeMap<String, ImportBinding>,
+}
+
 /// What one file imports, and whether the whole file was examined.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportScan {
@@ -136,6 +225,18 @@ pub struct ImportScan {
     /// earliest line seen for it is kept. The keys are ordered exactly as the
     /// set of specifiers was, so nothing about the scan's determinism moves.
     pub specifiers: BTreeMap<String, u32>,
+    /// The names this file binds from those specifiers, keyed by the local
+    /// name the file uses.
+    ///
+    /// Keyed locally because that is the only name a call site writes: a
+    /// resolver holds `b` from `b()` and needs what `b` stands for. A local
+    /// name is bound once per module in well-formed TypeScript, so the key is
+    /// unique; when a prefix truncation leaves two statements binding one
+    /// name, the first wins and the scan reports itself truncated.
+    ///
+    /// These come from the same statements as the specifiers, inside the
+    /// prefix already parsed, so recording them reads no further into a file.
+    pub bindings: BTreeMap<String, ImportBinding>,
     /// The file was longer than [`MAX_IMPORT_SCAN_BYTES`] and was not read whole.
     pub truncated: bool,
 }
@@ -163,7 +264,8 @@ impl ImportScanner {
         })
     }
 
-    /// Collect the module specifiers one source file imports or re-exports.
+    /// Collect the module specifiers one source file imports or re-exports,
+    /// and the names it binds from them.
     ///
     /// Only the file's leading region is parsed and no metrics are computed:
     /// this runs over every file of a revision, not only the changed ones, so
@@ -193,10 +295,15 @@ impl ImportScanner {
             Language::TypeScript => &mut self.typescript,
             Language::Tsx => &mut self.tsx,
         };
-        let mut specifiers = analyzer.scan_imports(head)?;
+        let ImportFacts {
+            mut specifiers,
+            mut bindings,
+        } = analyzer.scan_imports(head)?;
         specifiers.retain(|specifier, _| !specifier.is_empty());
+        bindings.retain(|_, binding| !binding.specifier.is_empty());
         Ok(ImportScan {
             specifiers,
+            bindings,
             truncated,
         })
     }
@@ -255,6 +362,8 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
             language: None,
             functions: Vec::new(),
             exports: BTreeSet::new(),
+            exported_symbols: BTreeMap::new(),
+            re_exported_modules: BTreeSet::new(),
             diagnostics: vec![LanguageDiagnostic {
                 code: LanguageDiagnosticCode::UnsupportedLanguage,
                 severity: DiagnosticSeverity::Info,
@@ -269,6 +378,8 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
             language: Some(language),
             functions: Vec::new(),
             exports: BTreeSet::new(),
+            exported_symbols: BTreeMap::new(),
+            re_exported_modules: BTreeSet::new(),
             diagnostics: vec![LanguageDiagnostic {
                 code: LanguageDiagnosticCode::OversizedFile,
                 severity: DiagnosticSeverity::Warning,

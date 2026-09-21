@@ -5,8 +5,9 @@ use tree_sitter::{Node, Parser};
 use crate::{DiffScopeError, metrics::FunctionMetrics};
 
 use super::{
-    CallSite, DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
-    LanguageDiagnosticCode, SourceAnalysis, SourceRange,
+    CallSite, DiagnosticSeverity, ExportedSymbol, FunctionDefinition, FunctionKind, ImportBinding,
+    ImportFacts, ImportedName, Language, LanguageDiagnostic, LanguageDiagnosticCode,
+    SourceAnalysis, SourceRange,
 };
 
 pub struct TypeScriptAnalyzer {
@@ -46,6 +47,8 @@ impl TypeScriptAnalyzer {
                     language: Some(self.language),
                     functions: Vec::new(),
                     exports: BTreeSet::new(),
+                    exported_symbols: BTreeMap::new(),
+                    re_exported_modules: BTreeSet::new(),
                     diagnostics: vec![LanguageDiagnostic {
                         code: LanguageDiagnosticCode::InvalidUtf8,
                         severity: DiagnosticSeverity::Error,
@@ -84,10 +87,13 @@ impl TypeScriptAnalyzer {
                 .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
         });
 
+        let exported = collect_exported_symbols(root, source_text, &functions);
         Ok(SourceAnalysis {
             language: Some(self.language),
             functions,
             exports: collect_exports(root, source_text),
+            exported_symbols: exported.symbols,
+            re_exported_modules: exported.modules,
             diagnostics,
         })
     }
@@ -583,7 +589,8 @@ fn is_short_circuit_operator(node: Node<'_>) -> bool {
 
 impl TypeScriptAnalyzer {
     /// Collect the module specifiers a source prefix imports or re-exports,
-    /// each with the 1-based line its statement sits on.
+    /// each with the 1-based line its statement sits on, and the local names
+    /// the file binds from them.
     ///
     /// The input may be a truncated file, so the tree is expected to contain
     /// errors near its end. Tree-sitter still yields the statements it did
@@ -592,22 +599,23 @@ impl TypeScriptAnalyzer {
     /// # Errors
     ///
     /// Returns an error when tree-sitter does not produce a syntax tree.
-    pub fn scan_imports(&mut self, source: &[u8]) -> Result<BTreeMap<String, u32>, DiffScopeError> {
+    pub fn scan_imports(&mut self, source: &[u8]) -> Result<ImportFacts, DiffScopeError> {
         let Ok(source_text) = std::str::from_utf8(source) else {
-            return Ok(BTreeMap::new());
+            return Ok(ImportFacts::default());
         };
         let tree = self
             .parser
             .parse(source_text, None)
             .ok_or_else(|| DiffScopeError::Language("tree-sitter returned no tree".to_owned()))?;
 
-        let mut specifiers = BTreeMap::new();
-        collect_specifiers(tree.root_node(), source_text, &mut specifiers);
-        Ok(specifiers)
+        let mut facts = ImportFacts::default();
+        collect_specifiers(tree.root_node(), source_text, &mut facts);
+        Ok(facts)
     }
 }
 
-/// Walk for the `source` of every import and re-export statement.
+/// Walk for the `source` of every import and re-export statement, and for the
+/// names each import binds.
 ///
 /// A plain `export { a }` has no source and adds no edge; only a statement that
 /// names another module does. Dynamic `import(...)` is deliberately not
@@ -618,21 +626,115 @@ impl TypeScriptAnalyzer {
 /// that is the token a reader looks at to confirm the edge, and a multiline
 /// import puts it somewhere the statement's start does not point to. Two
 /// statements importing one module are one edge, so the earliest line wins.
-fn collect_specifiers(node: Node<'_>, source: &str, specifiers: &mut BTreeMap<String, u32>) {
+///
+/// Bindings are read from the same statement in the same visit. An
+/// `export ... from` clause binds no local name, so it contributes a specifier
+/// and nothing else.
+fn collect_specifiers(node: Node<'_>, source: &str, facts: &mut ImportFacts) {
     if matches!(node.kind(), "import_statement" | "export_statement")
         && let Some(module) = node.child_by_field_name("source")
         && let Some(text) = node_text(module, source)
     {
         let line = start_line(module);
-        specifiers
-            .entry(text.trim_matches(['\'', '"', '`']).to_owned())
+        let specifier = clean_property_name(text);
+        facts
+            .specifiers
+            .entry(specifier.clone())
             .and_modify(|existing| *existing = (*existing).min(line))
             .or_insert(line);
+        if node.kind() == "import_statement" {
+            collect_bindings(node, source, &specifier, line, &mut facts.bindings);
+        }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_specifiers(child, source, specifiers);
+        collect_specifiers(child, source, facts);
     }
+}
+
+/// Record the local names one import statement binds.
+///
+/// A type-only import is recorded like any other named import. The graph
+/// reports an edge only when the name resolves to a function definition, so a
+/// type never produces one, and dropping type imports here would put a second
+/// rule about what a name may be in a second place.
+fn collect_bindings(
+    statement: Node<'_>,
+    source: &str,
+    specifier: &str,
+    line: u32,
+    bindings: &mut BTreeMap<String, ImportBinding>,
+) {
+    let mut cursor = statement.walk();
+    for clause in statement.named_children(&mut cursor) {
+        if clause.kind() != "import_clause" {
+            continue;
+        }
+        let mut parts = clause.walk();
+        for part in clause.named_children(&mut parts) {
+            match part.kind() {
+                // The clause's bare identifier is the default import.
+                "identifier" => bind(
+                    bindings,
+                    node_text(part, source),
+                    &ImportedName::Default,
+                    specifier,
+                    line,
+                ),
+                "namespace_import" => {
+                    let local = part.named_child(0).and_then(|name| node_text(name, source));
+                    bind(bindings, local, &ImportedName::Namespace, specifier, line);
+                }
+                "named_imports" => {
+                    let mut named = part.walk();
+                    for import in part.named_children(&mut named) {
+                        let Some(name) = import
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(name, source))
+                        else {
+                            continue;
+                        };
+                        let alias = import
+                            .child_by_field_name("alias")
+                            .and_then(|alias| node_text(alias, source));
+                        bind(
+                            bindings,
+                            Some(alias.unwrap_or(name)),
+                            &ImportedName::Named(clean_property_name(name)),
+                            specifier,
+                            line,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Bind one local name, keeping the first statement that bound it.
+///
+/// A local name is bound once per module in well-formed TypeScript. Keeping
+/// the first is what a truncated prefix or a malformed file degrades to, and
+/// it is stable: the walk visits statements in source order.
+fn bind(
+    bindings: &mut BTreeMap<String, ImportBinding>,
+    local: Option<&str>,
+    imported: &ImportedName,
+    specifier: &str,
+    line: u32,
+) {
+    let Some(local) = local
+        .map(clean_property_name)
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    bindings.entry(local).or_insert_with(|| ImportBinding {
+        imported: imported.clone(),
+        specifier: specifier.to_owned(),
+        line,
+    });
 }
 
 /// The 1-based line a node starts on, for the evidence a caller renders.
@@ -727,12 +829,201 @@ fn add_declared_names(declaration: Node<'_>, source: &str, exports: &mut BTreeSe
     }
 }
 
+/// Every export record one module declares, and the modules it forwards from.
+#[derive(Debug, Default)]
+struct ExportRecords {
+    symbols: BTreeMap<String, ExportedSymbol>,
+    modules: BTreeSet<String>,
+}
+
+/// Describe each exported name by what stands behind it.
+///
+/// This runs beside [`collect_exports`] rather than replacing it: the export
+/// surface is a set of names and is compared as one, while resolution needs
+/// the name behind each export and the definition it leads to. Keeping them
+/// apart means a change here cannot move an export-surface delta.
+fn collect_exported_symbols(
+    root: Node<'_>,
+    source: &str,
+    functions: &[FunctionDefinition],
+) -> ExportRecords {
+    let mut records = ExportRecords::default();
+    collect_export_records(root, source, &mut records);
+    attach_function_ranges(&mut records.symbols, functions);
+    records
+}
+
+fn collect_export_records(node: Node<'_>, source: &str, records: &mut ExportRecords) {
+    if node.kind() == "export_statement" {
+        add_export_records(node, source, records);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_export_records(child, source, records);
+    }
+}
+
+/// Record what one export statement publishes, and from where.
+///
+/// A whole-module re-export publishes no name this analysis can see, so it
+/// contributes only the module it forwards from: the names behind `export *`
+/// live in a file that was never read, and inventing one of them would invent
+/// an edge.
+fn add_export_records(statement: Node<'_>, source: &str, records: &mut ExportRecords) {
+    let from = statement
+        .child_by_field_name("source")
+        .and_then(|module| node_text(module, source))
+        .map(clean_property_name)
+        .filter(|specifier| !specifier.is_empty());
+    if let Some(specifier) = &from {
+        records.modules.insert(specifier.clone());
+    }
+
+    let line = start_line(statement);
+    let text = node_text(statement, source).unwrap_or_default();
+    let default = text.starts_with("export default");
+
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        let mut declared = BTreeSet::new();
+        add_declared_names(declaration, source, &mut declared);
+        if default {
+            // `export default function f() {}` publishes `default`; `f` is the
+            // name the definition is found under in this file.
+            let local = declared
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "default".to_owned());
+            record(records, "default", local, from, line);
+            return;
+        }
+        for name in declared {
+            record(records, &name.clone(), name, from.clone(), line);
+        }
+        return;
+    }
+
+    let mut cursor = statement.walk();
+    let mut clause_named = false;
+    for child in statement.named_children(&mut cursor) {
+        match child.kind() {
+            "export_clause" => {
+                let mut clause = child.walk();
+                for specifier in child.named_children(&mut clause) {
+                    let Some(local) = specifier
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(name, source))
+                    else {
+                        continue;
+                    };
+                    let exported = specifier
+                        .child_by_field_name("alias")
+                        .and_then(|alias| node_text(alias, source))
+                        .unwrap_or(local);
+                    record(
+                        records,
+                        &clean_property_name(exported),
+                        clean_property_name(local),
+                        from.clone(),
+                        line,
+                    );
+                    clause_named = true;
+                }
+            }
+            "namespace_export" => {
+                // `export * as ns from "x"` publishes the module itself under
+                // one name. The name behind it is `*`, which no module exports,
+                // so a lookup through it stops rather than guessing.
+                if let Some(name) = child
+                    .named_child(0)
+                    .and_then(|name| node_text(name, source))
+                {
+                    record(
+                        records,
+                        &clean_property_name(name),
+                        "*".to_owned(),
+                        from.clone(),
+                        line,
+                    );
+                    clause_named = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if clause_named || !default {
+        return;
+    }
+    // `export default <expression>`: a bare identifier names something this
+    // file declares, and anything else is an expression with no name to give.
+    let local = statement
+        .child_by_field_name("value")
+        .filter(|value| value.kind() == "identifier")
+        .and_then(|value| node_text(value, source))
+        .map_or_else(|| "default".to_owned(), clean_property_name);
+    record(records, "default", local, from, line);
+}
+
+fn record(
+    records: &mut ExportRecords,
+    exported: &str,
+    local: String,
+    from: Option<String>,
+    line: u32,
+) {
+    if exported.is_empty() {
+        return;
+    }
+    records
+        .symbols
+        .entry(exported.to_owned())
+        .or_insert(ExportedSymbol {
+            local,
+            from,
+            function: None,
+            line,
+        });
+}
+
+/// Point each locally declared export at the function it names, when it names
+/// one.
+///
+/// The name compared is the leaf of the qualified name, which is what an
+/// importer writes. A leaf two definitions share stays unresolved: two
+/// same-named functions in one file are an ambiguity the analysis already
+/// reports, and picking one of them would be worse than saying nothing.
+fn attach_function_ranges(
+    symbols: &mut BTreeMap<String, ExportedSymbol>,
+    functions: &[FunctionDefinition],
+) {
+    let mut by_name: BTreeMap<&str, Option<&FunctionDefinition>> = BTreeMap::new();
+    for function in functions {
+        let leaf = function
+            .qualified_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&function.qualified_name);
+        by_name
+            .entry(leaf)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(function));
+    }
+    for symbol in symbols.values_mut() {
+        if symbol.from.is_some() {
+            continue;
+        }
+        if let Some(Some(function)) = by_name.get(symbol.local.as_str()) {
+            symbol.function = Some(function.range.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::super::{
-        CallSite, DiagnosticSeverity, FunctionKind, Language, LanguageDiagnosticCode,
+        CallSite, DiagnosticSeverity, FunctionKind, ImportedName, Language, LanguageDiagnosticCode,
         analyze_source, detect_language,
     };
 
@@ -1350,13 +1641,134 @@ function hidden() { return 4; }
         let mut analyzer =
             super::TypeScriptAnalyzer::new(Language::TypeScript).expect("grammar loads");
 
-        let specifiers = analyzer.scan_imports(source).expect("scan succeeds");
+        let facts = analyzer.scan_imports(source).expect("scan succeeds");
 
         // Sorted by specifier, and a module imported twice keeps the earliest
         // line, because that is the site a reader checks first.
         assert_eq!(
-            specifiers.into_iter().collect::<Vec<_>>(),
+            facts.specifiers.into_iter().collect::<Vec<_>>(),
             vec![("./first".to_owned(), 1), ("./second".to_owned(), 4)]
         );
+    }
+
+    #[test]
+    fn records_the_name_behind_every_import_binding() {
+        let source = br#"import defaultThing, { a as b, c } from "./x";
+import * as ns from "./ns";
+import "./side-effect";
+import { type U } from "./mixed";
+export { forwarded } from "./x";
+"#;
+        let mut analyzer =
+            super::TypeScriptAnalyzer::new(Language::TypeScript).expect("grammar loads");
+
+        let bindings = analyzer
+            .scan_imports(source)
+            .expect("scan succeeds")
+            .bindings;
+        let described = bindings
+            .iter()
+            .map(|(local, binding)| {
+                (
+                    local.as_str(),
+                    binding.imported.clone(),
+                    binding.specifier.as_str(),
+                    binding.line,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            described,
+            vec![
+                ("U", ImportedName::Named("U".to_owned()), "./mixed", 4),
+                ("b", ImportedName::Named("a".to_owned()), "./x", 1),
+                ("c", ImportedName::Named("c".to_owned()), "./x", 1),
+                ("defaultThing", ImportedName::Default, "./x", 1),
+                ("ns", ImportedName::Namespace, "./ns", 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn records_what_stands_behind_each_exported_name() {
+        let source = br#"export function named() {}
+export const arrow = () => {};
+export { local as pub };
+export { a as bee } from "./x";
+export * from "./star";
+export * as nsx from "./starns";
+export default function main() {}
+function local() {}
+"#;
+
+        let analysis = analyze_source(Path::new("surface.ts"), source).expect("analysis succeeds");
+        let described = analysis
+            .exported_symbols
+            .iter()
+            .map(|(exported, symbol)| {
+                (
+                    exported.as_str(),
+                    symbol.local.as_str(),
+                    symbol.from.as_deref(),
+                    symbol.function.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            described,
+            vec![
+                ("arrow", "arrow", None, true),
+                ("bee", "a", Some("./x"), false),
+                ("default", "main", None, true),
+                ("named", "named", None, true),
+                // `export * as nsx` publishes a module, and `*` is a name no
+                // module exports, so a lookup through it stops.
+                ("nsx", "*", Some("./starns"), false),
+                ("pub", "local", None, true),
+            ]
+        );
+        assert_eq!(
+            analysis.re_exported_modules.iter().collect::<Vec<_>>(),
+            vec!["./star", "./starns", "./x"]
+        );
+    }
+
+    #[test]
+    fn leaves_the_export_surface_unchanged_by_the_symbol_record() {
+        let source = br#"export function named() {}
+export * from "./star";
+export default 42;
+"#;
+
+        let analysis = analyze_source(Path::new("surface.ts"), source).expect("analysis succeeds");
+
+        assert_eq!(
+            analysis.exports.iter().collect::<Vec<_>>(),
+            vec!["*", "default", "named"]
+        );
+        // A default export with no name behind it still publishes `default`,
+        // and points at nothing this file declares.
+        let default = &analysis.exported_symbols["default"];
+        assert_eq!(default.local, "default");
+        assert_eq!(default.function, None);
+    }
+
+    #[test]
+    fn keeps_the_bindings_a_truncated_prefix_did_see() {
+        use super::super::{ImportScanner, MAX_IMPORT_SCAN_BYTES};
+
+        let mut source = b"import { early } from \"./early\";\n".to_vec();
+        source.resize(MAX_IMPORT_SCAN_BYTES, b'\n');
+        source.extend_from_slice(b"import { late } from \"./late\";\n");
+
+        let scan = ImportScanner::new()
+            .expect("grammar loads")
+            .scan(Path::new("long.ts"), &source)
+            .expect("scan succeeds");
+
+        assert!(scan.truncated);
+        assert_eq!(scan.bindings.keys().collect::<Vec<_>>(), vec!["early"]);
     }
 }
