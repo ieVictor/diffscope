@@ -1,16 +1,19 @@
 use std::{
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::{
-    AnalysisRequest, DiffScopeError, FileChange, FileStatus,
+    AnalysisRequest, BlobContent, DiffScopeError, FileChange, FileStatus,
     analysis::{
         FileFunctionChanges, FunctionMappingDiagnostic, FunctionMappingDiagnosticCode,
         map_changed_functions,
     },
     inventory_changes,
-    languages::{DiagnosticSeverity, detect_language},
+    languages::{DiagnosticSeverity, MAX_ANALYZED_BLOB_BYTES, detect_language},
     result::{
         AnalysisResult, AnalysisSummary, Diagnostic, DiagnosticCode, FileResult, FunctionResult,
         RevisionResult, SCHEMA_VERSION, sort_diagnostics,
@@ -103,6 +106,7 @@ fn map_files(files: &[FileChange]) -> Result<Vec<FileFunctionChanges>, DiffScope
     }
 
     let cursor = AtomicUsize::new(0);
+    let budget = ByteBudget::new();
     let mut claimed = Vec::with_capacity(files.len());
     let mut worker_lost = false;
 
@@ -113,7 +117,11 @@ fn map_files(files: &[FileChange]) -> Result<Vec<FileFunctionChanges>, DiffScope
                     let mut mapped = Vec::new();
                     while let Some(index) = claim_index(&cursor, files.len()) {
                         if let Some(file) = files.get(index) {
-                            mapped.push((index, map_changed_functions(file)));
+                            let cost = analysis_cost(file);
+                            budget.acquire(cost);
+                            let analyzed = map_changed_functions(file);
+                            budget.release(cost);
+                            mapped.push((index, analyzed));
                         }
                     }
                     mapped
@@ -148,6 +156,73 @@ fn worker_count(file_count: usize) -> usize {
     }
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     available.min(file_count)
+}
+
+/// Source bytes that may be under analysis at any one time.
+///
+/// A syntax tree costs many times the source it describes, and a file's two
+/// revisions are parsed together, so peak memory follows the bytes in flight
+/// rather than the number of workers. Ordinary diffs stay far below this limit
+/// and run fully parallel; a diff of many large files is throttled instead of
+/// holding one syntax tree per worker at once.
+const ANALYSIS_BYTES_IN_FLIGHT: usize = 8 * 1024 * 1024;
+
+/// A waiting room that keeps the bytes under analysis below a fixed budget.
+struct ByteBudget {
+    in_flight: Mutex<usize>,
+    released: Condvar,
+}
+
+impl ByteBudget {
+    fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(0),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Wait until this file's bytes fit alongside the work already in flight.
+    ///
+    /// A file larger than the whole budget is admitted whenever nothing else is
+    /// in flight, so no file can deadlock the analysis by being too large.
+    fn acquire(&self, cost: usize) {
+        let mut in_flight = lock(&self.in_flight);
+        while *in_flight > 0 && in_flight.saturating_add(cost) > ANALYSIS_BYTES_IN_FLIGHT {
+            in_flight = self
+                .released
+                .wait(in_flight)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *in_flight = in_flight.saturating_add(cost);
+    }
+
+    fn release(&self, cost: usize) {
+        let mut in_flight = lock(&self.in_flight);
+        *in_flight = in_flight.saturating_sub(cost);
+        drop(in_flight);
+        self.released.notify_all();
+    }
+}
+
+/// A poisoned budget means another worker failed; its count is still usable,
+/// and that worker's failure is reported when it is joined.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Bytes a file contributes to the budget: the blobs that will actually be
+/// parsed. Blobs above the analysis size limit are never parsed and cost
+/// nothing, so one oversized file does not reserve the whole budget.
+fn analysis_cost(file: &FileChange) -> usize {
+    [&file.base_blob, &file.target_blob]
+        .into_iter()
+        .map(|blob| match blob {
+            BlobContent::Available(source) if source.len() <= MAX_ANALYZED_BLOB_BYTES => {
+                source.len()
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Claim the next unanalyzed file index, or report that none is left.
