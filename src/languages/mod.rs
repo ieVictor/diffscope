@@ -58,7 +58,18 @@ pub enum LanguageDiagnosticCode {
     InvalidUtf8,
     MalformedSource,
     ParseError,
+    OversizedFile,
 }
+
+/// Largest source blob that is parsed for metrics.
+///
+/// Analyzed repositories are untrusted and routinely contain generated or
+/// vendored sources of arbitrary size. A syntax tree costs many times the
+/// source it describes, and both revisions of a file are analyzed, so an
+/// unbounded file size is an unbounded memory requirement. Files above this
+/// limit are still inventoried, with their diff statistics and an
+/// `oversized_file` diagnostic, but no function metrics.
+pub const MAX_ANALYZED_BLOB_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticSeverity {
@@ -86,6 +97,22 @@ pub fn analyze_source(path: &Path, source: &[u8]) -> Result<SourceAnalysis, Diff
             }],
         });
     };
+
+    if source.len() > MAX_ANALYZED_BLOB_BYTES {
+        return Ok(SourceAnalysis {
+            language: Some(language),
+            functions: Vec::new(),
+            diagnostics: vec![LanguageDiagnostic {
+                code: LanguageDiagnosticCode::OversizedFile,
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "source is {} bytes, above the {MAX_ANALYZED_BLOB_BYTES} byte analysis limit; function metrics are unavailable",
+                    source.len()
+                ),
+                range: None,
+            }],
+        });
+    }
 
     match language {
         Language::TypeScript | Language::Tsx => TypeScriptAnalyzer::new(language)?.analyze(source),
