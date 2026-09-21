@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod application;
 pub mod git;
+pub mod graph;
 pub mod harness;
 pub mod imports;
 pub mod languages;
