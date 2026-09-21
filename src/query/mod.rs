@@ -925,3 +925,339 @@ fn paginate<T>(rows: Vec<T>, page: &Page) -> (Vec<T>, PageInfo) {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FileFilter, FunctionFilter, Page, aggregate_complexity, change_area, change_summary,
+        get_analysis_diagnostics, get_function_change, list_changed_files, list_changed_functions,
+    };
+    use crate::{
+        DiffHunk, FileStatus,
+        analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
+        languages::{FunctionKind, Language, SourceRange},
+        metrics::FunctionMetrics,
+        query::{classify::FileClassification, risk::RiskLevel},
+        result::{
+            AnalysisResult, AnalysisSummary, FileResult, FunctionResult, RevisionResult,
+            SCHEMA_VERSION,
+        },
+    };
+
+    #[test]
+    fn groups_paths_into_areas_by_project_boundary() {
+        assert_eq!(
+            change_area("packages/runtime-core/src/renderer.ts"),
+            "packages/runtime-core"
+        );
+        assert_eq!(change_area("crates/parser/src/lib.rs"), "crates/parser");
+        assert_eq!(change_area("src/index.ts"), "src");
+        assert_eq!(change_area("README.md"), "<root>");
+    }
+
+    #[test]
+    fn omits_unchanged_functions_unless_they_are_asked_for() {
+        let result = fixture();
+
+        let default = list_changed_functions(&result, &FunctionFilter::default());
+        assert!(
+            default
+                .functions
+                .iter()
+                .all(|function| function.status != "unchanged")
+        );
+
+        let including = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                include_unchanged: true,
+                ..FunctionFilter::default()
+            },
+        );
+        assert!(including.functions.len() > default.functions.len());
+    }
+
+    #[test]
+    fn filters_functions_by_classification_and_risk() {
+        let result = fixture();
+
+        let source_only = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                classification: Some(FileClassification::Source),
+                ..FunctionFilter::default()
+            },
+        );
+        assert!(
+            source_only
+                .functions
+                .iter()
+                .all(|function| function.classification == "source")
+        );
+        assert!(
+            source_only
+                .functions
+                .iter()
+                .all(|function| !function.file.contains("__tests__"))
+        );
+
+        let high_only = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                minimum_risk: Some(RiskLevel::High),
+                ..FunctionFilter::default()
+            },
+        );
+        assert!(
+            high_only
+                .functions
+                .iter()
+                .all(|function| function.risk.level == "high")
+        );
+    }
+
+    #[test]
+    fn pages_deterministically_without_dropping_or_repeating_rows() {
+        let result = fixture();
+        let all = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                page: Page {
+                    limit: Some(100),
+                    offset: 0,
+                },
+                ..FunctionFilter::default()
+            },
+        );
+
+        let first = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                page: Page {
+                    limit: Some(1),
+                    offset: 0,
+                },
+                ..FunctionFilter::default()
+            },
+        );
+        assert_eq!(first.page.returned, 1);
+        assert_eq!(first.page.total, all.page.total);
+        assert!(first.page.has_more);
+        assert_eq!(first.page.next_offset, Some(1));
+
+        let second = list_changed_functions(
+            &result,
+            &FunctionFilter {
+                page: Page {
+                    limit: Some(1),
+                    offset: 1,
+                },
+                ..FunctionFilter::default()
+            },
+        );
+        assert_eq!(first.functions[0].symbol, all.functions[0].symbol);
+        assert_eq!(second.functions[0].symbol, all.functions[1].symbol);
+    }
+
+    #[test]
+    fn addresses_a_function_by_symbol_id_or_by_plain_name() {
+        let result = fixture();
+
+        let by_id = get_function_change(&result, "src/renderer.ts", "fn:patch")
+            .expect("symbol id resolves");
+        let by_name =
+            get_function_change(&result, "src/renderer.ts", "patch").expect("plain name resolves");
+
+        assert_eq!(by_id.function.symbol, by_name.function.symbol);
+        assert_eq!(by_id.function.qualified_name, "patch");
+    }
+
+    #[test]
+    fn reports_the_symbols_a_file_does_contain_when_one_is_not_found() {
+        let result = fixture();
+
+        let error = get_function_change(&result, "src/renderer.ts", "nonexistent")
+            .expect_err("unknown symbol is rejected");
+
+        assert_eq!(error.symbol, "nonexistent");
+        assert!(
+            error
+                .known_symbols
+                .iter()
+                .any(|symbol| symbol == "fn:patch")
+        );
+    }
+
+    #[test]
+    fn sums_complexity_across_both_revisions_of_a_file() {
+        let result = fixture();
+        let renderer = result
+            .files
+            .iter()
+            .find(|file| file.target_path.as_deref() == Some("src/renderer.ts"))
+            .expect("renderer file");
+
+        let total = aggregate_complexity(renderer);
+
+        // `patch` 10 -> 15 and the untouched `mount` 4 -> 4.
+        assert_eq!(total.cyclomatic_before, 14);
+        assert_eq!(total.cyclomatic_after, 19);
+        assert_eq!(total.cyclomatic_delta, 5);
+    }
+
+    #[test]
+    fn overview_counts_every_file_and_ranks_candidates() {
+        let result = fixture();
+        let summary = change_summary(&result);
+
+        assert_eq!(summary.files.changed, 2);
+        assert_eq!(summary.files.by_classification.get("source"), Some(&1));
+        assert_eq!(summary.files.by_classification.get("test"), Some(&1));
+        assert!(!summary.review_candidates.is_empty());
+        // The riskiest candidate leads.
+        assert_eq!(summary.review_candidates[0].symbol, "fn:patch");
+    }
+
+    #[test]
+    fn lists_files_and_scopes_diagnostics_to_one_file() {
+        let result = fixture();
+
+        let source = list_changed_files(
+            &result,
+            &FileFilter {
+                classification: Some(FileClassification::Source),
+                ..FileFilter::default()
+            },
+        );
+        assert_eq!(source.files.len(), 1);
+        assert_eq!(source.files[0].path, "src/renderer.ts");
+        assert_eq!(source.files[0].area, "src");
+
+        let all = get_analysis_diagnostics(&result, None);
+        let scoped = get_analysis_diagnostics(&result, Some("src/renderer.ts"));
+        assert!(scoped.diagnostics.len() <= all.diagnostics.len());
+    }
+
+    fn fixture() -> AnalysisResult {
+        AnalysisResult {
+            schema_version: SCHEMA_VERSION,
+            tool_version: "0.1.0".to_owned(),
+            repository: "/repo".to_owned(),
+            base: RevisionResult {
+                id: "aaa".to_owned(),
+                display_name: "base".to_owned(),
+            },
+            target: RevisionResult {
+                id: "bbb".to_owned(),
+                display_name: "target".to_owned(),
+            },
+            summary: AnalysisSummary {
+                changed_files: 2,
+                added_lines: 30,
+                removed_lines: 10,
+                supported_files: 2,
+                unsupported_files: 0,
+                ..AnalysisSummary::default()
+            },
+            files: vec![
+                file(
+                    "src/renderer.ts",
+                    vec![
+                        function(
+                            "patch",
+                            FunctionChangeStatus::Modified,
+                            Some(10),
+                            Some(15),
+                            20,
+                        ),
+                        function(
+                            "mount",
+                            FunctionChangeStatus::Unchanged,
+                            Some(4),
+                            Some(4),
+                            0,
+                        ),
+                    ],
+                ),
+                file(
+                    "src/__tests__/renderer.spec.ts",
+                    vec![function(
+                        "describe(\"renderer\").<anonymous>#1",
+                        FunctionChangeStatus::Modified,
+                        Some(2),
+                        Some(9),
+                        12,
+                    )],
+                ),
+            ],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn file(path: &str, functions: Vec<FunctionResult>) -> FileResult {
+        FileResult {
+            base_path: Some(path.to_owned()),
+            target_path: Some(path.to_owned()),
+            status: FileStatus::Modified,
+            language: Some(Language::TypeScript),
+            is_binary: false,
+            added_lines: 15,
+            removed_lines: 5,
+            hunks: vec![DiffHunk {
+                base_start: 1,
+                base_count: 5,
+                target_start: 1,
+                target_count: 15,
+                added_lines: 15,
+                removed_lines: 5,
+            }],
+            functions,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn function(
+        name: &str,
+        status: FunctionChangeStatus,
+        before: Option<u32>,
+        after: Option<u32>,
+        churned: u32,
+    ) -> FunctionResult {
+        FunctionResult {
+            id: format!("function-{name}"),
+            status,
+            kind: FunctionKind::Function,
+            qualified_name: name.to_owned(),
+            base_range: Some(SourceRange {
+                start_line: 1,
+                start_column: 0,
+                end_line: 20,
+                end_column: 1,
+            }),
+            target_range: Some(SourceRange {
+                start_line: 1,
+                start_column: 0,
+                end_line: 30,
+                end_column: 1,
+            }),
+            metrics_before: before.map(metrics),
+            metrics_after: after.map(metrics),
+            churn: FunctionChurn {
+                lines_removed: 0,
+                lines_added: churned,
+                changed_hunks: 1,
+            },
+            match_confidence: MatchConfidence::Exact,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn metrics(complexity: u32) -> FunctionMetrics {
+        FunctionMetrics {
+            physical_loc: 30,
+            source_loc: 25,
+            cyclomatic_complexity: complexity,
+            cognitive_complexity: complexity,
+        }
+    }
+}
