@@ -1,0 +1,281 @@
+name: Release
+
+# Tagged releases only: pushing `v<version>` publishes the archives consumed by
+# scripts/install.sh and scripts/install.ps1. The tag must match the crate
+# version, so a mistyped or reused tag can never overwrite an existing release's
+# artifacts with a different binary. The Linux archives are built for musl and
+# linked statically, so they run on any Linux distribution of the same
+# architecture; musl-gcc only provides the C compiler for tree-sitter.
+on:
+  push:
+    tags:
+      - "v*"
+
+run-name: Release ${{ github.ref_name }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against the crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [ "$tag_version" != "$crate_version" ]; then
+            printf 'refusing to release: tag %s does not match crate version %s\n' "$GITHUB_REF_NAME" "$crate_version" >&2
+            exit 1
+          fi
+          printf 'releasing %s (crate version %s)\n' "$GITHUB_REF_NAME" "$crate_version"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # Every target is attempted so a single broken target cannot mask the
+      # others; the release job still refuses to publish a partial set.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+            binary: diffscope
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            binary: diffscope
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            binary: diffscope
+            # Hosted macOS runners are arm64, so this binary cannot be executed
+            # here; packaging still verifies the archive contents.
+            smoke: false
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            binary: diffscope
+            smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            archive: zip
+            binary: diffscope.exe
+            smoke: true
+    env:
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+      # cc-rs reads the target-specific compiler for the C code in tree-sitter.
+      CC_x86_64-unknown-linux-musl: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64-unknown-linux-musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the musl C toolchain
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            printf 'refusing to build: musl-gcc is unavailable for %s\n' "$TARGET" >&2
+            exit 1
+          fi
+
+      - name: Add the Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "$TARGET"
+          if ! rustup target list --installed | grep -Fxq "$TARGET"; then
+            printf 'refusing to build: rustup did not install target %s\n' "$TARGET" >&2
+            exit 1
+          fi
+
+      - name: Build the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          if [ ! -f "target/${TARGET}/release/${BINARY}" ]; then
+            printf 'refusing to package: target/%s/release/%s was not produced\n' "$TARGET" "$BINARY" >&2
+            exit 1
+          fi
+
+      - name: Run the built binary
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported="$("./target/${TARGET}/release/${BINARY}" --version)"
+          printf '%s\n' "$reported"
+          case "$reported" in
+            *"${GITHUB_REF_NAME#v}"*) ;;
+            *)
+              printf 'refusing to package: %s does not report version %s\n' "$reported" "${GITHUB_REF_NAME#v}" >&2
+              exit 1
+              ;;
+          esac
+
+      # The macOS x86_64 binary is cross-compiled on an arm64 runner and cannot
+      # be executed there, so its target is asserted from the binary header; the
+      # musl binaries are additionally asserted to be statically linked.
+      - name: Check the binary architecture
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          description="$(file -b "target/${TARGET}/release/${BINARY}")"
+          printf '%s: %s\n' "$TARGET" "$description"
+          case "$TARGET" in
+            x86_64-*) pattern='x86-64|x86_64' ;;
+            aarch64-*) pattern='aarch64|arm64' ;;
+            *)
+              printf 'refusing to package: no architecture check for %s\n' "$TARGET" >&2
+              exit 1
+              ;;
+          esac
+          if ! grep -Eq "$pattern" <<<"$description"; then
+            printf 'refusing to package: %s is not built for %s\n' "$BINARY" "$TARGET" >&2
+            exit 1
+          fi
+          case "$TARGET" in
+            *-linux-musl)
+              if ! grep -q 'static' <<<"$description"; then
+                printf 'refusing to package: %s is not statically linked\n' "$BINARY" >&2
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Package the Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="diffscope-v${GITHUB_REF_NAME#v}-${TARGET}.tar.gz"
+          stage="$(mktemp -d "${TMPDIR:-/tmp}/diffscope-package.XXXXXX")"
+          trap 'rm -rf "$stage"' EXIT
+          cp "target/${TARGET}/release/${BINARY}" "$stage/diffscope"
+          chmod 755 "$stage/diffscope"
+          mkdir -p dist
+          tar -C "$stage" -czf "dist/$asset" diffscope
+          if [ "$(tar -tzf "dist/$asset")" != "diffscope" ]; then
+            printf 'refusing to package: %s does not contain diffscope at the archive root\n' "$asset" >&2
+            exit 1
+          fi
+          printf 'packaged dist/%s\n' "$asset"
+
+      - name: Package the Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = "diffscope-v$($env:GITHUB_REF_NAME.Substring(1))-$($env:TARGET).zip"
+          $stage = Join-Path $env:RUNNER_TEMP 'diffscope-stage'
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath "target\$($env:TARGET)\release\$($env:BINARY)" -Destination (Join-Path $stage $env:BINARY)
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path dist $asset) -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path (Join-Path dist $asset)).Path)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+          } finally {
+            $zip.Dispose()
+          }
+          if ($entries.Count -ne 1 -or $entries[0] -ne $env:BINARY) {
+            [Console]::Error.WriteLine("refusing to package: unexpected contents ($($entries -join ', ')) in $asset")
+            exit 1
+          }
+          Write-Host "packaged dist/$asset"
+
+      - name: Upload the release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            "diffscope-v${version}-x86_64-unknown-linux-musl.tar.gz"
+            "diffscope-v${version}-aarch64-unknown-linux-musl.tar.gz"
+            "diffscope-v${version}-x86_64-apple-darwin.tar.gz"
+            "diffscope-v${version}-aarch64-apple-darwin.tar.gz"
+            "diffscope-v${version}-x86_64-pc-windows-msvc.zip"
+          )
+          for asset in "${expected[@]}"; do
+            if [ ! -f "dist/$asset" ]; then
+              printf 'refusing to publish: missing release asset %s\n' "$asset" >&2
+              exit 1
+            fi
+          done
+
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum diffscope-v*.tar.gz diffscope-v*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(dist/diffscope-v*.tar.gz dist/diffscope-v*.zip)
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}" dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "diffscope ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "${assets[@]}" dist/SHA256SUMS
+          fi
