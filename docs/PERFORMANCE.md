@@ -85,6 +85,31 @@ That cost buys a correct answer. The short names were not merely terser; they ma
 
 Both commits were measured in the same session, which is the only comparison that isolates a change. Criterion's own reported difference is against whatever it last stored, which may be another session's numbers, so it is not used here.
 
+## Effect of call collection
+
+Intra-file call sites are collected inside the traversal that computes the function metrics, so their cost is part of every analysis rather than a phase of its own, and no separate benchmark can isolate it. It was measured by building the analysis twice in one session from one tree -- once with the collection in place and once with those statements removed, everything else identical -- and running both binaries back to back. Wall time is Hyperfine with one warm-up and five runs; peak RSS is `scripts/measure-peak-memory.sh`, five runs each, worst of the five reported.
+
+```sh
+cargo bench --bench analysis -- git_analysis
+hyperfine --warmup 1 --runs 5 \
+  '/tmp/diffscope-on --repository <corpus> --format json HEAD~1 HEAD > /dev/null' \
+  '/tmp/diffscope-off --repository <corpus> --format json HEAD~1 HEAD > /dev/null'
+./scripts/measure-peak-memory.sh /tmp/diffscope-<variant> --repository <corpus> --format json HEAD~1 HEAD
+```
+
+| Corpus | Before | After | Before RSS | After RSS |
+| --- | ---: | ---: | ---: | ---: |
+| generated large tier | 50.6 ms +/- 0.7 ms | 50.4 ms +/- 0.9 ms | 5,620 KiB | 5,800 KiB |
+| call-dense | 736.9 ms +/- 19.4 ms | 766.5 ms +/- 7.7 ms | 63,556 KiB | 94,776 KiB |
+
+The generated tiers cannot show this cost. `git_analysis` now prints the call sites its measurement covers -- `collected_calls=7`, `60`, and `180` for the small, medium, and large tiers across both revisions -- because a generated file holds one call, and one call per changed file is not a workload. `vue-span` and `ts-checker`, the corpora the milestone plan names for this measurement, are not present on this machine and could not be measured; the rows above are the tiers and one locally generated corpus instead.
+
+The `call-dense` corpus is not one of the tiers: 1,000 changed files of 4.84 MB per revision, each declaring 30 functions whose bodies are nine `helper();` calls, so both revisions together hold 540,000 call sites. That is far denser than real TypeScript, and it is the density at which this cost is visible at all. There the collection costs 4% to 6% of wall time in the two pairings and 31,220 KiB of peak RSS, or about 550 ns of CPU and 60 bytes of memory per call site, since the call vectors and their name strings live as long as the analysis. Repeating the pair with the order reversed measured 694.1 ms and 735.8 ms, so the difference is not drift within a run. The sites are held in memory only and reach no document, so the 1.1 MB result for a 49-file diff is unchanged.
+
+This session's absolute figures are higher than the baseline table's for the same corpus -- the large tier measured 47.23 ms in the `git_analysis` group against the table's 20.95 ms. No cause is attributed here; both columns above were measured back to back on one machine state, which is the comparison this section makes.
+
+The cost is accepted because the alternative is worse. Resolving a call needs the callee text, and reading it later would mean either a second walk of every function -- the mistake `function_metrics` exists to avoid -- or re-parsing a revision the analysis already holds.
+
 ## Query cost and analysis reuse
 
 An agent asks several questions about one comparison. Each is a projection of the same analysis, so the adapter keeps a small number of recent analyses keyed by the commits the revisions resolve to.
