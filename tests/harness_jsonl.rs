@@ -52,11 +52,21 @@ fn successful_answers_share_one_v2_envelope() {
     let responses = serve_all(&[
         query(&repo, "summary", "get_change_summary", &json!({})),
         query(&repo, "functions", "list_changed_functions", &json!({})),
+        query(&repo, "graph", "get_impact_graph", &json!({})),
     ]);
 
     let summary = result(&responses[0]);
     assert_eq!(object_keys(summary), ["analysis", "data", "query"]);
     assert!(summary.get("page").is_none());
+
+    let graph = result(&responses[2]);
+    assert_eq!(object_keys(graph), ["analysis", "data", "query"]);
+    assert!(graph.get("page").is_none());
+    let rendered = &graph["data"];
+    assert_eq!(rendered["root"], Value::Null);
+    // A rendering nobody asked for costs nothing and is not carried.
+    assert!(rendered.get("dependency_diff").is_none(), "{rendered}");
+    assert!(rendered.get("mermaid").is_none(), "{rendered}");
 
     let list = result(&responses[1]);
     assert_eq!(object_keys(list), ["analysis", "data", "page", "query"]);
@@ -355,6 +365,84 @@ fn rejects_unknown_methods_and_parameters_without_stopping_the_stream() {
     assert!(responses[3]["result"].is_object());
 }
 
+/// Every way an impact-graph request can be rejected, each naming the field it
+/// is about and what that field accepts — and never taking the stream down.
+#[test]
+fn impact_graph_rejections_name_the_field_and_what_it_accepts() {
+    let repo = sample_repo();
+
+    let responses = serve_all(&[
+        query(
+            &repo,
+            "relation",
+            "get_impact_graph",
+            &json!({ "relations": ["calls"] }),
+        ),
+        query(
+            &repo,
+            "function-root",
+            "get_impact_graph",
+            &json!({ "function_id": "src/util.ts#fn:score@target:1:1" }),
+        ),
+        query(
+            &repo,
+            "cursor",
+            "get_impact_graph",
+            &json!({ "cursor": "not-a-cursor" }),
+        ),
+        query(
+            &repo,
+            "both-roots",
+            "get_impact_graph",
+            &json!({
+                "file": "src/util.ts",
+                "function_id": "src/util.ts#fn:score@target:1:1"
+            }),
+        ),
+        query(
+            &repo,
+            "unchanged-file",
+            "get_impact_graph",
+            &json!({ "file": "src/absent.ts" }),
+        ),
+        query(&repo, "after", "get_impact_graph", &json!({})),
+    ]);
+
+    for response in &responses[..5] {
+        assert_eq!(error_code(response), "invalid_params", "{response}");
+    }
+
+    let relation = error_message(&responses[0]);
+    assert!(relation.contains("`relations`"), "{relation}");
+    assert!(relation.contains("imports, tested_by"), "{relation}");
+    assert!(relation.contains("calls"), "{relation}");
+
+    let function_root = error_message(&responses[1]);
+    assert!(function_root.contains("`function_id`"), "{function_root}");
+    assert!(function_root.contains("call resolution"), "{function_root}");
+    assert!(function_root.contains("`file`"), "{function_root}");
+
+    // A cursor belongs to the paged methods; this answer is bounded by its
+    // budgets instead.
+    let cursor = error_message(&responses[2]);
+    assert!(cursor.contains("`cursor`"), "{cursor}");
+    assert!(cursor.contains("list_changed_files"), "{cursor}");
+
+    let both_roots = error_message(&responses[3]);
+    assert!(both_roots.contains("`file`"), "{both_roots}");
+    assert!(both_roots.contains("`function_id`"), "{both_roots}");
+
+    // A path the comparison did not change is answered with the paths it did:
+    // the caller can correct itself in one step.
+    let unknown = error_message(&responses[4]);
+    assert!(unknown.contains("`file`"), "{unknown}");
+    assert!(unknown.contains("src/absent.ts"), "{unknown}");
+    assert!(unknown.contains("src/util.ts"), "{unknown}");
+
+    // The stream survives every rejection, and the next request is answered.
+    assert!(responses[5]["result"].is_object());
+}
+
 #[test]
 fn analyses_share_one_metadata_block_and_identify_their_inputs() {
     let repo = sample_repo();
@@ -437,6 +525,22 @@ fn canonical_query_echoes_applied_parameters_and_defaults() {
             "get_analysis_diagnostics",
             &json!({ "file": "src/app.ts" }),
         ),
+        query(&repo, "graph", "get_impact_graph", &json!({})),
+        query(
+            &repo,
+            "graph-bounded",
+            "get_impact_graph",
+            &json!({
+                "file": "src/util.ts",
+                "direction": "upstream",
+                "relations": ["tested_by"],
+                "depth": 9,
+                "view": "target",
+                "max_nodes": 1,
+                "max_edges": 999,
+                "render": ["mermaid"]
+            }),
+        ),
     ]);
 
     assert_eq!(query_of(&responses[0]), &json!({}));
@@ -471,6 +575,38 @@ fn canonical_query_echoes_applied_parameters_and_defaults() {
     );
     assert_eq!(query_of(&responses[5]), &json!({ "file": null }));
     assert_eq!(query_of(&responses[6]), &json!({ "file": "src/app.ts" }));
+    // Every parameter the method understands, with the defaults that were
+    // applied: the budgets it used, and the relations this version resolves.
+    assert_eq!(
+        query_of(&responses[7]),
+        &json!({
+            "file": null,
+            "function_id": null,
+            "direction": "both",
+            "relations": ["imports", "tested_by"],
+            "depth": 1,
+            "view": "delta",
+            "max_nodes": 30,
+            "max_edges": 60,
+            "render": []
+        })
+    );
+    // Out-of-range values are clamped rather than rejected, and the echo
+    // reports the clamped ones.
+    assert_eq!(
+        query_of(&responses[8]),
+        &json!({
+            "file": "src/util.ts",
+            "function_id": null,
+            "direction": "upstream",
+            "relations": ["tested_by"],
+            "depth": 3,
+            "view": "target",
+            "max_nodes": 3,
+            "max_edges": 200,
+            "render": ["mermaid"]
+        })
+    );
 }
 
 #[test]
@@ -873,6 +1009,14 @@ fn repeated_queries_are_byte_identical() {
         ),
         query(&repo, "diagnostics", "get_analysis_diagnostics", &json!({})),
         query(&repo, "analysis", "analyze", &json!({})),
+        // Both renderings of one graph: the Mermaid document and the dependency
+        // diff are output, so they are held to the same byte-identity rule.
+        query(
+            &repo,
+            "graph",
+            "get_impact_graph",
+            &json!({ "file": "src/util.ts", "render": ["diff", "mermaid"] }),
+        ),
     ];
     let input = requests
         .iter()
@@ -884,6 +1028,18 @@ fn repeated_queries_are_byte_identical() {
     for _ in 0..3 {
         assert_eq!(serve_bytes(&input), first);
     }
+
+    // The graph answer carries both renderings it was asked for, so the
+    // comparison above covered rendered output and not only structured data.
+    let answered = responses(&first);
+    let rendered = data(&answered[5]);
+    assert!(
+        rendered["mermaid"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("flowchart LR")),
+        "{rendered}"
+    );
+    assert!(rendered["dependency_diff"].is_string(), "{rendered}");
 
     // A page cut from a cursor reproduces byte-for-byte too, in a fresh session.
     let cursor = page_of(&responses(&first)[1])["next_cursor"]
@@ -899,6 +1055,58 @@ fn repeated_queries_are_byte_identical() {
     .to_string();
     let page = serve_bytes(&continuation);
     assert_eq!(serve_bytes(&continuation), page);
+}
+
+/// A comparison that redirected one import to another module: the same caller
+/// now reaches a different file, which is one removed edge and one added one.
+#[test]
+fn a_redirected_import_reports_the_removal_and_the_addition_together() {
+    let repo = redirect_repo();
+
+    let responses = serve_all(&[query(
+        &repo,
+        "delta",
+        "get_impact_graph",
+        &json!({ "file": "src/app.ts", "render": ["diff"] }),
+    )]);
+    let answer = data(&responses[0]);
+
+    let imports = |status: &str| -> Vec<&Value> {
+        answer["graph"]["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .filter(|edge| edge["relation"] == "imports" && edge["status"] == status)
+            .collect()
+    };
+    let removed = imports("removed");
+    let added = imports("added");
+    assert_eq!(removed.len(), 1, "{answer}");
+    assert_eq!(added.len(), 1, "{answer}");
+    assert_eq!(removed[0]["from"], "module:src/app.ts");
+    assert_eq!(removed[0]["to"], "module:src/legacy.ts");
+    assert_eq!(removed[0]["resolution"], "resolved_specifier");
+    assert_eq!(removed[0]["confidence"], json!(1.0));
+    assert_eq!(added[0]["from"], "module:src/app.ts");
+    assert_eq!(added[0]["to"], "module:src/modern.ts");
+
+    // The diff is ordered by the edge ordering, so the removal and the
+    // addition that replaced it sit on adjacent lines.
+    let diff = answer["dependency_diff"].as_str().expect("dependency_diff");
+    let lines = diff.lines().collect::<Vec<_>>();
+    let removed_at = lines
+        .iter()
+        .position(|line| line.starts_with("- ") && line.contains("legacy"))
+        .unwrap_or_else(|| panic!("no removed line in {diff:?}"));
+    let added_at = lines
+        .iter()
+        .position(|line| line.starts_with("+ ") && line.contains("modern"))
+        .unwrap_or_else(|| panic!("no added line in {diff:?}"));
+    assert_eq!(
+        added_at,
+        removed_at + 1,
+        "the removal and its replacement must sit together: {diff:?}"
+    );
 }
 
 #[test]
@@ -1013,6 +1221,12 @@ fn error_code(response: &Value) -> &str {
         .unwrap_or_else(|| panic!("response carries no error code: {response}"))
 }
 
+fn error_message(response: &Value) -> &str {
+    response["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("response carries no error message: {response}"))
+}
+
 fn function_rows(response: &Value) -> &[Value] {
     data(response)["functions"]
         .as_array()
@@ -1120,6 +1334,32 @@ fn sample_repo() -> TestRepo {
     repo.write("src/dupes.ts", DUPES_TARGET);
     repo.write("src/added.ts", ADDED);
     repo.commit("change sources");
+    repo
+}
+
+/// A comparison that redirects one import from a legacy module to its
+/// replacement, leaving both targets unchanged in the tree.
+fn redirect_repo() -> TestRepo {
+    let repo = TestRepo::with_base();
+    repo.write(
+        "src/app.ts",
+        "import { parse } from './legacy';\n\nexport function run() {\n  return parse();\n}\n",
+    );
+    repo.write(
+        "src/legacy.ts",
+        "export function parse() {\n  return 1;\n}\n",
+    );
+    repo.write(
+        "src/modern.ts",
+        "export function parse() {\n  return 2;\n}\n",
+    );
+    repo.commit("add sources");
+
+    repo.write(
+        "src/app.ts",
+        "import { parse } from './modern';\n\nexport function run() {\n  return parse();\n}\n",
+    );
+    repo.commit("redirect the import");
     repo
 }
 
