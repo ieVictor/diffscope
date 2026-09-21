@@ -431,3 +431,177 @@ fn remove_trailing_commas(text: &str) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{ImportIndex, PathAlias, apply_alias, join, resolve, strip_jsonc};
+
+    fn tree<'a>(paths: &[&'a str]) -> BTreeSet<&'a str> {
+        paths.iter().copied().collect()
+    }
+
+    #[test]
+    fn resolves_relative_specifiers_to_real_files() {
+        let paths = tree(&[
+            "src/renderer.ts",
+            "src/shared/index.ts",
+            "src/vnode.tsx",
+            "src/legacy.js",
+        ]);
+
+        let from = "src/renderer.ts";
+        let at = |specifier| resolve(specifier, from, &paths, &[]);
+
+        assert_eq!(at("./vnode"), Some("src/vnode.tsx".to_owned()));
+        assert_eq!(at("./shared"), Some("src/shared/index.ts".to_owned()));
+        assert_eq!(at("./legacy"), Some("src/legacy.js".to_owned()));
+        assert_eq!(
+            resolve("../renderer", "src/shared/index.ts", &paths, &[]),
+            Some("src/renderer.ts".to_owned())
+        );
+        // A package this revision does not contain is external, not a guess.
+        assert_eq!(at("estree-walker"), None);
+        assert_eq!(at("./missing"), None);
+    }
+
+    #[test]
+    fn resolves_workspace_specifiers_through_tsconfig_aliases() {
+        // Without these, 18.4% of a real Vue revision's specifiers look
+        // external and every cross-package edge disappears.
+        let paths = tree(&[
+            "packages/shared/src/index.ts",
+            "packages/vue-compat/src/index.ts",
+            "packages/runtime-core/src/renderer.ts",
+        ]);
+        let aliases = vec![
+            PathAlias {
+                pattern: "@vue/compat".to_owned(),
+                targets: vec!["packages/vue-compat/src".to_owned()],
+            },
+            PathAlias {
+                pattern: "@vue/*".to_owned(),
+                targets: vec!["packages/*/src".to_owned()],
+            },
+        ];
+        let from = "packages/runtime-core/src/renderer.ts";
+
+        assert_eq!(
+            resolve("@vue/shared", from, &paths, &aliases),
+            Some("packages/shared/src/index.ts".to_owned())
+        );
+        // The exact pattern must win over the wildcard.
+        assert_eq!(
+            resolve("@vue/compat", from, &paths, &aliases),
+            Some("packages/vue-compat/src/index.ts".to_owned())
+        );
+    }
+
+    #[test]
+    fn substitutes_only_matching_alias_patterns() {
+        let wildcard = PathAlias {
+            pattern: "@vue/*".to_owned(),
+            targets: vec!["packages/*/src".to_owned()],
+        };
+        assert_eq!(
+            apply_alias(&wildcard, "@vue/shared"),
+            Some("packages/shared/src".to_owned())
+        );
+        assert_eq!(apply_alias(&wildcard, "lodash"), None);
+
+        let exact = PathAlias {
+            pattern: "vue".to_owned(),
+            targets: vec!["packages/vue/src".to_owned()],
+        };
+        assert_eq!(
+            apply_alias(&exact, "vue"),
+            Some("packages/vue/src".to_owned())
+        );
+        assert_eq!(apply_alias(&exact, "vuex"), None);
+    }
+
+    #[test]
+    fn joins_relative_paths_through_parent_segments() {
+        assert_eq!(join("src/compiler", "./parse"), "src/compiler/parse");
+        assert_eq!(
+            join("src/compiler", "../runtime/index"),
+            "src/runtime/index"
+        );
+        assert_eq!(join("", "./root"), "root");
+    }
+
+    #[test]
+    fn reads_tsconfig_with_comments_and_trailing_commas() {
+        // TypeScript accepts both and real configurations use them, so a strict
+        // JSON parse of a `tsconfig.json` fails outright.
+        let text = r#"{
+  // a line comment
+  "compilerOptions": {
+    /* a block comment */
+    "paths": {
+      "@vue/*": ["./packages/*/src"],
+    },
+  },
+}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(&strip_jsonc(text)).expect("config parses after stripping");
+
+        assert_eq!(
+            value["compilerOptions"]["paths"]["@vue/*"][0],
+            "./packages/*/src"
+        );
+    }
+
+    #[test]
+    fn leaves_comment_markers_inside_strings_alone() {
+        let text = r#"{"paths":{"http://example.invalid/*":["./a"]}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(&strip_jsonc(text)).expect("config parses");
+
+        assert!(value["paths"].get("http://example.invalid/*").is_some());
+    }
+
+    #[test]
+    fn walks_importers_breadth_first_within_a_depth_limit() {
+        let mut index = ImportIndex::default();
+        for (importer, imported) in [
+            ("app.ts", "middle.ts"),
+            ("middle.ts", "core.ts"),
+            ("direct.ts", "core.ts"),
+        ] {
+            index
+                .outbound
+                .entry(importer.to_owned())
+                .or_default()
+                .insert(imported.to_owned());
+            index
+                .inbound
+                .entry(imported.to_owned())
+                .or_default()
+                .insert(importer.to_owned());
+        }
+
+        assert_eq!(
+            index
+                .importers("core.ts")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["direct.ts".to_owned(), "middle.ts".to_owned()]
+        );
+        assert_eq!(
+            index.reachable_importers("core.ts", 1),
+            BTreeMap::from([("direct.ts".to_owned(), 1), ("middle.ts".to_owned(), 1)])
+        );
+        // `app.ts` only reaches `core.ts` through `middle.ts`.
+        assert_eq!(
+            index.reachable_importers("core.ts", 2),
+            BTreeMap::from([
+                ("direct.ts".to_owned(), 1),
+                ("middle.ts".to_owned(), 1),
+                ("app.ts".to_owned(), 2)
+            ])
+        );
+    }
+}
