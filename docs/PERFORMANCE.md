@@ -44,6 +44,20 @@ Measured on 2026-09-20 with:
 
 The complete large-corpus CLI measured `744.5 ms ± 4.3 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 5,076 KiB. These numbers are local reference values, not cross-machine performance guarantees.
 
+## Effect of identity scoping and churn measurement
+
+Container-scoped identities, per-function churn, body hashing for ambiguous matches, and export collection each add work to the analysis. Measured by benchmarking the commit before that work and the commit after it, back to back in the same session:
+
+| Tier | Before | After |
+| --- | ---: | ---: |
+| small | 12.59 ms | 11.96 ms |
+| medium | 22.83 ms | 22.85 ms |
+| large | 22.17 ms | 21.25 ms |
+
+The difference is within run-to-run noise on every tier: the added work is not measurable against the cost of parsing.
+
+These numbers do not reproduce the baseline table above, which was recorded in a different session. Criterion compares against whatever it last stored, so its reported change is meaningless across sessions; the table here is an A/B of two commits measured together, which is the only comparison that isolates the change. The baseline table should be re-recorded before it is relied on again.
+
 ## Query cost and analysis reuse
 
 An agent asks several questions about one comparison. Each is a projection of the same analysis, so the adapter keeps a small number of recent analyses keyed by the commits the revisions resolve to.
