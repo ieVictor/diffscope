@@ -2,8 +2,15 @@ use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-use super::{HarnessErrorCode, HarnessOutcome, HarnessRequest, HarnessResponse, execute};
-use crate::output;
+use super::{HarnessErrorCode, HarnessOutcome, HarnessRequest, HarnessSession};
+use crate::{
+    analysis::FunctionChangeStatus,
+    output,
+    query::{
+        self, FileFilter, FunctionFilter, Page, classify::FileClassification, risk::RiskLevel,
+    },
+    result::AnalysisResult,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -34,6 +41,7 @@ impl std::error::Error for JsonlAdapterError {}
 /// Returns an error only when the input/output transport fails or a response
 /// cannot be serialized.
 pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<(), JsonlAdapterError> {
+    let session = HarnessSession::new();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -48,59 +56,209 @@ pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<(), J
             continue;
         }
 
-        let response = process_line(&line)?;
+        let response = process_line(&session, &line);
         serde_json::to_writer(&mut writer, &response).map_err(JsonlAdapterError::Serialization)?;
         writer.write_all(b"\n").map_err(JsonlAdapterError::Io)?;
         writer.flush().map_err(JsonlAdapterError::Io)?;
     }
 }
 
-fn process_line(line: &[u8]) -> Result<WireResponse, JsonlAdapterError> {
+fn process_line(session: &HarnessSession, line: &[u8]) -> WireResponse {
     let request = match serde_json::from_slice::<WireRequest>(line) {
         Ok(request) => request,
         Err(error) => {
-            return Ok(WireResponse::error(
+            return WireResponse::error(
                 request_id(line),
                 "malformed_request",
                 format!("invalid request: {error}"),
-            ));
+            );
         }
     };
     if request.protocol_version != PROTOCOL_VERSION {
-        return Ok(WireResponse::error(
+        return WireResponse::error(
             Some(request.id),
             "unsupported_protocol_version",
             format!(
                 "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
                 request.protocol_version
             ),
-        ));
+        );
     }
 
-    response_for(execute(HarnessRequest {
+    let method = match Method::parse(request.method.as_deref()) {
+        Ok(method) => method,
+        Err(message) => {
+            return WireResponse::error(Some(request.id), "unknown_method", message);
+        }
+    };
+
+    let response = session.execute(HarnessRequest {
         id: request.id,
         repository: request.repository,
         base_revision: request.base,
         target_revision: request.target,
-    }))
+    });
+    let id = response.id.clone();
+    let result = match response.outcome {
+        HarnessOutcome::Error(error) => {
+            return WireResponse::error(
+                Some(id),
+                match error.code {
+                    HarnessErrorCode::AnalysisFailed => "analysis_failed",
+                },
+                error.message,
+            );
+        }
+        HarnessOutcome::Success(result) => result,
+    };
+
+    let params = request.params.unwrap_or_default();
+    match project(method, &result, &params) {
+        Ok(value) => WireResponse {
+            protocol_version: PROTOCOL_VERSION,
+            id: Some(id),
+            result: Some(value),
+            error: None,
+        },
+        Err(error) => WireResponse::error(Some(id), error.code, error.message),
+    }
 }
 
-fn response_for(response: HarnessResponse) -> Result<WireResponse, JsonlAdapterError> {
-    match response.outcome {
-        HarnessOutcome::Success(result) => Ok(WireResponse {
-            protocol_version: PROTOCOL_VERSION,
-            id: Some(response.id),
-            result: Some(output::json_value(&result).map_err(JsonlAdapterError::Serialization)?),
-            error: None,
-        }),
-        HarnessOutcome::Error(error) => Ok(WireResponse::error(
-            Some(response.id),
-            match error.code {
-                HarnessErrorCode::AnalysisFailed => "analysis_failed",
-            },
-            error.message,
-        )),
+/// The question a request is asking about a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    /// The complete analysis, exactly as the CLI emits it.
+    Analyze,
+    ChangeSummary,
+    ListChangedFiles,
+    ListChangedFunctions,
+    GetFunctionChange,
+    GetAnalysisDiagnostics,
+}
+
+impl Method {
+    /// A request without a method asks for the complete analysis, which is what
+    /// the protocol has always returned. Older clients therefore keep working
+    /// unchanged.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("analyze") => Ok(Self::Analyze),
+            Some("get_change_summary") => Ok(Self::ChangeSummary),
+            Some("list_changed_files") => Ok(Self::ListChangedFiles),
+            Some("list_changed_functions") => Ok(Self::ListChangedFunctions),
+            Some("get_function_change") => Ok(Self::GetFunctionChange),
+            Some("get_analysis_diagnostics") => Ok(Self::GetAnalysisDiagnostics),
+            Some(other) => Err(format!(
+                "unknown method `{other}`; expected analyze, get_change_summary, \
+                 list_changed_files, list_changed_functions, get_function_change, \
+                 or get_analysis_diagnostics"
+            )),
+        }
     }
+}
+
+struct ProjectionError {
+    code: &'static str,
+    message: String,
+}
+
+fn invalid_params(message: String) -> ProjectionError {
+    ProjectionError {
+        code: "invalid_params",
+        message,
+    }
+}
+
+/// Render the answer to one method as JSON.
+fn project(
+    method: Method,
+    result: &AnalysisResult,
+    params: &WireParams,
+) -> Result<serde_json::Value, ProjectionError> {
+    let value = match method {
+        Method::Analyze => {
+            output::json_value(result).map_err(|error| serialization_failed(&error))?
+        }
+        Method::ChangeSummary => to_value(&query::change_summary(result))
+            .map_err(|error| serialization_failed(&error))?,
+        Method::ListChangedFiles => {
+            let filter = params.file_filter()?;
+            to_value(&query::list_changed_files(result, &filter))
+                .map_err(|error| serialization_failed(&error))?
+        }
+        Method::ListChangedFunctions => {
+            let filter = params.function_filter()?;
+            to_value(&query::list_changed_functions(result, &filter))
+                .map_err(|error| serialization_failed(&error))?
+        }
+        Method::GetFunctionChange => {
+            let file = params
+                .file
+                .as_deref()
+                .ok_or_else(|| invalid_params("`file` is required".to_owned()))?;
+            let symbol = params
+                .symbol
+                .as_deref()
+                .ok_or_else(|| invalid_params("`symbol` is required".to_owned()))?;
+            match query::get_function_change(result, file, symbol) {
+                Ok(detail) => to_value(&detail).map_err(|error| serialization_failed(&error))?,
+                Err(unknown) => {
+                    return Err(ProjectionError {
+                        code: "unknown_function",
+                        message: describe_unknown(&unknown),
+                    });
+                }
+            }
+        }
+        Method::GetAnalysisDiagnostics => to_value(&query::get_analysis_diagnostics(
+            result,
+            params.file.as_deref(),
+        ))
+        .map_err(|error| serialization_failed(&error))?,
+    };
+    Ok(value)
+}
+
+fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(value)
+}
+
+fn serialization_failed(error: &serde_json::Error) -> ProjectionError {
+    ProjectionError {
+        code: "serialization_failed",
+        message: error.to_string(),
+    }
+}
+
+/// Name the symbols the file does contain, so a caller can correct itself in
+/// one step instead of guessing again.
+fn describe_unknown(unknown: &query::UnknownFunction) -> String {
+    /// Symbols named in the error before it is summarized.
+    const SUGGESTIONS: usize = 10;
+
+    if unknown.known_symbols.is_empty() {
+        return format!(
+            "no file `{}` in this comparison, so `{}` cannot be resolved",
+            unknown.file, unknown.symbol
+        );
+    }
+    let shown = unknown
+        .known_symbols
+        .iter()
+        .take(SUGGESTIONS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remainder = unknown.known_symbols.len().saturating_sub(SUGGESTIONS);
+    let more = if remainder == 0 {
+        String::new()
+    } else {
+        format!(" and {remainder} more")
+    };
+    format!(
+        "`{}` has no symbol `{}`; it contains {shown}{more}",
+        unknown.file, unknown.symbol
+    )
 }
 
 fn request_id(line: &[u8]) -> Option<String> {
@@ -128,6 +286,108 @@ struct WireRequest {
     repository: String,
     base: String,
     target: String,
+    /// The question being asked. Absent means the complete analysis.
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: Option<WireParams>,
+}
+
+/// Every parameter any method accepts.
+///
+/// One shape for all methods keeps the wire format obvious and lets an unknown
+/// field be rejected outright rather than silently ignored. Parameters that do
+/// not apply to the method being called are simply unused.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireParams {
+    file: Option<String>,
+    symbol: Option<String>,
+    status: Option<String>,
+    classification: Option<String>,
+    minimum_risk: Option<String>,
+    min_complexity_delta: Option<i64>,
+    include_unchanged: Option<bool>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+impl WireParams {
+    fn page(&self) -> Page {
+        Page {
+            limit: self.limit,
+            offset: self.offset.unwrap_or(0),
+        }
+    }
+
+    fn file_filter(&self) -> Result<FileFilter, ProjectionError> {
+        Ok(FileFilter {
+            classification: self.classification()?,
+            minimum_risk: self.minimum_risk()?,
+            page: self.page(),
+        })
+    }
+
+    fn function_filter(&self) -> Result<FunctionFilter, ProjectionError> {
+        Ok(FunctionFilter {
+            file: self.file.clone(),
+            status: self.status()?,
+            classification: self.classification()?,
+            minimum_risk: self.minimum_risk()?,
+            min_complexity_delta: self.min_complexity_delta,
+            include_unchanged: self.include_unchanged.unwrap_or(false),
+            page: self.page(),
+        })
+    }
+
+    fn classification(&self) -> Result<Option<FileClassification>, ProjectionError> {
+        parse_enum(
+            self.classification.as_deref(),
+            FileClassification::parse,
+            "classification",
+            "lockfile, vendored, generated, test, config, docs, source",
+        )
+    }
+
+    fn minimum_risk(&self) -> Result<Option<RiskLevel>, ProjectionError> {
+        parse_enum(
+            self.minimum_risk.as_deref(),
+            RiskLevel::parse,
+            "minimum_risk",
+            "low, medium, high",
+        )
+    }
+
+    fn status(&self) -> Result<Option<FunctionChangeStatus>, ProjectionError> {
+        parse_enum(
+            self.status.as_deref(),
+            |value| match value {
+                "added" => Some(FunctionChangeStatus::Added),
+                "removed" => Some(FunctionChangeStatus::Removed),
+                "modified" => Some(FunctionChangeStatus::Modified),
+                "unchanged" => Some(FunctionChangeStatus::Unchanged),
+                _ => None,
+            },
+            "status",
+            "added, removed, modified, unchanged",
+        )
+    }
+}
+
+fn parse_enum<T>(
+    value: Option<&str>,
+    parse: impl Fn(&str) -> Option<T>,
+    field: &str,
+    accepted: &str,
+) -> Result<Option<T>, ProjectionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    parse(value).map(Some).ok_or_else(|| {
+        invalid_params(format!(
+            "`{field}` must be one of {accepted}; received `{value}`"
+        ))
+    })
 }
 
 #[derive(Serialize)]

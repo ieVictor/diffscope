@@ -76,7 +76,23 @@ impl Repository {
         })
     }
 
-    fn resolve_revision(&self, revision: &str) -> Result<ResolvedRevision, DiffScopeError> {
+    /// The repository root, as Git resolved it.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Resolve one revision to the commit it names.
+    ///
+    /// Exposed so a caller can identify a comparison by its two commits before
+    /// deciding whether it already has that analysis. Resolution is a single
+    /// `rev-parse` and costs orders of magnitude less than an analysis, which
+    /// is what makes the check worth doing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot resolve the revision to a commit.
+    pub fn resolve_revision(&self, revision: &str) -> Result<ResolvedRevision, DiffScopeError> {
         let spec = format!("{revision}^{{commit}}");
         let output = self.git(["rev-parse", "--verify", spec.as_str()])?;
         Ok(ResolvedRevision {
