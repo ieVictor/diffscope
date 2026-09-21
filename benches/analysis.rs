@@ -6,7 +6,7 @@ use diffscope::{
     git::Repository,
     imports::index_revision,
     inventory_changes,
-    query::{self, FunctionFilter},
+    query::{self, FileFilter, FunctionFilter},
 };
 
 const TIERS: [&str; 3] = ["small", "medium", "large"];
@@ -100,6 +100,10 @@ fn query_projection(criterion: &mut Criterion) {
 
     group.bench_function("change_summary", |bencher| {
         bencher.iter(|| query::change_summary(std::hint::black_box(&result), None));
+    });
+    group.bench_function("list_changed_files", |bencher| {
+        let filter = FileFilter::default();
+        bencher.iter(|| query::list_changed_files(std::hint::black_box(&result), &filter, None));
     });
     group.bench_function("list_changed_functions", |bencher| {
         let filter = FunctionFilter::default();
