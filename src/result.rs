@@ -1,7 +1,7 @@
 use crate::{
     DiffHunk, FileStatus,
     analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
-    languages::{DiagnosticSeverity, FunctionKind, Language, SourceRange},
+    languages::{CallSite, DiagnosticSeverity, FunctionKind, Language, SourceRange},
     metrics::FunctionMetrics,
 };
 
@@ -69,6 +69,15 @@ pub struct FunctionResult {
     pub target_range: Option<SourceRange>,
     pub metrics_before: Option<FunctionMetrics>,
     pub metrics_after: Option<FunctionMetrics>,
+    /// Calls written in this function on each side, in source order, empty when
+    /// that side has no definition.
+    ///
+    /// Kept internal: `output.rs` renders its own view structs, so these reach
+    /// no JSON document, `--format json` does not carry them, and the core
+    /// schema stays at version 1. The graph builder reads them from here rather
+    /// than re-parsing either revision.
+    pub calls_before: Vec<CallSite>,
+    pub calls_after: Vec<CallSite>,
     pub churn: FunctionChurn,
     pub match_confidence: MatchConfidence,
     pub diagnostics: Vec<Diagnostic>,

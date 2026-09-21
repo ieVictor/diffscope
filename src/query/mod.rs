@@ -1826,6 +1826,8 @@ mod tests {
             }),
             metrics_before: before.map(metrics),
             metrics_after: after.map(metrics),
+            calls_before: Vec::new(),
+            calls_after: Vec::new(),
             churn: FunctionChurn {
                 lines_removed: 0,
                 lines_added: churned,

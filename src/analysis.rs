@@ -6,8 +6,8 @@ use std::{
 use crate::{
     BlobContent, DiffHunk, DiffScopeError, FileChange, FileStatus,
     languages::{
-        DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
-        LanguageDiagnosticCode, SourceRange, analyze_source,
+        CallSite, DiagnosticSeverity, FunctionDefinition, FunctionKind, Language,
+        LanguageDiagnostic, LanguageDiagnosticCode, SourceRange, analyze_source,
     },
     metrics::FunctionMetrics,
 };
@@ -35,6 +35,15 @@ pub struct FunctionChange {
     pub target_range: Option<SourceRange>,
     pub metrics_before: Option<FunctionMetrics>,
     pub metrics_after: Option<FunctionMetrics>,
+    /// Calls written in the function on each side, in source order, empty when
+    /// that side has no definition.
+    ///
+    /// Evidence for the call graph rather than a metric: [`function_changed`]
+    /// compares hunks and metrics only, so a call list never decides a status
+    /// and a function whose calls were merely reordered stays unchanged. Held
+    /// in memory only; no serializer reads these.
+    pub calls_before: Vec<CallSite>,
+    pub calls_after: Vec<CallSite>,
     pub churn: FunctionChurn,
     pub match_confidence: MatchConfidence,
 }
@@ -179,6 +188,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                     target_range: Some(target_function.range.clone()),
                     metrics_before: Some(base_function.metrics.clone()),
                     metrics_after: Some(target_function.metrics.clone()),
+                    calls_before: base_function.calls.clone(),
+                    calls_after: target_function.calls.clone(),
                 });
             }
             (Some(base_function), None) => functions.push(FunctionChange {
@@ -192,6 +203,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 target_range: None,
                 metrics_before: Some(base_function.metrics.clone()),
                 metrics_after: None,
+                calls_before: base_function.calls.clone(),
+                calls_after: Vec::new(),
             }),
             (None, Some(target_function)) => functions.push(FunctionChange {
                 status: FunctionChangeStatus::Added,
@@ -204,6 +217,8 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 target_range: Some(target_function.range.clone()),
                 metrics_before: None,
                 metrics_after: Some(target_function.metrics.clone()),
+                calls_before: Vec::new(),
+                calls_after: target_function.calls.clone(),
             }),
             (None, None) => {}
         }
@@ -405,6 +420,10 @@ fn key_for(function: &FunctionDefinition) -> FunctionKey {
 /// numbers, and reporting those as modified buries the functions that really
 /// changed. Moved functions still intersect a hunk at both their old and new
 /// positions, so they remain modified.
+///
+/// Call sites are deliberately not compared either: they are evidence for the
+/// call graph, not a metric, and this status is derived from metrics and hunks
+/// alone so that nothing about it depends on data no caller can see.
 fn function_changed(
     base_function: &FunctionDefinition,
     target_function: &FunctionDefinition,
@@ -522,6 +541,8 @@ fn ambiguous_change(
         target_range,
         metrics_before: base_function.map(|function| function.metrics.clone()),
         metrics_after: target_function.map(|function| function.metrics.clone()),
+        calls_before: base_function.map_or_else(Vec::new, |function| function.calls.clone()),
+        calls_after: target_function.map_or_else(Vec::new, |function| function.calls.clone()),
     }
 }
 
@@ -595,7 +616,7 @@ fn range_start(range: Option<&SourceRange>) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BlobContent, FileChange, FileStatus};
+    use crate::{BlobContent, FileChange, FileStatus, languages::CallSite};
 
     use super::{
         FunctionChangeStatus, FunctionMappingDiagnosticCode, MatchConfidence,
@@ -1063,6 +1084,65 @@ mod tests {
         assert_eq!(shifted.churn.changed_hunks, 1);
         assert_eq!(shifted.churn.lines_added, 0);
         assert_eq!(shifted.churn.lines_removed, 0);
+    }
+
+    #[test]
+    fn carries_each_sides_call_sites_to_that_side() {
+        // The graph builds one side's edges from one side's calls, so a call
+        // the target added must not appear on the base, and a removed
+        // function's calls must survive on the side the function existed on.
+        let file = file_change(
+            b"function helper() { return 1; }\nfunction caller() { return helper(); }\nfunction gone() { return helper(); }\n",
+            b"function helper() { return 1; }\nfunction caller() { return other(); }\nfunction added() { return helper(); }\n",
+            2,
+            2,
+            2,
+            2,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+        let calls_of = |name: &str| {
+            let function = mapped
+                .functions
+                .iter()
+                .find(|function| function.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"));
+            (function.calls_before.clone(), function.calls_after.clone())
+        };
+
+        assert_eq!(
+            calls_of("caller"),
+            (
+                vec![CallSite {
+                    name: "helper".to_owned(),
+                    line: 2,
+                }],
+                vec![CallSite {
+                    name: "other".to_owned(),
+                    line: 2,
+                }],
+            )
+        );
+        assert_eq!(
+            calls_of("gone"),
+            (
+                vec![CallSite {
+                    name: "helper".to_owned(),
+                    line: 3,
+                }],
+                Vec::new(),
+            )
+        );
+        assert_eq!(
+            calls_of("added"),
+            (
+                Vec::new(),
+                vec![CallSite {
+                    name: "helper".to_owned(),
+                    line: 3,
+                }],
+            )
+        );
     }
 
     #[test]

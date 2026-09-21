@@ -31,6 +31,25 @@ pub struct SourceRange {
     pub end_column: u32,
 }
 
+/// One call written inside a function body, as the collector saw it.
+///
+/// Only a plain identifier callee is recorded. A call to a name declared in the
+/// same file needs no import resolution and no type information, so its target
+/// is knowable exactly; a member callee (`a.b()`), a computed one (`a[b]()`),
+/// or a call on a call needs information no stage has yet, and a name guessed
+/// from one of them would become an edge that may not exist.
+///
+/// The file is not recorded per call: a call site belongs to the function whose
+/// body contains it, and that function's own path is the file. Storing it again
+/// per call would repeat one path across thousands of sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// Callee text, exactly as written, for a plain identifier callee.
+    pub name: String,
+    /// 1-based line the call expression starts on.
+    pub line: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDefinition {
     pub language: Language,
@@ -38,6 +57,14 @@ pub struct FunctionDefinition {
     pub qualified_name: String,
     pub range: SourceRange,
     pub metrics: FunctionMetrics,
+    /// Calls written directly in this body, in source order, duplicates kept.
+    ///
+    /// A call inside a nested function belongs to that nested function, not to
+    /// the one enclosing it, for the same reason a decision there does not
+    /// raise the enclosing function's complexity: attributing it upward would
+    /// make the enclosing function appear to call things it does not, and the
+    /// nested function is a node of its own.
+    pub calls: Vec<CallSite>,
     /// Hash of the function's source with whitespace runs collapsed.
     ///
     /// Used only to pair functions that share one identity, so that a group of

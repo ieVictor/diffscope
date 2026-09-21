@@ -5,7 +5,7 @@ use tree_sitter::{Node, Parser};
 use crate::{DiffScopeError, metrics::FunctionMetrics};
 
 use super::{
-    DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
+    CallSite, DiagnosticSeverity, FunctionDefinition, FunctionKind, Language, LanguageDiagnostic,
     LanguageDiagnosticCode, SourceAnalysis, SourceRange,
 };
 
@@ -130,12 +130,14 @@ impl<'source> FunctionCollector<'source> {
         }
 
         let qualified_name = self.qualified_name(node, kind);
+        let facts = function_facts(node, self.source)?;
         self.functions.push(FunctionDefinition {
             language: self.language,
             kind,
             qualified_name,
             range: SourceRange::from_tree_sitter(node.range())?,
-            metrics: function_metrics(node, self.source)?,
+            metrics: facts.metrics,
+            calls: facts.calls,
             body_hash: super::body_hash(node_text(node, self.source).unwrap_or_default()),
         });
         Ok(())
@@ -348,15 +350,25 @@ fn clean_property_name(name: &str) -> String {
     name.trim_matches(['\'', '"', '`']).to_owned()
 }
 
-fn function_metrics(node: Node<'_>, source: &str) -> Result<FunctionMetrics, DiffScopeError> {
-    // One traversal yields both metrics. Walking the function twice, once per
-    // metric, doubles the most expensive step of the analyzer.
-    let points = complexity_points(node, 0);
-    Ok(FunctionMetrics {
-        physical_loc: physical_loc(node, source)?,
-        source_loc: source_loc(node, source)?,
-        cyclomatic_complexity: 1 + points.cyclomatic,
-        cognitive_complexity: points.cognitive,
+/// Everything the function collector reads from one function in one walk.
+struct FunctionFacts {
+    metrics: FunctionMetrics,
+    calls: Vec<CallSite>,
+}
+
+fn function_facts(node: Node<'_>, source: &str) -> Result<FunctionFacts, DiffScopeError> {
+    // One traversal yields the metrics and the call sites. Walking the function
+    // twice, once per concern, doubles the most expensive step of the analyzer,
+    // which `PERFORMANCE.md` attributes 53% of analysis time to.
+    let facts = body_facts(node, source, 0);
+    Ok(FunctionFacts {
+        metrics: FunctionMetrics {
+            physical_loc: physical_loc(node, source)?,
+            source_loc: source_loc(node, source)?,
+            cyclomatic_complexity: 1 + facts.cyclomatic,
+            cognitive_complexity: facts.cognitive,
+        },
+        calls: facts.calls,
     })
 }
 
@@ -451,43 +463,88 @@ fn remove_comments(source: &str) -> String {
     output
 }
 
+/// What one recursive walk of a function body yields.
+///
+/// Complexity and call sites are read together because this walk is the
+/// analyzer's most expensive step: a second pass over every body would pay it
+/// twice for facts that are already in hand at each node.
 #[derive(Debug, Default)]
-struct ComplexityPoints {
+struct BodyFacts {
     cyclomatic: u32,
     cognitive: u32,
+    /// Calls reached by this walk, in source order, duplicates kept.
+    calls: Vec<CallSite>,
 }
 
-fn complexity_points(node: Node<'_>, nesting: u32) -> ComplexityPoints {
-    let mut points = ComplexityPoints::default();
+fn body_facts(node: Node<'_>, source: &str, nesting: u32) -> BodyFacts {
+    let mut facts = BodyFacts::default();
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
+        // recurse, but stop at a nested function's boundary
         if child.start_byte() != node.start_byte() && function_kind(child, "").is_some() {
             continue;
         }
 
+        // A call is read from the child this walk already holds, so collecting
+        // it costs no traversal of its own.
+        if let Some(call) = call_site(child, source) {
+            facts.calls.push(call);
+        }
+
         let kind = child.kind();
         if is_cyclomatic_decision(kind) {
-            points.cyclomatic += 1;
+            facts.cyclomatic += 1;
         }
         if is_cognitive_decision(kind) {
-            points.cognitive += 1 + nesting;
-            let child_points = complexity_points(child, nesting + 1);
-            points.cyclomatic += child_points.cyclomatic;
-            points.cognitive += child_points.cognitive;
+            facts.cognitive += 1 + nesting;
+            let child_facts = body_facts(child, source, nesting + 1);
+            facts.cyclomatic += child_facts.cyclomatic;
+            facts.cognitive += child_facts.cognitive;
+            facts.calls.extend(child_facts.calls);
             continue;
         }
         if kind == "binary_expression" && is_short_circuit_operator(child) {
-            points.cyclomatic += 1;
-            points.cognitive += 1;
+            facts.cyclomatic += 1;
+            facts.cognitive += 1;
         }
 
-        let child_points = complexity_points(child, nesting);
-        points.cyclomatic += child_points.cyclomatic;
-        points.cognitive += child_points.cognitive;
+        let child_facts = body_facts(child, source, nesting);
+        facts.cyclomatic += child_facts.cyclomatic;
+        facts.cognitive += child_facts.cognitive;
+        facts.calls.extend(child_facts.calls);
     }
 
-    points
+    facts
+}
+
+/// Read the call one node records, when it is a call with a plain identifier
+/// callee.
+///
+/// `new Foo()` names its callee in a `constructor` field and `Foo()` in a
+/// `function` field; that is the only difference between the two here. Every
+/// other callee shape -- a member expression, a computed access, a call on a
+/// call -- records nothing rather than a lower-confidence guess: the call graph
+/// shows a relationship it is sure of or shows none.
+///
+/// The line is the call expression's own, not the callee's: that is the
+/// position a reader jumps to to see the call, and a call spread over several
+/// lines starts where its callee does not.
+fn call_site(node: Node<'_>, source: &str) -> Option<CallSite> {
+    let field = match node.kind() {
+        "call_expression" => "function",
+        "new_expression" => "constructor",
+        _ => return None,
+    };
+    let callee = node.child_by_field_name(field)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(callee, source)?;
+    Some(CallSite {
+        name: name.to_owned(),
+        line: start_line(node),
+    })
 }
 
 fn is_cyclomatic_decision(kind: &str) -> bool {
@@ -675,8 +732,8 @@ mod tests {
     use std::path::Path;
 
     use super::super::{
-        DiagnosticSeverity, FunctionKind, Language, LanguageDiagnosticCode, analyze_source,
-        detect_language,
+        CallSite, DiagnosticSeverity, FunctionKind, Language, LanguageDiagnosticCode,
+        analyze_source, detect_language,
     };
 
     #[test]
@@ -856,6 +913,224 @@ function outer() {
 
         assert_eq!(outer.metrics.cyclomatic_complexity, 1);
         assert_eq!(outer.metrics.cognitive_complexity, 0);
+    }
+
+    #[test]
+    fn collects_calls_to_locally_declared_functions() {
+        let source = br"
+function helper(): number { return 1; }
+
+function caller(): number {
+  return helper();
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let caller = analysis
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "caller")
+            .expect("caller function exists");
+
+        assert_eq!(
+            caller.calls,
+            vec![CallSite {
+                name: "helper".to_owned(),
+                line: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn attributes_calls_inside_nested_functions_to_the_nested_function() {
+        // The mirror of the complexity boundary. Attributing the arrow
+        // function's call upward would make `outer` appear to call something
+        // it does not, and the arrow function is a node of its own.
+        let source = br"
+function outer() {
+  const inner = () => helper();
+  other();
+  return inner;
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let outer = analysis
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "outer")
+            .expect("outer function exists");
+        let inner = analysis
+            .functions
+            .iter()
+            .find(|function| function.qualified_name == "inner")
+            .expect("inner function exists");
+
+        assert_eq!(
+            inner.calls,
+            vec![CallSite {
+                name: "helper".to_owned(),
+                line: 3,
+            }]
+        );
+        assert_eq!(
+            outer.calls,
+            vec![CallSite {
+                name: "other".to_owned(),
+                line: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_callees_that_are_not_plain_identifiers() {
+        // A member callee, a computed one, and a call on a call each name
+        // something this stage cannot resolve, so they record nothing. The
+        // plain call inside the first one's arguments is still reached by the
+        // walk and is still a call to a name this file could declare.
+        let source = br"
+function indirect(holder: Holder, key: string) {
+  holder.method(direct());
+  holder[key]();
+  holder.create()();
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let indirect = &analysis.functions[0];
+
+        assert_eq!(
+            indirect.calls,
+            vec![CallSite {
+                name: "direct".to_owned(),
+                line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn collects_constructor_calls() {
+        let source = br"
+function build(factory: Factory): Widget {
+  const made = new factory.Widget(1);
+  return new Widget(made);
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let build = &analysis.functions[0];
+
+        // A `new_expression` names its callee in a different field than a
+        // `call_expression` does, and a member constructor is no more a plain
+        // identifier than a member call is.
+        assert_eq!(
+            build.calls,
+            vec![CallSite {
+                name: "Widget".to_owned(),
+                line: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn collects_recursive_calls() {
+        let source = br"
+function countdown(value: number): number {
+  if (value <= 0) {
+    return 0;
+  }
+  return countdown(value - 1);
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let countdown = &analysis.functions[0];
+
+        assert_eq!(
+            countdown.calls,
+            vec![CallSite {
+                name: "countdown".to_owned(),
+                line: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_calls_in_source_order_with_duplicates_across_decisions() {
+        // The walk reaches a call through three different arms -- plain
+        // children, decisions, and short-circuit operands -- and a call inside
+        // a decision is collected by that decision's own recursion. Order and
+        // duplicates are what the graph emits edges from, so both are pinned
+        // here.
+        let source = br"
+function mixed(flag: boolean) {
+  second();
+  if (flag) {
+    first();
+    second();
+  }
+  flag ? first() : second();
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let mixed = &analysis.functions[0];
+
+        assert_eq!(
+            mixed.calls,
+            vec![
+                CallSite {
+                    name: "second".to_owned(),
+                    line: 3,
+                },
+                CallSite {
+                    name: "first".to_owned(),
+                    line: 5,
+                },
+                CallSite {
+                    name: "second".to_owned(),
+                    line: 6,
+                },
+                CallSite {
+                    name: "first".to_owned(),
+                    line: 8,
+                },
+                CallSite {
+                    name: "second".to_owned(),
+                    line: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_metrics_and_body_hashes_unchanged_by_call_collection() {
+        // Calls come out of the same walk as the metrics, so they change
+        // neither the metrics nor the body hash: a body that only calls is as
+        // simple as an empty one, and its hash is still its source text with
+        // whitespace collapsed.
+        let source = br"
+function onlyCalls() {
+  first();
+  second();
+  new Third();
+}
+";
+        let body = "function onlyCalls() {\n  first();\n  second();\n  new Third();\n}";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let only_calls = &analysis.functions[0];
+
+        assert_eq!(only_calls.calls.len(), 3);
+        assert_eq!(only_calls.metrics.physical_loc, 5);
+        assert_eq!(only_calls.metrics.source_loc, 5);
+        assert_eq!(only_calls.metrics.cyclomatic_complexity, 1);
+        assert_eq!(only_calls.metrics.cognitive_complexity, 0);
+        assert_eq!(only_calls.body_hash, super::super::body_hash(body));
+        assert_eq!(
+            only_calls.body_hash,
+            super::super::body_hash("function onlyCalls() { first(); second(); new Third(); }")
+        );
     }
 
     #[test]
