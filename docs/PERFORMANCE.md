@@ -120,9 +120,25 @@ Measured on 12 logical cores:
 | vue-span | 2.005 s | 590.0 ms | 70.6% |
 | ts-checker | 1.218 s | 1.240 s | -1.8% |
 
-`ts-checker` regresses slightly because one 2.9 MiB file accounts for nearly all of its parse work: eleven workers finish immediately and only scheduling overhead remains. Diffs dominated by a single large file are the case per-file parallelism cannot improve; parsing a file's base and target revisions concurrently would address it and has not been measured.
+`ts-checker` regresses slightly because one 2.9 MiB file accounts for nearly all of its parse work: eleven workers finish immediately and only scheduling overhead remains. Diffs dominated by a single large file are the case per-file parallelism cannot improve; the next section addresses them.
 
 Peak RSS rises because several files are held in flight at once, from 24,108 KiB to 43,708 KiB on `vue-minor` and from 31,680 KiB to 50,988 KiB on `vue-span`. `ts-checker` is unchanged at 69,384 KiB, since its memory is dominated by one file.
+
+### Concurrent base and target parsing
+
+A file's two revisions are independent, so parsing them at once is the only parallelism available to a diff dominated by one large file. Both blobs are analyzed on separate threads when each is at least 64 KiB; smaller blobs stay on the current thread, which keeps file-heavy diffs from starting a second thread per file and oversubscribing the machine.
+
+| Corpus | Per-file only | With concurrent blobs | Improvement |
+| --- | ---: | ---: | ---: |
+| vue-commit | 95.0 ms | 58.7 ms | 38.2% |
+| vue-week | 138.9 ms | 120.2 ms | 13.5% |
+| vue-minor | 462.8 ms | 437.4 ms | 5.5% |
+| vue-span | 579.7 ms | 578.8 ms | 0.2% |
+| ts-checker | 1.237 s | 715.8 ms | 42.1% |
+
+`ts-checker` gains most, as intended. `vue-commit` gains because both of its two files exceed the threshold. File-heavy corpora gain little, because few of their files are large enough to qualify, and none regress.
+
+Holding two syntax trees of the same large file at once costs memory: `ts-checker` peak RSS rises from 69,492 KiB to 126,488 KiB. Corpora whose files are mostly below the threshold change little, from 44,100 KiB to 47,864 KiB on `vue-minor` and not at all on `vue-span`. Output remains byte-identical to a sequential analysis on every corpus.
 
 ### Cumulative effect
 
@@ -130,11 +146,11 @@ Against the first real-world measurement, before whole-range diff collection and
 
 | Corpus | Original | Current | Speedup |
 | --- | ---: | ---: | ---: |
-| vue-commit | 107.2 ms | 93.4 ms | 1.15x |
-| vue-week | 556.8 ms | 148.7 ms | 3.74x |
+| vue-commit | 107.2 ms | 58.7 ms | 1.83x |
+| vue-week | 556.8 ms | 120.2 ms | 4.63x |
 | vue-patches | 1.048 s | 194.6 ms | 5.39x |
-| vue-minor | 3.638 s | 463.7 ms | 7.85x |
-| vue-span | 4.568 s | 590.0 ms | 7.74x |
-| ts-checker | 1.376 s | 1.240 s | 1.11x |
+| vue-minor | 3.638 s | 437.4 ms | 8.32x |
+| vue-span | 4.568 s | 578.8 ms | 7.89x |
+| ts-checker | 1.376 s | 715.8 ms | 1.92x |
 
-Further optimization requires a new measurement. Remaining candidates, in the order the current measurements justify them: parsing a file's two revisions concurrently, which is the only lever for single-large-file diffs; reusing one Tree-sitter parser per worker instead of constructing one per blob; and rendering output without buffering the entire result.
+Further optimization requires a new measurement. Remaining candidates, in the order the current measurements justify them: reusing one Tree-sitter parser per worker instead of constructing one per blob; and rendering output without buffering the entire result.
