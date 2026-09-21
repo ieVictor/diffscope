@@ -505,6 +505,90 @@ function complex(a: boolean, b: boolean, items: number[]) {
     }
 
     #[test]
+    fn inventories_function_expressions_over_their_whole_range() {
+        let source = br"
+const named = function (flag: boolean): number {
+  if (flag) {
+    return 1;
+  }
+  return 0;
+};
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions.len(), 1);
+        let function = &analysis.functions[0];
+        assert_eq!(function.qualified_name, "named");
+        assert_eq!(function.kind, FunctionKind::Function);
+        assert_eq!(function.metrics.physical_loc, 6);
+        assert_eq!(function.metrics.cyclomatic_complexity, 2);
+        assert_eq!(function.metrics.cognitive_complexity, 1);
+    }
+
+    #[test]
+    fn inventories_async_declarations_once() {
+        let source = br"
+async function loadAll(urls: string[]): Promise<string[]> {
+  return urls;
+}
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions.len(), 1);
+        assert_eq!(analysis.functions[0].qualified_name, "loadAll");
+        assert_eq!(analysis.functions[0].metrics.physical_loc, 3);
+    }
+
+    #[test]
+    fn counts_switch_case_clauses_as_decisions() {
+        let source = br#"
+function classify(kind: string): number {
+  switch (kind) {
+    case "a":
+      return 1;
+    case "b":
+      return 2;
+    case "c":
+      return 3;
+    default:
+      return 0;
+  }
+}
+"#;
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let metrics = &analysis.functions[0].metrics;
+
+        assert_eq!(metrics.cyclomatic_complexity, 4);
+        assert_eq!(metrics.cognitive_complexity, 3);
+    }
+
+    #[test]
+    fn nests_decisions_inside_switch_case_clauses() {
+        let source = br#"
+function classify(kind: string, flag: boolean): number {
+  switch (kind) {
+    case "a":
+      if (flag) {
+        return 1;
+      }
+      return 2;
+    default:
+      return 0;
+  }
+}
+"#;
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let metrics = &analysis.functions[0].metrics;
+
+        assert_eq!(metrics.cyclomatic_complexity, 3);
+        assert_eq!(metrics.cognitive_complexity, 3);
+    }
+
+    #[test]
     fn excludes_nested_functions_from_complexity_metrics() {
         let source = br"
 function outer() {
