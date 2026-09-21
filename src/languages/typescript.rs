@@ -164,9 +164,10 @@ impl<'source> FunctionCollector<'source> {
 
 fn function_kind(node: Node<'_>, source: &str) -> Option<FunctionKind> {
     match node.kind() {
-        "function_declaration" | "generator_function_declaration" | "function" => {
-            Some(FunctionKind::Function)
-        }
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function" => Some(FunctionKind::Function),
         "method_definition" | "abstract_method_signature" | "method_signature" => {
             if explicit_name(node, source).as_deref() == Some("constructor") {
                 Some(FunctionKind::Constructor)
