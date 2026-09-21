@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tree_sitter::{Node, Parser};
 
@@ -525,7 +525,8 @@ fn is_short_circuit_operator(node: Node<'_>) -> bool {
 }
 
 impl TypeScriptAnalyzer {
-    /// Collect the module specifiers a source prefix imports or re-exports.
+    /// Collect the module specifiers a source prefix imports or re-exports,
+    /// each with the 1-based line its statement sits on.
     ///
     /// The input may be a truncated file, so the tree is expected to contain
     /// errors near its end. Tree-sitter still yields the statements it did
@@ -534,16 +535,16 @@ impl TypeScriptAnalyzer {
     /// # Errors
     ///
     /// Returns an error when tree-sitter does not produce a syntax tree.
-    pub fn scan_imports(&mut self, source: &[u8]) -> Result<BTreeSet<String>, DiffScopeError> {
+    pub fn scan_imports(&mut self, source: &[u8]) -> Result<BTreeMap<String, u32>, DiffScopeError> {
         let Ok(source_text) = std::str::from_utf8(source) else {
-            return Ok(BTreeSet::new());
+            return Ok(BTreeMap::new());
         };
         let tree = self
             .parser
             .parse(source_text, None)
             .ok_or_else(|| DiffScopeError::Language("tree-sitter returned no tree".to_owned()))?;
 
-        let mut specifiers = BTreeSet::new();
+        let mut specifiers = BTreeMap::new();
         collect_specifiers(tree.root_node(), source_text, &mut specifiers);
         Ok(specifiers)
     }
@@ -555,17 +556,31 @@ impl TypeScriptAnalyzer {
 /// names another module does. Dynamic `import(...)` is deliberately not
 /// followed: its argument is an expression that need not be a literal, and
 /// guessing at one would invent edges that may not exist.
-fn collect_specifiers(node: Node<'_>, source: &str, specifiers: &mut BTreeSet<String>) {
+///
+/// The line recorded is the specifier's own, not the statement's first line:
+/// that is the token a reader looks at to confirm the edge, and a multiline
+/// import puts it somewhere the statement's start does not point to. Two
+/// statements importing one module are one edge, so the earliest line wins.
+fn collect_specifiers(node: Node<'_>, source: &str, specifiers: &mut BTreeMap<String, u32>) {
     if matches!(node.kind(), "import_statement" | "export_statement")
         && let Some(module) = node.child_by_field_name("source")
         && let Some(text) = node_text(module, source)
     {
-        specifiers.insert(text.trim_matches(['\'', '"', '`']).to_owned());
+        let line = start_line(module);
+        specifiers
+            .entry(text.trim_matches(['\'', '"', '`']).to_owned())
+            .and_modify(|existing| *existing = (*existing).min(line))
+            .or_insert(line);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_specifiers(child, source, specifiers);
     }
+}
+
+/// The 1-based line a node starts on, for the evidence a caller renders.
+fn start_line(node: Node<'_>) -> u32 {
+    u32::try_from(node.start_position().row.saturating_add(1)).unwrap_or(u32::MAX)
 }
 
 /// Collect the names a module exports, as an importer would write them.
@@ -1052,5 +1067,21 @@ function hidden() { return 4; }
             diagnostic.code == LanguageDiagnosticCode::UnsupportedLanguage
                 && diagnostic.severity == DiagnosticSeverity::Info
         }));
+    }
+
+    #[test]
+    fn reports_each_specifier_with_the_line_its_statement_sits_on() {
+        let source = b"import { a } from './first';\n\n// a comment\nexport * from './second';\nimport { c } from './first';\n";
+        let mut analyzer =
+            super::TypeScriptAnalyzer::new(Language::TypeScript).expect("grammar loads");
+
+        let specifiers = analyzer.scan_imports(source).expect("scan succeeds");
+
+        // Sorted by specifier, and a module imported twice keeps the earliest
+        // line, because that is the site a reader checks first.
+        assert_eq!(
+            specifiers.into_iter().collect::<Vec<_>>(),
+            vec![("./first".to_owned(), 1), ("./second".to_owned(), 4)]
+        );
     }
 }

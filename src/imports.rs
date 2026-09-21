@@ -31,6 +31,15 @@ pub struct ImportIndex {
     outbound: BTreeMap<String, BTreeSet<String>>,
     /// Repository-relative path to the paths that import it.
     inbound: BTreeMap<String, BTreeSet<String>>,
+    /// Importing path to imported path to the line the import statement sits
+    /// on.
+    ///
+    /// One entry per resolved edge, so a revision pays for the edges it has and
+    /// not for its specifiers: an unresolved specifier is counted instead, and
+    /// never gets a line to report. Nesting by importer rather than keying a
+    /// flat `(importer, imported)` pair keeps a lookup borrowing the two names
+    /// a caller already has instead of building an owned key for it.
+    lines: BTreeMap<String, BTreeMap<String, u32>>,
     /// Files scanned only up to the import scan limit, whose later imports are
     /// therefore not represented.
     truncated: BTreeSet<String>,
@@ -53,6 +62,45 @@ impl ImportIndex {
     pub fn dependencies(&self, path: &str) -> &BTreeSet<String> {
         const EMPTY: &BTreeSet<String> = &BTreeSet::new();
         self.outbound.get(path).unwrap_or(EMPTY)
+    }
+
+    /// Line the import statement that produced this edge sits on.
+    ///
+    /// `None` when this revision has no resolved edge between the two paths: a
+    /// line number for a relationship the index does not contain would be
+    /// evidence for something that is not there.
+    ///
+    /// A module imported by several statements is one edge with one site, and
+    /// the earliest line is kept, because that is the first place a reader can
+    /// look.
+    #[must_use]
+    pub fn import_line(&self, importer: &str, target: &str) -> Option<u32> {
+        self.lines
+            .get(importer)
+            .and_then(|imports| imports.get(target))
+            .copied()
+    }
+
+    /// Record one resolved edge, keeping the earliest line it was seen at.
+    ///
+    /// The three views of one edge — who imports, who is imported, and where it
+    /// is written — move together, so the index can never hold a line for an
+    /// edge it does not have.
+    fn add_edge(&mut self, importer: &str, target: &str, line: u32) {
+        self.outbound
+            .entry(importer.to_owned())
+            .or_default()
+            .insert(target.to_owned());
+        self.inbound
+            .entry(target.to_owned())
+            .or_default()
+            .insert(importer.to_owned());
+        self.lines
+            .entry(importer.to_owned())
+            .or_default()
+            .entry(target.to_owned())
+            .and_modify(|existing| *existing = (*existing).min(line))
+            .or_insert(line);
     }
 
     /// Paths that reach `path` by importing it, directly or through others.
@@ -175,20 +223,9 @@ pub fn index_revision(
             index.truncated.insert(entry.path.clone());
         }
 
-        for specifier in &scan.specifiers {
+        for (specifier, line) in &scan.specifiers {
             match resolve(specifier, &entry.path, &paths, &aliases) {
-                Some(target) => {
-                    index
-                        .outbound
-                        .entry(entry.path.clone())
-                        .or_default()
-                        .insert(target.clone());
-                    index
-                        .inbound
-                        .entry(target)
-                        .or_default()
-                        .insert(entry.path.clone());
-                }
+                Some(target) => index.add_edge(&entry.path, &target, *line),
                 // An unresolved specifier names something outside this
                 // revision, almost always an installed package. It is counted,
                 // not guessed at.
@@ -636,5 +673,18 @@ mod tests {
                 ("app.ts".to_owned(), 2)
             ])
         );
+    }
+
+    #[test]
+    fn reports_the_earliest_line_a_resolved_edge_was_seen_at() {
+        let mut index = ImportIndex::default();
+        index.add_edge("src/app.ts", "src/core.ts", 7);
+        index.add_edge("src/app.ts", "src/core.ts", 3);
+
+        assert_eq!(index.import_line("src/app.ts", "src/core.ts"), Some(3));
+        // An edge this revision does not have has no site to report, in either
+        // direction.
+        assert_eq!(index.import_line("src/core.ts", "src/app.ts"), None);
+        assert_eq!(index.import_line("src/app.ts", "src/other.ts"), None);
     }
 }
