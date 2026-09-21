@@ -20,6 +20,7 @@
 //! the transport's job.
 
 pub mod classify;
+pub mod graph;
 pub mod impact;
 pub mod risk;
 
@@ -801,7 +802,7 @@ fn display_path(file: &FileResult) -> &str {
 /// Inside a directory that holds one project per child, such as `packages`, the
 /// area is that child. Otherwise it is the top-level directory. The name is the
 /// path itself: nothing in a diff says what a directory is for.
-fn change_area(path: &str) -> String {
+pub(crate) fn change_area(path: &str) -> String {
     let mut segments = path.split('/');
     let Some(first) = segments.next() else {
         return "<root>".to_owned();
