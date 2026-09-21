@@ -912,6 +912,37 @@ test(`case ${index}`, () => { return 1; })
     }
 
     #[test]
+    fn collects_every_form_of_export() {
+        let source = br#"
+export function named() { return 1; }
+export const value = 1;
+export class Widget {}
+export interface Shape {}
+const internal = 2;
+export { internal as renamed };
+export default function () { return 3; }
+export * from "./other";
+function hidden() { return 4; }
+"#;
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let exports = analysis.exports;
+
+        for expected in [
+            "named", "value", "Widget", "Shape", "renamed", "default", "*",
+        ] {
+            assert!(
+                exports.contains(expected),
+                "missing {expected} in {exports:?}"
+            );
+        }
+        // An unexported function is not part of the surface, and neither is the
+        // local name behind a renamed export.
+        assert!(!exports.contains("hidden"));
+        assert!(!exports.contains("internal"));
+    }
+
+    #[test]
     fn reports_malformed_source_without_panicking() {
         let analysis = analyze_source(Path::new("broken.ts"), b"function broken( {")
             .expect("analysis succeeds");

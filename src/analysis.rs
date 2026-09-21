@@ -836,6 +836,43 @@ mod tests {
     }
 
     #[test]
+    fn reports_what_a_change_does_to_the_public_surface() {
+        let file = file_change(
+            b"export function kept() { return 1; }\nexport function dropped() { return 2; }\n",
+            b"export function kept() { return 1; }\nexport function introduced() { return 3; }\n",
+            2,
+            1,
+            2,
+            1,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+
+        assert_eq!(mapped.exports_added, vec!["introduced".to_owned()]);
+        assert_eq!(mapped.exports_removed, vec!["dropped".to_owned()]);
+    }
+
+    #[test]
+    fn reports_no_surface_change_when_only_a_signature_moves() {
+        // The name every importer writes is unchanged, so nothing breaks for
+        // them even though the function itself did change.
+        let file = file_change(
+            b"export function looseEqual(a: any, b: any) { return a === b; }\n",
+            b"export function looseEqual(a: any, b: any, seen?: State) { return a === b; }\n",
+            1,
+            1,
+            1,
+            1,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+
+        assert!(mapped.exports_added.is_empty());
+        assert!(mapped.exports_removed.is_empty());
+        assert_eq!(mapped.functions[0].status, FunctionChangeStatus::Modified);
+    }
+
+    #[test]
     fn matches_functions_across_file_renames() {
         let mut file = file_change(
             b"function stable() { return 1; }\n",
