@@ -100,7 +100,7 @@ fn graph_diff_prints_the_dependency_diff_alone() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let answer = jsonl_graph(&repo, &graph_params(&["diff"]));
+    let answer = jsonl_graph(&repo, &graph_params(("file", "src/util.ts"), &["diff"]));
     let expected = format!("{}\n", trimmed(rendering(&answer, "dependency_diff")));
     assert_eq!(stdout, expected);
     assert!(!stdout.contains("DiffScope"), "{stdout}");
@@ -124,7 +124,7 @@ fn graph_mermaid_prints_the_diagram_alone() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let answer = jsonl_graph(&repo, &graph_params(&["mermaid"]));
+    let answer = jsonl_graph(&repo, &graph_params(("file", "src/util.ts"), &["mermaid"]));
     let expected = format!("{}\n", trimmed(rendering(&answer, "mermaid")));
     assert_eq!(stdout, expected);
     assert!(stdout.starts_with("flowchart LR"), "{stdout}");
@@ -189,13 +189,66 @@ fn graph_json_answers_match_the_jsonl_transport() {
 
     assert!(output.status.success(), "{output:?}");
     let cli: Value = serde_json::from_slice(&output.stdout).expect("the answer is JSON");
-    let jsonl = jsonl_graph(&repo, &graph_params(&[]));
+    let jsonl = jsonl_graph(&repo, &graph_params(("file", "src/util.ts"), &[]));
 
     assert_eq!(
         serde_json::to_string(&cli["data"]).expect("serialize the CLI answer"),
         serde_json::to_string(&jsonl["data"]).expect("serialize the transport answer"),
         "one comparison answers the same question once"
     );
+}
+
+#[test]
+fn graph_function_root_reports_the_function_and_its_diff() {
+    let repo = graph_repo();
+
+    // The identity the transports publish, so the flag is exercised with a real
+    // one.
+    let responses = run_jsonl(&[json!({
+        "protocol_version": 2,
+        "id": "functions",
+        "repository": repo.path().to_str().expect("the temporary path is UTF-8"),
+        "base": "HEAD~1",
+        "target": "HEAD",
+        "method": "list_changed_functions",
+        "params": { "file": "src/util.ts" },
+    })]);
+    let id = responses[0]["result"]["data"]["functions"][0]["function_id"]
+        .as_str()
+        .expect("a listed function identity")
+        .to_owned();
+
+    let output = run_graph(&repo, &["--function", &id, "HEAD~1", "HEAD"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "DiffScope HEAD~1..HEAD");
+    assert_eq!(
+        lines[1],
+        format!("Root: function:{id}"),
+        "a function root is named by its identity: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/util.ts::score"),
+        "the function endpoint is named in the diff: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("Diagram: ")),
+        "{stdout}"
+    );
+
+    // The diff rendering is the document the query layer produces for the same
+    // root, printed alone.
+    let output = run_graph(
+        &repo,
+        &["--format", "diff", "--function", &id, "HEAD~1", "HEAD"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let answer = jsonl_graph(&repo, &graph_params(("function_id", &id), &["diff"]));
+    let expected = format!("{}\n", trimmed(rendering(&answer, "dependency_diff")));
+    assert_eq!(stdout, expected);
+    assert!(stdout.contains("src/util.ts::score"), "{stdout}");
 }
 
 #[test]
@@ -208,7 +261,7 @@ fn graph_rejects_an_unsupported_relation_naming_what_is_accepted() {
             "--file",
             "src/util.ts",
             "--relations",
-            "calls",
+            "extends",
             "HEAD~1",
             "HEAD",
         ],
@@ -219,13 +272,15 @@ fn graph_rejects_an_unsupported_relation_naming_what_is_accepted() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.starts_with("diffscope: "), "{stderr}");
     assert!(
-        stderr.contains("calls"),
+        stderr.contains("extends"),
         "the rejected name is echoed: {stderr}"
     );
-    assert!(
-        stderr.contains("imports") && stderr.contains("tested_by"),
-        "the message names what is accepted: {stderr}"
-    );
+    for accepted in ["imports", "tested_by", "calls", "contains"] {
+        assert!(
+            stderr.contains(accepted),
+            "the message names `{accepted}` as accepted: {stderr}"
+        );
+    }
 }
 
 fn run(repo: &TestRepo, arguments: &[&str]) -> std::process::Output {
@@ -291,18 +346,23 @@ fn jsonl_graph(repo: &TestRepo, params: &Value) -> Value {
         .unwrap_or_else(|| panic!("the response carries no result: {response}"))
 }
 
-/// The parameters a `diffscope graph --file src/util.ts HEAD~1 HEAD` run asks
-/// with, for the renderings the chosen format requests.
-fn graph_params(render: &[&str]) -> Value {
-    json!({
-        "file": "src/util.ts",
+/// The parameters a `diffscope graph` run asks with: the root it named and the
+/// defaults the CLI applies, for the renderings the chosen format requests.
+///
+/// The root is the field and value the invocation named — `("file",
+/// "src/util.ts")` for a file root, `("function_id", id)` for a function root —
+/// so one helper describes either run.
+fn graph_params(root: (&str, &str), render: &[&str]) -> Value {
+    let mut params = json!({
         "direction": "both",
         "depth": 1,
         "view": "delta",
         "max_nodes": 30,
         "max_edges": 60,
         "render": render,
-    })
+    });
+    params[root.0] = json!(root.1);
+    params
 }
 
 /// A rendering an answer carries, as a single line of output.

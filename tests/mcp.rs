@@ -90,6 +90,7 @@ fn handshake_negotiates_and_lists_exactly_the_six_tools() {
     let properties = &graph["inputSchema"]["properties"];
     for parameter in [
         "file",
+        "function_id",
         "direction",
         "relations",
         "depth",
@@ -100,9 +101,15 @@ fn handshake_negotiates_and_lists_exactly_the_six_tools() {
     ] {
         assert!(properties[parameter].is_object(), "{graph}");
     }
-    assert!(
-        properties.get("function_id").is_none(),
-        "function roots are not supported yet, so the schema must not offer one: {graph}"
+    assert_eq!(
+        properties["function_id"]["type"],
+        json!("string"),
+        "{graph}"
+    );
+    assert_eq!(
+        properties["relations"]["items"]["enum"],
+        json!(["imports", "tested_by", "calls", "contains"]),
+        "{graph}"
     );
 }
 
@@ -157,6 +164,30 @@ fn every_tool_answers_the_question_it_names() {
     let detail = server.call("get_function_change", &arguments);
     assert!(detail["structuredContent"]["data"]["function"].is_object());
     assert!(detail["structuredContent"]["data"]["hunks"].is_array());
+
+    // The same identity roots an impact graph, and the answer says which
+    // function it is centered on and which module declares it.
+    let rooted = server.call("get_impact_graph", &arguments);
+    assert_eq!(rooted["isError"], json!(false), "{rooted}");
+    let graph = &rooted["structuredContent"]["data"];
+    assert_eq!(graph["root"]["kind"], json!("function"), "{rooted}");
+    assert_eq!(
+        graph["root"]["id"],
+        json!(format!(
+            "function:{}",
+            listed[0]["function_id"].as_str().expect("function_id")
+        )),
+        "{rooted}"
+    );
+    let nodes = graph["graph"]["nodes"].as_array().expect("nodes");
+    assert!(
+        nodes.iter().any(|node| node["kind"] == json!("function")),
+        "a function root carries its function node: {rooted}"
+    );
+    assert!(
+        nodes.iter().any(|node| node["kind"] == json!("module")),
+        "a function root still shows the module that declares it: {rooted}"
+    );
 
     let diagnostics = server.call("get_analysis_diagnostics", &comparison(&repo));
     assert!(diagnostics["structuredContent"]["data"]["diagnostics"].is_array());

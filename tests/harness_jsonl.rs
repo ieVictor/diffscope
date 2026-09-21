@@ -371,18 +371,27 @@ fn rejects_unknown_methods_and_parameters_without_stopping_the_stream() {
 fn impact_graph_rejections_name_the_field_and_what_it_accepts() {
     let repo = sample_repo();
 
+    // A real identity, so the exclusivity rejection is not reached through an
+    // unknown one.
+    let listed = serve_all(&[query(&repo, "listed", "list_changed_functions", &json!({}))]);
+    let ids = function_ids(&listed[0]);
+    let real = ids
+        .iter()
+        .find(|id| id.starts_with("src/util.ts#fn:score"))
+        .expect("the modified function is listed");
+
     let responses = serve_all(&[
         query(
             &repo,
             "relation",
             "get_impact_graph",
-            &json!({ "relations": ["calls"] }),
+            &json!({ "relations": ["extends"] }),
         ),
         query(
             &repo,
             "function-root",
             "get_impact_graph",
-            &json!({ "function_id": "src/util.ts#fn:score@target:1:1" }),
+            &json!({ "function_id": "src/util.ts#fn:score" }),
         ),
         query(
             &repo,
@@ -394,10 +403,7 @@ fn impact_graph_rejections_name_the_field_and_what_it_accepts() {
             &repo,
             "both-roots",
             "get_impact_graph",
-            &json!({
-                "file": "src/util.ts",
-                "function_id": "src/util.ts#fn:score@target:1:1"
-            }),
+            &json!({ "file": "src/util.ts", "function_id": real }),
         ),
         query(
             &repo,
@@ -414,13 +420,17 @@ fn impact_graph_rejections_name_the_field_and_what_it_accepts() {
 
     let relation = error_message(&responses[0]);
     assert!(relation.contains("`relations`"), "{relation}");
-    assert!(relation.contains("imports, tested_by"), "{relation}");
-    assert!(relation.contains("calls"), "{relation}");
+    assert!(
+        relation.contains("imports, tested_by, calls, contains"),
+        "{relation}"
+    );
+    assert!(relation.contains("extends"), "{relation}");
 
+    // An identity the analysis does not contain is answered with the identities
+    // it does: the caller can correct itself in one step.
     let function_root = error_message(&responses[1]);
     assert!(function_root.contains("`function_id`"), "{function_root}");
-    assert!(function_root.contains("call resolution"), "{function_root}");
-    assert!(function_root.contains("`file`"), "{function_root}");
+    assert!(function_root.contains(real.as_str()), "{function_root}");
 
     // A cursor belongs to the paged methods; this answer is bounded by its
     // budgets instead.
@@ -431,6 +441,7 @@ fn impact_graph_rejections_name_the_field_and_what_it_accepts() {
     let both_roots = error_message(&responses[3]);
     assert!(both_roots.contains("`file`"), "{both_roots}");
     assert!(both_roots.contains("`function_id`"), "{both_roots}");
+    assert!(both_roots.contains("mutually exclusive"), "{both_roots}");
 
     // A path the comparison did not change is answered with the paths it did:
     // the caller can correct itself in one step.
@@ -583,7 +594,7 @@ fn canonical_query_echoes_applied_parameters_and_defaults() {
             "file": null,
             "function_id": null,
             "direction": "both",
-            "relations": ["imports", "tested_by"],
+            "relations": ["imports", "tested_by", "calls", "contains"],
             "depth": 1,
             "view": "delta",
             "max_nodes": 30,
@@ -990,6 +1001,110 @@ fn extraction_is_distinguished_from_other_changes() {
         .find(|row| row["path"] == "src/plain.ts")
         .expect("the plainly edited file");
     assert_eq!(plain["change_shape"], "other", "{plain}");
+}
+
+#[test]
+fn a_function_root_answers_with_calls_and_containment() {
+    let repo = extraction_repo();
+
+    let listed = serve_all(&[query(
+        &repo,
+        "listed",
+        "list_changed_functions",
+        &json!({ "file": "src/refactor.ts" }),
+    )]);
+    let rows = function_rows(&listed[0]);
+    let process = rows
+        .iter()
+        .find(|row| row["qualified_name"] == json!("process"))
+        .expect("the changed function is listed");
+    let helper = rows
+        .iter()
+        .find(|row| row["qualified_name"] == json!("totalFor"))
+        .expect("the extracted helper is listed");
+    assert_eq!(process["status"], json!("modified"), "{process}");
+    assert_eq!(helper["status"], json!("added"), "{helper}");
+    let process_id = process["function_id"].as_str().expect("function_id");
+    let helper_id = helper["function_id"].as_str().expect("function_id");
+
+    let responses = serve_all(&[query(
+        &repo,
+        "rooted",
+        "get_impact_graph",
+        &json!({ "function_id": process_id, "render": ["diff"] }),
+    )]);
+    let answer = data(&responses[0]);
+
+    // The echo reports the function root the request named, and the defaults
+    // this version resolves.
+    let applied = query_of(&responses[0]);
+    assert_eq!(applied["file"], Value::Null);
+    assert_eq!(applied["function_id"], json!(process_id));
+    assert_eq!(
+        applied["relations"],
+        json!(["imports", "tested_by", "calls", "contains"])
+    );
+
+    assert_eq!(answer["root"]["kind"], json!("function"));
+    assert_eq!(
+        answer["root"]["id"],
+        json!(format!("function:{process_id}"))
+    );
+    assert_eq!(answer["root"]["path"], json!("src/refactor.ts"));
+
+    // The function it calls, and the module that declares both, are one hop
+    // from the root.
+    let node_ids = answer["graph"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter_map(|node| node["id"].as_str())
+        .collect::<Vec<_>>();
+    for id in [
+        format!("function:{process_id}"),
+        format!("function:{helper_id}"),
+        "module:src/refactor.ts".to_owned(),
+    ] {
+        assert!(node_ids.contains(&id.as_str()), "{answer}");
+    }
+
+    let edges = answer["graph"]["edges"].as_array().expect("edges");
+    let call = edges
+        .iter()
+        .find(|edge| edge["relation"] == json!("calls"))
+        .unwrap_or_else(|| panic!("the extracted call is an edge: {answer}"));
+    assert_eq!(call["from"], json!(format!("function:{process_id}")));
+    assert_eq!(call["to"], json!(format!("function:{helper_id}")));
+    assert_eq!(call["status"], json!("added"));
+    assert_eq!(call["resolution"], json!("direct_local_symbol"));
+    assert_eq!(call["confidence"], json!(1.0));
+    assert_eq!(call["evidence"]["file"], json!("src/refactor.ts"));
+    assert_eq!(
+        call["evidence"]["line"],
+        json!(19),
+        "the call site is the target definition's call expression: {call}"
+    );
+
+    let contains = edges
+        .iter()
+        .find(|edge| {
+            edge["relation"] == json!("contains")
+                && edge["to"] == json!(format!("function:{process_id}"))
+        })
+        .unwrap_or_else(|| panic!("the containing module is an edge: {answer}"));
+    assert_eq!(contains["from"], json!("module:src/refactor.ts"));
+    assert_eq!(contains["resolution"], json!("declaration"));
+    assert_eq!(contains["confidence"], json!(1.0));
+
+    // Both function endpoints are named in the dependency diff, so two
+    // functions of one file are two lines rather than one path.
+    let diff = answer["dependency_diff"]
+        .as_str()
+        .expect("a dependency diff");
+    assert!(
+        diff.contains("+ src/refactor.ts::process -[calls]-> src/refactor.ts::totalFor"),
+        "a calls edge names both functions: {diff}"
+    );
 }
 
 #[test]
