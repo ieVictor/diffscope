@@ -103,4 +103,38 @@ System time fell from 1.393 s to 0.075 s on `vue-minor` and from 2.135 s to 0.09
 
 Holding the whole range's patch text in memory raised peak RSS on the largest corpora, from 22,720 KiB to 29,356 KiB on `vue-minor` and from 24,636 KiB to 32,768 KiB on `vue-span`. Result and golden tests are unchanged.
 
-Further optimization requires a new measurement. Per-file analysis is now the dominant cost and runs on a single thread; parallel execution is permitted by [`DEFINITIONS.md`](DEFINITIONS.md) and is the next candidate after profiling.
+### Parallel per-file analysis
+
+With Git access reduced to a constant number of processes, parsing both revisions of each changed file became the dominant cost, and it ran on one thread. Per-file mapping now runs on all available cores. Workers claim files from one shared cursor rather than taking a fixed slice each, so one very large file cannot leave the remaining workers idle.
+
+Ordering is preserved as [`DEFINITIONS.md`](DEFINITIONS.md) requires: each result carries the index of its input and results are restored to input order, so file order, function order, and the sequential function identifiers are unaffected. A failing analysis still reports the error of the earliest file. Output was verified byte-identical to the sequential implementation on every corpus below, including an 8,309,154-byte result, and repeated runs of the same comparison produce identical output.
+
+Measured on 12 logical cores:
+
+| Corpus | Sequential | Parallel | Improvement |
+| --- | ---: | ---: | ---: |
+| vue-commit | 102.5 ms | 93.4 ms | 8.9% |
+| vue-week | 394.0 ms | 148.7 ms | 62.3% |
+| vue-patches | 691.8 ms | 194.6 ms | 71.9% |
+| vue-minor | 1.914 s | 463.7 ms | 75.8% |
+| vue-span | 2.005 s | 590.0 ms | 70.6% |
+| ts-checker | 1.218 s | 1.240 s | -1.8% |
+
+`ts-checker` regresses slightly because one 2.9 MiB file accounts for nearly all of its parse work: eleven workers finish immediately and only scheduling overhead remains. Diffs dominated by a single large file are the case per-file parallelism cannot improve; parsing a file's base and target revisions concurrently would address it and has not been measured.
+
+Peak RSS rises because several files are held in flight at once, from 24,108 KiB to 43,708 KiB on `vue-minor` and from 31,680 KiB to 50,988 KiB on `vue-span`. `ts-checker` is unchanged at 69,384 KiB, since its memory is dominated by one file.
+
+### Cumulative effect
+
+Against the first real-world measurement, before whole-range diff collection and parallel analysis:
+
+| Corpus | Original | Current | Speedup |
+| --- | ---: | ---: | ---: |
+| vue-commit | 107.2 ms | 93.4 ms | 1.15x |
+| vue-week | 556.8 ms | 148.7 ms | 3.74x |
+| vue-patches | 1.048 s | 194.6 ms | 5.39x |
+| vue-minor | 3.638 s | 463.7 ms | 7.85x |
+| vue-span | 4.568 s | 590.0 ms | 7.74x |
+| ts-checker | 1.376 s | 1.240 s | 1.11x |
+
+Further optimization requires a new measurement. Remaining candidates, in the order the current measurements justify them: parsing a file's two revisions concurrently, which is the only lever for single-large-file diffs; reusing one Tree-sitter parser per worker instead of constructing one per blob; and rendering output without buffering the entire result.
