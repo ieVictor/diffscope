@@ -10,6 +10,54 @@ use crate::{
 
 pub mod jsonl;
 
+/// Version of the schema every query answer is written in.
+///
+/// Separate from the analysis document's own version: the document describes
+/// one comparison, while this schema describes how the harness answers
+/// questions about it. Cursors are bound to it, so an answer produced under one
+/// version is never continued under another.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Deterministic identifier of one analyzed comparison.
+///
+/// Derived from what an answer actually depends on: the commits the two
+/// revisions resolved to, the tool that produced the analysis, and the answer
+/// schema. Revision names are deliberately not inputs, because `HEAD` and a
+/// branch name resolve to different commits over time; two requests describing
+/// the same comparison get the same identifier, and any change to the analysis
+/// or to its meaning produces a different one.
+///
+/// The value is a fingerprint rather than a name: callers treat it as opaque
+/// and only ever compare it with another identifier.
+#[must_use]
+pub fn analysis_id(base_commit: &str, target_commit: &str) -> String {
+    /// FNV-1a over 128 bits: cheap, dependency-free, and identical in every
+    /// process. Nothing here is a security boundary; the identifier names an
+    /// analysis whose inputs the caller already holds.
+    const OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    let mut hash = OFFSET_BASIS;
+    let mut mix = |bytes: &[u8]| {
+        // Length-prefixed, so that moving a byte across a field boundary
+        // changes the result instead of quietly producing the same digest.
+        for byte in u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes() {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        for byte in bytes {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    mix(base_commit.as_bytes());
+    mix(target_commit.as_bytes());
+    mix(env!("CARGO_PKG_VERSION").as_bytes());
+    mix(&SCHEMA_VERSION.to_le_bytes());
+
+    format!("{hash:032x}")
+}
+
 /// Transport-neutral request accepted by harness adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessRequest {

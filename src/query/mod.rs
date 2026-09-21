@@ -12,6 +12,12 @@
 //! These types carry `Serialize` because they are a transport projection with a
 //! single representation, not a domain model. The analysis model itself stays
 //! free of serialization concerns, and renderers for it live in [`crate::output`].
+//!
+//! Every answer is a projection of one immutable analysis, and the transport
+//! pairs it with that analysis's identity and with the query that was actually
+//! applied. A list answers with a window over a ranked list plus the offset of
+//! the next row; turning that offset into something a caller can hand back is
+//! the transport's job.
 
 pub mod classify;
 pub mod impact;
@@ -31,14 +37,37 @@ use crate::{
 };
 
 use classify::FileClassification;
-use risk::{ExportStatus, RiskLevel, RiskSignals};
+use risk::{
+    ExportStatus, REVIEW_PRIORITY_MAXIMUM_SCORE, REVIEW_PRIORITY_MODEL, RISK_MAXIMUM_SCORE,
+    RISK_MODEL, RiskAssessment, RiskLevel, RiskSignals, ScoreAssessment,
+};
 
 /// Largest page any query will return, whatever limit is requested.
-const MAX_LIMIT: usize = 200;
+pub const MAX_LIMIT: usize = 200;
 /// Page size used when a caller does not ask for one.
-const DEFAULT_LIMIT: usize = 50;
+pub const DEFAULT_LIMIT: usize = 50;
+
+/// The page size a request is applied with, after defaults and bounds.
+///
+/// Canonical, so a caller can be told exactly what was applied and a cursor can
+/// be bound to it: two requests that differ only in an out-of-range limit mean
+/// the same page.
+#[must_use]
+pub fn canonical_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
 /// Review candidates included in the overview.
 const SUMMARY_CANDIDATES: usize = 5;
+
+/// Cognitive complexity an added function must carry to count as a helper that
+/// took real work out of another function rather than delegating one line.
+const SUBSTANTIAL_HELPER_COGNITIVE: u32 = 5;
+
+/// Shape of a change that moved complexity out of a function into new ones.
+pub const COMPLEXITY_EXTRACTION: &str = "complexity_extraction";
+/// Shape of every change that is not an extraction.
+pub const OTHER_CHANGE_SHAPE: &str = "other";
 
 /// Directory names that hold one project per child directory.
 const PACKAGE_ROOTS: &[&str] = &[
@@ -53,6 +82,12 @@ const PACKAGE_ROOTS: &[&str] = &[
 
 // ---------------------------------------------------------------- queries ---
 
+/// Which part of a ranked list to return.
+///
+/// The offset is not a caller-facing parameter: the transport sets it only from
+/// a cursor it issued itself, validated against the same query and the same
+/// analysis, so a page is always a continuation of one answer rather than an
+/// arbitrary slice of another.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Page {
     pub limit: Option<usize>,
@@ -61,8 +96,7 @@ pub struct Page {
 
 impl Page {
     fn window(&self) -> (usize, usize) {
-        let limit = self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        (self.offset, limit)
+        (self.offset, canonical_limit(self.limit))
     }
 }
 
@@ -105,11 +139,17 @@ pub struct ChangeSummary<'a> {
 /// One entry in the overview's ranked shortlist.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewCandidate<'a> {
+    /// Identity of the full record, for a detail query.
+    pub function_id: String,
     pub file: &'a str,
     pub symbol: String,
     pub status: &'static str,
     pub complexity_delta: ComplexityDelta,
+    /// Level of the intrinsic-risk model.
     pub risk: &'static str,
+    /// Level of the review-priority model, which is what the shortlist is
+    /// ranked by.
+    pub review_priority: &'static str,
     pub match_confidence: f64,
 }
 
@@ -148,10 +188,40 @@ pub struct FunctionCounts {
     pub unchanged: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+/// Diagnostics reported, by severity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DiagnosticCounts {
+    pub info: u32,
     pub warnings: u32,
     pub errors: u32,
+    /// Every diagnostic, so a caller can size the whole list before reading it.
+    pub total: u32,
+}
+
+impl DiagnosticCounts {
+    /// Count one more diagnostic of the given severity.
+    fn add(&mut self, severity: DiagnosticSeverity) {
+        self.add_many(severity, 1);
+    }
+
+    /// Add a tally of diagnostics of one severity.
+    fn add_many(&mut self, severity: DiagnosticSeverity, count: u32) {
+        match severity {
+            DiagnosticSeverity::Info => self.info += count,
+            DiagnosticSeverity::Warning => self.warnings += count,
+            DiagnosticSeverity::Error => self.errors += count,
+        }
+        self.total = self.info + self.warnings + self.errors;
+    }
+
+    /// Counts of an analysis's own summary.
+    fn from_summary(counts: &crate::result::DiagnosticCounts) -> Self {
+        let mut view = Self::default();
+        view.add_many(DiagnosticSeverity::Info, counts.info);
+        view.add_many(DiagnosticSeverity::Warning, counts.warning);
+        view.add_many(DiagnosticSeverity::Error, counts.error);
+        view
+    }
 }
 
 /// A group of changed files that belong to the same project area.
@@ -164,7 +234,10 @@ pub struct ChangeArea {
     pub name: String,
     pub files: u32,
     pub lines: LineCounts,
+    /// Highest intrinsic risk level among the area's changed functions.
     pub risk: &'static str,
+    /// Highest review priority level among the area's changed functions.
+    pub review_priority: &'static str,
     pub complexity: AggregateComplexity,
 }
 
@@ -198,7 +271,19 @@ pub struct ChangedFile<'a> {
     pub lines: LineCounts,
     pub functions: FunctionCounts,
     pub complexity: AggregateComplexity,
-    pub risk: &'static str,
+    /// Intrinsic risk of the riskiest function this change touched here.
+    ///
+    /// A function's own code, and nothing about where it sits: the module's
+    /// reach and the file's classification are exposure, and belong to
+    /// [`Self::review_priority`].
+    pub risk: ScoreAssessment,
+    /// The same functions ranked by how much review attention they are owed.
+    ///
+    /// Always at least [`Self::risk`] in level, because it starts from that
+    /// score and adds what the function's position in the module exposes.
+    pub review_priority: ScoreAssessment,
+    /// Whether this change moved complexity out of a function into new ones.
+    pub change_shape: &'static str,
     /// Names this change adds to and removes from the module's public surface.
     #[serde(skip_serializing_if = "ExportChange::is_empty")]
     pub exports: ExportChange<'a>,
@@ -241,8 +326,14 @@ impl ExportChange<'_> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedFunction<'a> {
+    /// Identity to pass back to a detail query.
+    ///
+    /// Unique within the analysis: the path and symbol are separated by the
+    /// revision side the definition sits on and its position there, so two
+    /// functions that share a name are still addressed apart.
+    pub function_id: String,
     pub file: &'a str,
-    /// Stable identity to pass back to a detail query.
+    /// Human-readable symbol, such as `fn:patch`.
     pub symbol: String,
     pub qualified_name: &'a str,
     pub kind: &'static str,
@@ -250,7 +341,12 @@ pub struct ChangedFunction<'a> {
     pub classification: &'static str,
     pub metrics: MetricDeltas,
     pub change: ChurnView,
-    pub risk: RiskView,
+    /// What the change did to this function's own code.
+    pub risk: ScoreAssessment,
+    /// Intrinsic risk plus how exposed this function is: its name in the
+    /// module's public surface, the reach of the module containing it, and that
+    /// module's classification.
+    pub review_priority: ScoreAssessment,
     pub match_confidence: f64,
     pub range: RangeView,
 }
@@ -291,13 +387,6 @@ pub struct ChurnView {
     pub hunk_overlap: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct RiskView {
-    pub level: &'static str,
-    pub score: u32,
-    pub reasons: Vec<String>,
-}
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RangeView {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,30 +401,33 @@ pub struct LineRange {
     pub end_line: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PageInfo {
+/// How much of a ranked list one answer carried.
+///
+/// The transport turns `next_offset` into the opaque cursor a caller sends
+/// back; nothing outside the query layer sees a bare offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageWindow {
     pub returned: usize,
     pub total: usize,
     pub has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Offset of the next row, when one exists.
     pub next_offset: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FileList<'a> {
     pub files: Vec<ChangedFile<'a>>,
-    pub page: PageInfo,
+    pub page: PageWindow,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FunctionList<'a> {
     pub functions: Vec<ChangedFunction<'a>>,
-    pub page: PageInfo,
+    pub page: PageWindow,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDetail<'a> {
-    #[serde(flatten)]
     pub function: ChangedFunction<'a>,
     /// Hunks of the containing file that touch this function.
     pub hunks: Vec<HunkView>,
@@ -373,10 +465,42 @@ pub struct DiagnosticList<'a> {
 /// A detail query named a function the analysis does not contain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownFunction {
-    pub file: String,
-    pub symbol: String,
-    /// Symbols in that file which are closest to what was asked for.
-    pub known_symbols: Vec<String>,
+    pub function_id: String,
+    /// Identities in this analysis that come closest to what was asked for.
+    pub known_function_ids: Vec<String>,
+}
+
+/// Identity of one function record, unique within an analysis.
+///
+/// A path and a symbol are not enough on their own: the same file can declare
+/// one name on both sides of a change, and a removal and an addition can share
+/// a name. The revision side the definition was read from and its position
+/// there separate them. The target side is preferred because that is what a
+/// caller reads and reviews; a removal exists only on the base side.
+#[must_use]
+pub fn function_id(file: &FileResult, function: &FunctionResult) -> String {
+    let (side, range) = function_side(function);
+    let (line, column) = range.map_or((0, 0), |range| (range.start_line, range.start_column));
+    format!(
+        "{}#{}@{side}:{line}:{column}",
+        display_path(file),
+        symbol_id(function.kind, &function.qualified_name)
+    )
+}
+
+/// The revision side a function is identified on, and the range it sits at.
+fn function_side(function: &FunctionResult) -> (&'static str, Option<&SourceRange>) {
+    let base = function.base_range.as_ref();
+    let target = function.target_range.as_ref();
+    match (function.status, base, target) {
+        // A removal exists only on the base side, and a function with no
+        // target range is named where it still exists.
+        (FunctionChangeStatus::Removed, Some(base), _) | (_, Some(base), None) => {
+            ("base", Some(base))
+        }
+        (_, _, Some(target)) => ("target", Some(target)),
+        (_, None, None) => ("none", None),
+    }
 }
 
 // ---------------------------------------------------------------- answers ---
@@ -409,27 +533,32 @@ pub fn change_summary<'a>(
 
         let area_name = change_area(path);
         let complexity = aggregate_complexity(file);
-        let risk = file_risk(file, classification, direct_importers(index, path));
+        let assessment = file_assessment(file, classification, direct_importers(index, path));
         let area = areas.entry(area_name.clone()).or_insert(ChangeArea {
             name: area_name,
             files: 0,
             lines: LineCounts::default(),
             risk: RiskLevel::Low.as_str(),
+            review_priority: RiskLevel::Low.as_str(),
             complexity: AggregateComplexity::default(),
         });
         area.files += 1;
         area.lines.added += file.added_lines;
         area.lines.removed += file.removed_lines;
         area.complexity.merge(&complexity);
-        if RiskLevel::parse(area.risk) < Some(risk) {
-            area.risk = risk.as_str();
+        if RiskLevel::parse(area.risk) < Some(assessment.risk.level) {
+            area.risk = assessment.risk.level.as_str();
+        }
+        if RiskLevel::parse(area.review_priority) < Some(assessment.review_priority.level) {
+            area.review_priority = assessment.review_priority.level.as_str();
         }
     }
 
     let mut change_areas = areas.into_values().collect::<Vec<_>>();
     change_areas.sort_by(|left, right| {
-        RiskLevel::parse(right.risk)
-            .cmp(&RiskLevel::parse(left.risk))
+        RiskLevel::parse(right.review_priority)
+            .cmp(&RiskLevel::parse(left.review_priority))
+            .then_with(|| RiskLevel::parse(right.risk).cmp(&RiskLevel::parse(left.risk)))
             .then_with(|| right.files.cmp(&left.files))
             .then_with(|| left.name.cmp(&right.name))
     });
@@ -438,6 +567,7 @@ pub fn change_summary<'a>(
         .into_iter()
         .take(SUMMARY_CANDIDATES)
         .map(|function| ReviewCandidate {
+            function_id: function.function_id,
             file: function.file,
             symbol: function.symbol,
             status: function.status,
@@ -445,7 +575,8 @@ pub fn change_summary<'a>(
                 cyclomatic: function.metrics.cyclomatic_complexity.delta,
                 cognitive: function.metrics.cognitive_complexity.delta,
             },
-            risk: function.risk.level,
+            risk: function.risk.level.as_str(),
+            review_priority: function.review_priority.level.as_str(),
             match_confidence: function.match_confidence,
         })
         .collect();
@@ -465,10 +596,7 @@ pub fn change_summary<'a>(
             removed: result.summary.removed_lines,
         },
         functions,
-        diagnostics: DiagnosticCounts {
-            warnings: result.summary.diagnostics.warning,
-            errors: result.summary.diagnostics.error,
-        },
+        diagnostics: DiagnosticCounts::from_summary(&result.summary.diagnostics),
         change_areas,
         review_candidates,
     }
@@ -493,8 +621,11 @@ pub fn list_changed_files<'a>(
             {
                 return None;
             }
-            let risk = file_risk(file, classification, direct_importers(index, path));
-            if filter.minimum_risk.is_some_and(|minimum| risk < minimum) {
+            let assessment = file_assessment(file, classification, direct_importers(index, path));
+            if filter
+                .minimum_risk
+                .is_some_and(|minimum| assessment.risk.level < minimum)
+            {
                 return None;
             }
             let mut functions = FunctionCounts::default();
@@ -517,7 +648,9 @@ pub fn list_changed_files<'a>(
                 },
                 functions,
                 complexity: aggregate_complexity(file),
-                risk: risk.as_str(),
+                risk: assessment.risk,
+                review_priority: assessment.review_priority,
+                change_shape: change_shape(file),
                 exports: ExportChange {
                     added: file.exports_added.iter().map(String::as_str).collect(),
                     removed: file.exports_removed.iter().map(String::as_str).collect(),
@@ -529,8 +662,11 @@ pub fn list_changed_files<'a>(
         .collect::<Vec<_>>();
 
     rows.sort_by(|left, right| {
-        RiskLevel::parse(right.risk)
-            .cmp(&RiskLevel::parse(left.risk))
+        right
+            .review_priority
+            .level
+            .cmp(&left.review_priority.level)
+            .then_with(|| right.risk.level.cmp(&left.risk.level))
             .then_with(|| {
                 (right.lines.added + right.lines.removed)
                     .cmp(&(left.lines.added + left.lines.removed))
@@ -557,47 +693,30 @@ pub fn list_changed_functions<'a>(
 ///
 /// # Errors
 ///
-/// Returns the symbols the named file does contain when the requested one is
+/// Returns the identities this analysis does contain when the requested one is
 /// not among them, so a caller that guessed can correct itself in one step.
 pub fn get_function_change<'a>(
     result: &'a AnalysisResult,
-    file_path: &str,
-    symbol: &str,
+    id: &str,
     index: Option<&ImportIndex>,
 ) -> Result<FunctionDetail<'a>, UnknownFunction> {
-    let file = result
-        .files
-        .iter()
-        .find(|file| display_path(file) == file_path);
+    let found = result.files.iter().find_map(|file| {
+        file.functions
+            .iter()
+            .find(|function| function_id(file, function) == id)
+            .map(|function| (file, function))
+    });
 
-    let Some(file) = file else {
+    let Some((file, function)) = found else {
         return Err(UnknownFunction {
-            file: file_path.to_owned(),
-            symbol: symbol.to_owned(),
-            known_symbols: Vec::new(),
+            function_id: id.to_owned(),
+            known_function_ids: closest_function_ids(result, id),
         });
     };
 
     let path = display_path(file);
     let classification = classify::classify(path);
     let importers = direct_importers(index, path);
-    let found = file.functions.iter().find(|function| {
-        symbol_id(function.kind, &function.qualified_name) == symbol
-            || function.qualified_name == symbol
-    });
-
-    let Some(function) = found else {
-        return Err(UnknownFunction {
-            file: file_path.to_owned(),
-            symbol: symbol.to_owned(),
-            known_symbols: file
-                .functions
-                .iter()
-                .map(|function| symbol_id(function.kind, &function.qualified_name))
-                .collect(),
-        });
-    };
-
     Ok(FunctionDetail {
         hunks: touching_hunks(file, function),
         impact: index.map(|index| impact_view(index, path)),
@@ -615,6 +734,35 @@ pub fn get_function_change<'a>(
             .collect(),
         function: changed_function(path, classification, file, function, importers),
     })
+}
+
+/// Identities to offer when a requested one does not resolve.
+///
+/// What a caller most likely meant comes first: the identities that name the
+/// same symbol or path. A caller that guessed blindly gets the first few
+/// identities of the analysis instead, so it can see the shape of a real one.
+fn closest_function_ids(result: &AnalysisResult, requested: &str) -> Vec<String> {
+    /// Identities named before the list is summarized.
+    const SUGGESTIONS: usize = 10;
+
+    let mut matching = Vec::new();
+    let mut leading = Vec::new();
+    for file in &result.files {
+        for function in &file.functions {
+            let id = function_id(file, function);
+            if matching.len() < SUGGESTIONS && id.contains(requested) {
+                matching.push(id.clone());
+            }
+            if leading.len() < SUGGESTIONS {
+                leading.push(id);
+            }
+        }
+    }
+    if matching.is_empty() {
+        leading
+    } else {
+        matching
+    }
 }
 
 /// Report diagnostics, for the whole analysis or for one file.
@@ -738,12 +886,18 @@ fn direct_importers(index: Option<&ImportIndex>, path: &str) -> Option<u32> {
     index.map(|index| u32::try_from(index.importers(path).len()).unwrap_or(u32::MAX))
 }
 
-/// A file is as risky as the riskiest function changed inside it.
-fn file_risk(
+/// A file is as deep in review as the riskiest function changed inside it.
+///
+/// The two models are kept apart rather than collapsed into one number: a
+/// module can hold a function that is complex but little depended on, and one
+/// that is simple but breaks every importer of it, and a reviewer acts on the
+/// two differently. A file whose change touched no function carries a zero
+/// assessment, which is the same thing as a change with nothing to score.
+fn file_assessment(
     file: &FileResult,
     classification: FileClassification,
     importers: Option<u32>,
-) -> RiskLevel {
+) -> RiskAssessment {
     file.functions
         .iter()
         .filter(|function| function.status != FunctionChangeStatus::Unchanged)
@@ -754,10 +908,36 @@ fn file_risk(
                 export_status(file, function),
                 importers,
             ))
-            .level
         })
-        .max()
-        .unwrap_or(RiskLevel::Low)
+        .reduce(|highest, candidate| RiskAssessment {
+            risk: greater(highest.risk, candidate.risk),
+            review_priority: greater(highest.review_priority, candidate.review_priority),
+        })
+        .unwrap_or_else(|| RiskAssessment {
+            risk: zero_assessment(RISK_MODEL, RISK_MAXIMUM_SCORE),
+            review_priority: zero_assessment(REVIEW_PRIORITY_MODEL, REVIEW_PRIORITY_MAXIMUM_SCORE),
+        })
+}
+
+/// The higher-scoring of two assessments, preferring the first on a tie so the
+/// file's reasons stay in function order.
+fn greater(highest: ScoreAssessment, candidate: ScoreAssessment) -> ScoreAssessment {
+    if candidate.score > highest.score {
+        candidate
+    } else {
+        highest
+    }
+}
+
+/// A model's verdict on a function that scored nothing.
+fn zero_assessment(model: &'static str, maximum_score: u32) -> ScoreAssessment {
+    ScoreAssessment {
+        model,
+        maximum_score,
+        score: 0,
+        level: RiskLevel::Low,
+        reasons: Vec::new(),
+    }
 }
 
 fn signals_for(
@@ -774,11 +954,56 @@ fn signals_for(
         cyclomatic_delta: delta(before, after, |metrics| metrics.cyclomatic_complexity),
         cognitive_delta: delta(before, after, |metrics| metrics.cognitive_complexity),
         cognitive_after: after.map_or(0, |metrics| metrics.cognitive_complexity),
+        cyclomatic_after: after.map_or(0, |metrics| metrics.cyclomatic_complexity),
         churned_lines: function.churn.lines_added + function.churn.lines_removed,
         match_confidence: function.match_confidence,
         exported,
         direct_importers,
     }
+}
+
+/// Whether a change moved complexity out of a function into new ones.
+///
+/// The pattern this names is an extraction: a function shrinks, a helper takes
+/// the work it gave up, and the file ends up no more complex than it started.
+/// A helper that adds more complexity than the function gave up is growth
+/// rather than extraction, and the file's own total is what tells them apart:
+/// moving complexity into a helper does not raise it, adding new complexity
+/// does.
+fn change_shape(file: &FileResult) -> &'static str {
+    let no_more_complex = aggregate_complexity(file).cognitive_delta <= 0;
+    let helper = file.functions.iter().any(|function| {
+        function.status == FunctionChangeStatus::Added
+            && cognitive_after(function) >= SUBSTANTIAL_HELPER_COGNITIVE
+    });
+    let shrunk = file.functions.iter().any(|function| {
+        matches!(
+            function.status,
+            FunctionChangeStatus::Modified | FunctionChangeStatus::Removed
+        ) && cognitive_delta(function) < 0
+    });
+    if no_more_complex && helper && shrunk {
+        COMPLEXITY_EXTRACTION
+    } else {
+        OTHER_CHANGE_SHAPE
+    }
+}
+
+/// Cognitive complexity a function ends up with.
+fn cognitive_after(function: &FunctionResult) -> u32 {
+    function
+        .metrics_after
+        .as_ref()
+        .map_or(0, |metrics| metrics.cognitive_complexity)
+}
+
+/// What the change did to a function's cognitive complexity.
+fn cognitive_delta(function: &FunctionResult) -> i64 {
+    delta(
+        function.metrics_before.as_ref(),
+        function.metrics_after.as_ref(),
+        |metrics| metrics.cognitive_complexity,
+    )
 }
 
 /// Whether a function's own name moved in or out of the module's exports.
@@ -846,7 +1071,7 @@ fn ranked_functions<'a>(
             let row = changed_function(path, classification, file, function, importers);
             if filter
                 .minimum_risk
-                .is_some_and(|minimum| RiskLevel::parse(row.risk.level) < Some(minimum))
+                .is_some_and(|minimum| row.risk.level < minimum)
             {
                 continue;
             }
@@ -866,9 +1091,10 @@ fn ranked_functions<'a>(
 
     rows.sort_by(|left, right| {
         right
-            .risk
+            .review_priority
             .score
-            .cmp(&left.risk.score)
+            .cmp(&left.review_priority.score)
+            .then_with(|| right.risk.score.cmp(&left.risk.score))
             .then_with(|| {
                 right
                     .metrics
@@ -902,6 +1128,7 @@ fn changed_function<'a>(
         importers,
     ));
     ChangedFunction {
+        function_id: function_id(file, function),
         file: path,
         symbol: symbol_id(function.kind, &function.qualified_name),
         qualified_name: &function.qualified_name,
@@ -932,11 +1159,8 @@ fn changed_function<'a>(
             lines_removed: function.churn.lines_removed,
             hunk_overlap: overlap_fraction(function),
         },
-        risk: RiskView {
-            level: assessment.level.as_str(),
-            score: assessment.score,
-            reasons: assessment.reasons,
-        },
+        risk: assessment.risk,
+        review_priority: assessment.review_priority,
         match_confidence: function.match_confidence.as_fraction(),
         range: RangeView {
             before: function.base_range.as_ref().map(LineRange::from),
@@ -1026,17 +1250,13 @@ fn diagnostic_counts_iter<'a>(
 ) -> DiagnosticCounts {
     let mut counts = DiagnosticCounts::default();
     for diagnostic in diagnostics {
-        match diagnostic.severity {
-            DiagnosticSeverity::Warning => counts.warnings += 1,
-            DiagnosticSeverity::Error => counts.errors += 1,
-            DiagnosticSeverity::Info => {}
-        }
+        counts.add(diagnostic.severity);
     }
     counts
 }
 
 /// Take one page out of a ranked list.
-fn paginate<T>(rows: Vec<T>, page: &Page) -> (Vec<T>, PageInfo) {
+fn paginate<T>(rows: Vec<T>, page: &Page) -> (Vec<T>, PageWindow) {
     let total = rows.len();
     let (offset, limit) = page.window();
     let selected = rows
@@ -1049,7 +1269,7 @@ fn paginate<T>(rows: Vec<T>, page: &Page) -> (Vec<T>, PageInfo) {
     let has_more = next < total;
     (
         selected,
-        PageInfo {
+        PageWindow {
             returned,
             total,
             has_more,
@@ -1061,18 +1281,22 @@ fn paginate<T>(rows: Vec<T>, page: &Page) -> (Vec<T>, PageInfo) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileFilter, FunctionFilter, Page, aggregate_complexity, change_area, change_summary,
-        get_analysis_diagnostics, get_function_change, list_changed_files, list_changed_functions,
+        COMPLEXITY_EXTRACTION, FileFilter, FunctionFilter, OTHER_CHANGE_SHAPE, Page,
+        aggregate_complexity, change_area, change_summary, get_analysis_diagnostics,
+        get_function_change, list_changed_files, list_changed_functions,
     };
     use crate::{
         DiffHunk, FileStatus,
         analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
-        languages::{FunctionKind, Language, SourceRange},
+        languages::{DiagnosticSeverity, FunctionKind, Language, SourceRange},
         metrics::FunctionMetrics,
-        query::{classify::FileClassification, risk::RiskLevel},
+        query::{
+            classify::FileClassification,
+            risk::{REVIEW_PRIORITY_MODEL, RISK_MODEL, RiskLevel},
+        },
         result::{
-            AnalysisResult, AnalysisSummary, FileResult, FunctionResult, RevisionResult,
-            SCHEMA_VERSION,
+            AnalysisResult, AnalysisSummary, Diagnostic, DiagnosticCode, FileResult,
+            FunctionResult, RevisionResult, SCHEMA_VERSION,
         },
     };
 
@@ -1147,7 +1371,7 @@ mod tests {
             high_only
                 .functions
                 .iter()
-                .all(|function| function.risk.level == "high")
+                .all(|function| function.risk.level == RiskLevel::High)
         );
     }
 
@@ -1198,31 +1422,58 @@ mod tests {
     }
 
     #[test]
-    fn addresses_a_function_by_symbol_id_or_by_plain_name() {
+    fn addresses_a_function_by_the_identity_a_list_reported() {
         let result = fixture();
+        let listed = list_changed_functions(&result, &FunctionFilter::default(), None);
+        let listed = listed.functions.first().expect("a changed function");
 
-        let by_id = get_function_change(&result, "src/renderer.ts", "fn:patch", None)
-            .expect("symbol id resolves");
-        let by_name = get_function_change(&result, "src/renderer.ts", "patch", None)
-            .expect("plain name resolves");
+        let detail =
+            get_function_change(&result, &listed.function_id, None).expect("an identity resolves");
 
-        assert_eq!(by_id.function.symbol, by_name.function.symbol);
-        assert_eq!(by_id.function.qualified_name, "patch");
+        assert_eq!(detail.function.function_id, listed.function_id);
+        assert_eq!(detail.function.qualified_name, listed.qualified_name);
+        assert_eq!(detail.function.symbol, listed.symbol);
     }
 
     #[test]
-    fn reports_the_symbols_a_file_does_contain_when_one_is_not_found() {
+    fn tells_apart_two_functions_that_share_a_name() {
+        // One file can declare the same name on both sides of a change, and
+        // each record still has to be addressable on its own.
+        let result = duplicate_name_fixture();
+        let listed = list_changed_functions(&result, &FunctionFilter::default(), None);
+
+        let identities = listed
+            .functions
+            .iter()
+            .map(|function| function.function_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
+        // The removal is named on the base side, the modified function on the
+        // side a reader will find it on.
+        assert!(identities.iter().any(|id| id.contains("@base:")));
+        assert!(identities.iter().any(|id| id.contains("@target:")));
+
+        for identity in &identities {
+            let detail = get_function_change(&result, identity, None).expect("identity resolves");
+            assert_eq!(&detail.function.function_id, identity);
+        }
+    }
+
+    #[test]
+    fn reports_identities_an_unknown_one_would_have_to_be() {
         let result = fixture();
 
-        let error = get_function_change(&result, "src/renderer.ts", "nonexistent", None)
-            .expect_err("unknown symbol is rejected");
+        let requested = "src/renderer.ts#fn:absent@target:9:9";
+        let error = get_function_change(&result, requested, None)
+            .expect_err("unknown identity is rejected");
 
-        assert_eq!(error.symbol, "nonexistent");
+        assert_eq!(error.function_id, requested);
         assert!(
             error
-                .known_symbols
+                .known_function_ids
                 .iter()
-                .any(|symbol| symbol == "fn:patch")
+                .any(|identity| identity.contains("fn:patch"))
         );
     }
 
@@ -1277,10 +1528,201 @@ mod tests {
         assert!(scoped.diagnostics.len() <= all.diagnostics.len());
     }
 
+    #[test]
+    fn counts_every_diagnostic_severity_and_the_total() {
+        let mut result = fixture();
+        result.files[0].diagnostics = vec![
+            diagnostic(DiagnosticSeverity::Info, "for reference"),
+            diagnostic(DiagnosticSeverity::Warning, "worth a look"),
+            diagnostic(DiagnosticSeverity::Error, "cannot be parsed"),
+        ];
+
+        let listed = get_analysis_diagnostics(&result, Some("src/renderer.ts"));
+
+        assert_eq!(listed.counts.info, 1);
+        assert_eq!(listed.counts.warnings, 1);
+        assert_eq!(listed.counts.errors, 1);
+        assert_eq!(listed.counts.total, 3);
+        assert_eq!(listed.diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn reports_defect_risk_and_review_priority_as_separate_models() {
+        let result = fixture();
+        let listed = list_changed_functions(&result, &FunctionFilter::default(), None);
+        let source = listed
+            .functions
+            .iter()
+            .find(|function| function.file == "src/renderer.ts")
+            .expect("a source function");
+
+        assert_eq!(source.risk.model, RISK_MODEL);
+        assert_eq!(source.review_priority.model, REVIEW_PRIORITY_MODEL);
+        assert_ne!(source.risk.model, source.review_priority.model);
+        // Production source is exposure, not intrinsic risk: the same function
+        // is deeper in the review queue than its own code alone makes it.
+        assert!(source.review_priority.score > source.risk.score);
+        assert!(
+            source
+                .review_priority
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "production_source")
+        );
+        assert!(
+            !source
+                .risk
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "production_source")
+        );
+    }
+
+    #[test]
+    fn names_a_change_that_extracted_a_helper_out_of_a_function() {
+        let mut result = fixture();
+        result.files[0].functions = vec![
+            // The function that gave work up.
+            function(
+                "patch",
+                FunctionChangeStatus::Modified,
+                Some(18),
+                Some(6),
+                12,
+            ),
+            // The helper that took it.
+            function("patchInner", FunctionChangeStatus::Added, None, Some(8), 8),
+        ];
+
+        let listed = list_changed_files(&result, &FileFilter::default(), None);
+        let extracted = listed
+            .files
+            .iter()
+            .find(|file| file.path == "src/renderer.ts")
+            .expect("the source file");
+
+        assert_eq!(extracted.change_shape, COMPLEXITY_EXTRACTION);
+        // The file ends up less complex than it started.
+        assert!(extracted.complexity.cognitive_delta < 0);
+    }
+
+    #[test]
+    fn still_names_an_extraction_that_only_moved_complexity() {
+        let mut result = fixture();
+        result.files[0].functions = vec![
+            // Gives up its complexity entirely.
+            function(
+                "patch",
+                FunctionChangeStatus::Modified,
+                Some(15),
+                Some(0),
+                12,
+            ),
+            // The helper takes exactly what was given up.
+            function(
+                "patchInner",
+                FunctionChangeStatus::Added,
+                None,
+                Some(15),
+                15,
+            ),
+        ];
+
+        let listed = list_changed_files(&result, &FileFilter::default(), None);
+        let extracted = listed
+            .files
+            .iter()
+            .find(|file| file.path == "src/renderer.ts")
+            .expect("the source file");
+
+        assert_eq!(extracted.complexity.cognitive_delta, 0);
+        assert_eq!(extracted.change_shape, COMPLEXITY_EXTRACTION);
+    }
+
+    #[test]
+    fn calls_a_helper_that_added_more_than_it_took_other() {
+        let mut result = fixture();
+        result.files[0].functions = vec![
+            function("patch", FunctionChangeStatus::Modified, Some(4), Some(2), 6),
+            function(
+                "patchInner",
+                FunctionChangeStatus::Added,
+                None,
+                Some(20),
+                20,
+            ),
+        ];
+
+        let listed = list_changed_files(&result, &FileFilter::default(), None);
+        let grown = listed
+            .files
+            .iter()
+            .find(|file| file.path == "src/renderer.ts")
+            .expect("the source file");
+
+        assert!(grown.complexity.cognitive_delta > 0);
+        assert_eq!(grown.change_shape, OTHER_CHANGE_SHAPE);
+    }
+
+    #[test]
+    fn calls_a_change_that_moved_no_complexity_out_of_a_function_other() {
+        let result = fixture();
+
+        let listed = list_changed_files(&result, &FileFilter::default(), None);
+
+        assert!(!listed.files.is_empty());
+        assert!(
+            listed
+                .files
+                .iter()
+                .all(|file| file.change_shape == OTHER_CHANGE_SHAPE)
+        );
+    }
+
+    /// A file that declares one name on each side of the change: the version
+    /// being removed, and the one that replaced it.
+    fn duplicate_name_fixture() -> AnalysisResult {
+        let mut result = fixture();
+        let mut removed = function("render", FunctionChangeStatus::Removed, Some(12), None, 12);
+        removed.base_range = Some(source_range(60, 70));
+        removed.target_range = None;
+        let mut current = function(
+            "render",
+            FunctionChangeStatus::Modified,
+            Some(4),
+            Some(9),
+            8,
+        );
+        current.base_range = Some(source_range(5, 10));
+        current.target_range = Some(source_range(5, 14));
+        result.files = vec![file("src/renderer.ts", vec![current, removed])];
+        result
+    }
+
+    fn source_range(start_line: u32, end_line: u32) -> SourceRange {
+        SourceRange {
+            start_line,
+            start_column: 0,
+            end_line,
+            end_column: 1,
+        }
+    }
+
+    fn diagnostic(severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+        Diagnostic {
+            code: DiagnosticCode::MetricUnavailable,
+            severity,
+            message: message.to_owned(),
+            path: Some("src/renderer.ts".to_owned()),
+            range: None,
+            related_entity_ids: Vec::new(),
+        }
+    }
+
     fn fixture() -> AnalysisResult {
         AnalysisResult {
             schema_version: SCHEMA_VERSION,
-            tool_version: "0.1.0".to_owned(),
+            tool_version: "0.2.0".to_owned(),
             repository: "/repo".to_owned(),
             base: RevisionResult {
                 id: "aaa".to_owned(),
