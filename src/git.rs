@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     io::{self, Write},
     path::Path,
@@ -150,20 +150,17 @@ impl Repository {
         target_commit: &str,
         files: &mut [FileChange],
     ) -> Result<(), DiffScopeError> {
-        for file in &mut *files {
-            let (hunks, is_binary) = {
-                let pathspec = diff_pathspec(file)?;
-                (
-                    self.diff_hunks(base_commit, target_commit, pathspec)?,
-                    self.is_binary(base_commit, target_commit, pathspec)?,
-                )
-            };
+        let mut hunks_by_path = self.diff_hunks_by_path(base_commit, target_commit)?;
+        let binary_paths = self.binary_paths(base_commit, target_commit)?;
 
-            file.hunks = hunks;
+        for file in &mut *files {
+            let path = diff_key(file)?.to_owned();
+
+            file.hunks = hunks_by_path.remove(&path).unwrap_or_default();
             file.added_lines = file.hunks.iter().map(|hunk| hunk.added_lines).sum();
             file.removed_lines = file.hunks.iter().map(|hunk| hunk.removed_lines).sum();
 
-            if is_binary {
+            if binary_paths.contains(&path) {
                 file.status = FileStatus::Binary;
                 file.base_blob = blob_content_for_binary(file.old_blob_id.as_deref());
                 file.target_blob = blob_content_for_binary(file.new_blob_id.as_deref());
@@ -181,65 +178,48 @@ impl Repository {
         Ok(())
     }
 
-    fn diff_hunks(
+    /// Collect every file's hunks from one diff of the whole revision range.
+    ///
+    /// Hunks are keyed by target path, or by base path for deletions, which is
+    /// the same key [`diff_key`] derives from a change. Renames are paired by
+    /// Git, so a renamed file reports its rename delta rather than a
+    /// whole-file addition.
+    fn diff_hunks_by_path(
         &self,
         base_commit: &str,
         target_commit: &str,
-        pathspec: DiffPathspec<'_>,
-    ) -> Result<Vec<DiffHunk>, DiffScopeError> {
-        let output = match pathspec {
-            DiffPathspec::Single(path) => self.git_lossy([
-                "diff",
-                "--unified=0",
-                "--no-ext-diff",
-                base_commit,
-                target_commit,
-                "--",
-                path,
-            ])?,
-            DiffPathspec::Rename {
-                base_path,
-                target_path,
-            } => self.git_lossy([
-                "diff",
-                "--unified=0",
-                "--no-ext-diff",
-                "--find-renames",
-                base_commit,
-                target_commit,
-                "--",
-                base_path,
-                target_path,
-            ])?,
-        };
-        parse_hunks(&output)
+    ) -> Result<HashMap<String, Vec<DiffHunk>>, DiffScopeError> {
+        let output = self.git_lossy([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "--find-renames",
+            base_commit,
+            target_commit,
+        ])?;
+        parse_patch(&output)
     }
 
-    fn is_binary(
+    /// Collect the paths Git reports as binary from one numstat of the range.
+    ///
+    /// `-z` terminates every path with NUL, so paths containing whitespace or
+    /// non-ASCII bytes stay unambiguous.
+    fn binary_paths(
         &self,
         base_commit: &str,
         target_commit: &str,
-        pathspec: DiffPathspec<'_>,
-    ) -> Result<bool, DiffScopeError> {
-        let output = match pathspec {
-            DiffPathspec::Single(path) => {
-                self.git_lossy(["diff", "--numstat", base_commit, target_commit, "--", path])?
-            }
-            DiffPathspec::Rename {
-                base_path,
-                target_path,
-            } => self.git_lossy([
-                "diff",
-                "--numstat",
-                "--find-renames",
-                base_commit,
-                target_commit,
-                "--",
-                base_path,
-                target_path,
-            ])?,
-        };
-        Ok(output.lines().any(|line| line.starts_with("-\t-\t")))
+    ) -> Result<HashSet<String>, DiffScopeError> {
+        let output = self.git_bytes([
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            base_commit,
+            target_commit,
+        ])?;
+        parse_numstat_binary_paths(&output)
     }
 
     fn load_blobs(
@@ -361,35 +341,12 @@ fn run_git_bytes<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Vec<u8>,
     }
 }
 
-/// Path arguments that restrict a per-file diff to one changed file.
-///
-/// A rename must name both endpoints so that Git pairs them again inside the
-/// restricted pathspec. Diffing only the target path reports a rename as a
-/// whole-file addition.
-#[derive(Debug, Clone, Copy)]
-enum DiffPathspec<'a> {
-    Single(&'a str),
-    Rename {
-        base_path: &'a str,
-        target_path: &'a str,
-    },
-}
-
-fn diff_pathspec(file: &FileChange) -> Result<DiffPathspec<'_>, DiffScopeError> {
-    match (
-        file.status,
-        file.base_path.as_deref(),
-        file.target_path.as_deref(),
-    ) {
-        (FileStatus::Renamed, Some(base_path), Some(target_path)) => Ok(DiffPathspec::Rename {
-            base_path,
-            target_path,
-        }),
-        (_, _, Some(path)) | (_, Some(path), None) => Ok(DiffPathspec::Single(path)),
-        (_, None, None) => Err(DiffScopeError::InvalidGitOutput(
-            "file change without any path".to_owned(),
-        )),
-    }
+/// The key a change is looked up by: target path, or base path for deletions.
+fn diff_key(file: &FileChange) -> Result<&str, DiffScopeError> {
+    file.target_path
+        .as_deref()
+        .or(file.base_path.as_deref())
+        .ok_or_else(|| DiffScopeError::InvalidGitOutput("file change without any path".to_owned()))
 }
 
 fn split_nul(bytes: &[u8]) -> Vec<&[u8]> {
@@ -450,29 +407,88 @@ fn normalized_oid(value: Option<&str>) -> Option<String> {
     }
 }
 
-fn parse_hunks(diff: &str) -> Result<Vec<DiffHunk>, DiffScopeError> {
-    let mut hunks = Vec::new();
+fn parse_patch(diff: &str) -> Result<HashMap<String, Vec<DiffHunk>>, DiffScopeError> {
+    let mut by_path: HashMap<String, Vec<DiffHunk>> = HashMap::new();
+    let mut base_path: Option<String> = None;
+    let mut path: Option<String> = None;
     let mut current: Option<DiffHunk> = None;
 
     for line in diff.lines() {
-        if line.starts_with("@@ ") {
-            if let Some(hunk) = current.take() {
-                hunks.push(hunk);
-            }
+        if line.starts_with("diff --git ") {
+            finish_hunk(&mut current, path.as_deref(), &mut by_path);
+            base_path = None;
+            path = None;
+        } else if line.starts_with("@@ ") {
+            finish_hunk(&mut current, path.as_deref(), &mut by_path);
             current = Some(parse_hunk_header(line)?);
+        } else if current.is_none() {
+            // File headers only appear before the first hunk of a file, so a
+            // removed line such as `--- three dashes` is never mistaken for one.
+            if let Some(rest) = line.strip_prefix("--- ") {
+                base_path = patch_path(rest, "a/");
+            } else if let Some(rest) = line.strip_prefix("+++ ") {
+                path = patch_path(rest, "b/").or_else(|| base_path.clone());
+            }
         } else if let Some(hunk) = current.as_mut() {
-            if line.starts_with('+') && !line.starts_with("+++") {
+            if line.starts_with('+') {
                 hunk.added_lines += 1;
-            } else if line.starts_with('-') && !line.starts_with("---") {
+            } else if line.starts_with('-') {
                 hunk.removed_lines += 1;
             }
         }
     }
 
-    if let Some(hunk) = current {
-        hunks.push(hunk);
+    finish_hunk(&mut current, path.as_deref(), &mut by_path);
+    Ok(by_path)
+}
+
+fn finish_hunk(
+    current: &mut Option<DiffHunk>,
+    path: Option<&str>,
+    by_path: &mut HashMap<String, Vec<DiffHunk>>,
+) {
+    if let (Some(hunk), Some(path)) = (current.take(), path) {
+        by_path.entry(path.to_owned()).or_default().push(hunk);
     }
-    Ok(hunks)
+}
+
+fn patch_path(text: &str, prefix: &str) -> Option<String> {
+    if text == "/dev/null" {
+        return None;
+    }
+    Some(text.strip_prefix(prefix).unwrap_or(text).to_owned())
+}
+
+fn parse_numstat_binary_paths(output: &[u8]) -> Result<HashSet<String>, DiffScopeError> {
+    let records = split_nul(output);
+    let mut binary_paths = HashSet::new();
+    let mut index = 0;
+
+    while index < records.len() {
+        let record = utf8(records[index], "numstat record")?;
+        index += 1;
+        let mut fields = record.splitn(3, '\t');
+        let added = fields.next().unwrap_or_default();
+        let removed = fields.next().unwrap_or_default();
+        let Some(inline_path) = fields.next() else {
+            continue;
+        };
+
+        // A rename leaves the path field empty and follows with the base path
+        // and the target path as their own NUL-terminated records.
+        let path = if inline_path.is_empty() {
+            let _base_path = take_path(&records, &mut index, "numstat rename base path")?;
+            take_path(&records, &mut index, "numstat rename target path")?
+        } else {
+            inline_path.to_owned()
+        };
+
+        if added == "-" && removed == "-" {
+            binary_paths.insert(path);
+        }
+    }
+
+    Ok(binary_paths)
 }
 
 fn parse_hunk_header(line: &str) -> Result<DiffHunk, DiffScopeError> {
@@ -610,7 +626,7 @@ mod tests {
 
     use crate::BlobContent;
 
-    use super::{parse_batch_blobs, parse_hunk_header, parse_hunks};
+    use super::{parse_batch_blobs, parse_hunk_header, parse_patch};
 
     #[test]
     fn parses_hunk_header_with_counts() {
@@ -623,8 +639,11 @@ mod tests {
 
     #[test]
     fn counts_changed_lines_inside_hunks() {
-        let hunks = parse_hunks("diff --git a/a b/a\n@@ -1 +1,2 @@\n-old\n+new\n+more\n")
-            .expect("diff parses");
+        let by_path =
+            parse_patch("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1,2 @@\n-old\n+new\n+more\n")
+                .expect("diff parses");
+        let hunks = by_path.get("a").expect("file a has hunks");
+
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].removed_lines, 1);
         assert_eq!(hunks[0].added_lines, 2);
