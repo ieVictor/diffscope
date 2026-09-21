@@ -9,8 +9,17 @@ publish = false
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+tokio = { version = "1.53", default-features = false, features = [
+  "rt-multi-thread",
+] }
 tree-sitter = "0.24.7"
 tree-sitter-typescript = "0.23.2"
+
+# The MCP server, without the client, HTTP, or macro machinery it does not use.
+[dependencies.rmcp]
+version = "3.4.0"
+default-features = false
+features = ["server", "transport-io"]
 
 [dev-dependencies]
 criterion = "0.8.2"
