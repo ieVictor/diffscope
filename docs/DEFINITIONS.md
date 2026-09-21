@@ -70,7 +70,8 @@ For schema version `1`, TypeScript and TSX functions calculate metrics from Tree
 - For renamed files, matching uses the base path and target path from the rename pair as the same file identity.
 - If exactly one base function and one target function share the stable semantic identity, they are matched even when their source ranges or signatures changed.
 - If multiple candidates share the same semantic identity on either side, DiffScope reports an `ambiguous_function_match` diagnostic for those candidates and does not guess.
-- If no target match exists, the function is `removed`. If no base match exists, it is `added`. If a match exists and any intersecting diff hunk or metric/source range changed, it is `modified`; otherwise it is `unchanged`.
+- If no target match exists, the function is `removed`. If no base match exists, it is `added`. If a match exists and a diff hunk intersects the function on either side, or its metrics changed, it is `modified`; otherwise it is `unchanged`.
+- A function whose source range only shifts because of an edit elsewhere in the file is `unchanged`. Absolute ranges are not compared: in a large file one edit shifts every function below it, and reporting those as modified hides the functions that actually changed. A function moved within a file still intersects a hunk at its old and its new position, so it remains `modified`.
 - Moved functions within a file are matched by semantic identity, not by line number.
 
 ## Diagnostics
