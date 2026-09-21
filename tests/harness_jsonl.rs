@@ -253,6 +253,31 @@ fn a_reused_analysis_answers_identically_to_a_fresh_one() {
     assert_eq!(reused[0]["result"], reused[1]["result"]);
 }
 
+#[test]
+fn repeated_queries_are_byte_identical() {
+    // Determinism is the property every other guarantee rests on: parallel file
+    // analysis, throttling, hash-based pairing of ambiguous identities, and the
+    // import graph all introduce ordering that must not reach the output.
+    let repo = sample_repo();
+    let requests = [
+        query(&repo, "summary", "get_change_summary", &json!({})),
+        query(&repo, "files", "list_changed_files", &json!({})),
+        query(
+            &repo,
+            "functions",
+            "list_changed_functions",
+            &json!({ "include_unchanged": true }),
+        ),
+        query(&repo, "diagnostics", "get_analysis_diagnostics", &json!({})),
+        query(&repo, "analysis", "analyze", &json!({})),
+    ];
+
+    let first = serve_all(&requests);
+    for _ in 0..3 {
+        assert_eq!(serve_all(&requests), first);
+    }
+}
+
 struct TestRepo {
     path: std::path::PathBuf,
 }
