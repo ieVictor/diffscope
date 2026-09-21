@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Parser};
 
@@ -96,7 +96,7 @@ struct FunctionCollector<'source> {
     source: &'source str,
     functions: Vec<FunctionDefinition>,
     seen_starts: HashSet<usize>,
-    anonymous_count: u32,
+    anonymous_counts: HashMap<String, u32>,
 }
 
 impl<'source> FunctionCollector<'source> {
@@ -106,7 +106,7 @@ impl<'source> FunctionCollector<'source> {
             source,
             functions: Vec::new(),
             seen_starts: HashSet::new(),
-            anonymous_count: 0,
+            anonymous_counts: HashMap::new(),
         }
     }
 
@@ -131,6 +131,7 @@ impl<'source> FunctionCollector<'source> {
         self.functions.push(FunctionDefinition {
             language: self.language,
             kind,
+            symbol_id: symbol_id(kind, &qualified_name),
             qualified_name,
             range: SourceRange::from_tree_sitter(node.range())?,
             metrics: function_metrics(node, self.source)?,
@@ -138,28 +139,65 @@ impl<'source> FunctionCollector<'source> {
         Ok(())
     }
 
+    /// Name a function by its position in the source structure.
+    ///
+    /// The containing constructs are resolved first, because they scope both a
+    /// named function's qualified name and an anonymous function's ordinal. An
+    /// ordinal counted across the whole file makes a function's identity depend
+    /// on how many anonymous functions happen to precede it, so inserting one
+    /// callback renames every later one and matching cross-matches unrelated
+    /// bodies. Counting within the containing construct keeps an identity
+    /// stable under edits elsewhere in the file.
     fn qualified_name(&mut self, node: Node<'_>, kind: FunctionKind) -> String {
-        if kind == FunctionKind::Constructor {
-            return qualify_with_containers(node, self.source, "constructor");
-        }
+        let containers = container_path(node, self.source);
+        let leaf = self
+            .declared_name(node, kind)
+            .unwrap_or_else(|| self.next_anonymous_name(&containers));
 
-        if let Some(name) = explicit_name(node, self.source) {
-            return qualify_with_containers(node, self.source, &name);
-        }
-
-        if matches!(kind, FunctionKind::ArrowFunction | FunctionKind::Function)
-            && let Some(name) = assigned_name(node, self.source)
-        {
-            return qualify_with_containers(node, self.source, &name);
-        }
-
-        self.anonymous_count += 1;
-        qualify_with_containers(
-            node,
-            self.source,
-            &format!("<anonymous>#{}", self.anonymous_count),
-        )
+        let mut segments = containers;
+        segments.push(leaf);
+        segments.join(".")
     }
+
+    fn declared_name(&self, node: Node<'_>, kind: FunctionKind) -> Option<String> {
+        if kind == FunctionKind::Constructor {
+            return Some("constructor".to_owned());
+        }
+        if let Some(name) = explicit_name(node, self.source) {
+            return Some(name);
+        }
+        if matches!(kind, FunctionKind::ArrowFunction | FunctionKind::Function) {
+            return assigned_name(node, self.source);
+        }
+        None
+    }
+
+    fn next_anonymous_name(&mut self, containers: &[String]) -> String {
+        let scope = containers.join(".");
+        let ordinal = self.anonymous_counts.entry(scope).or_insert(0);
+        *ordinal += 1;
+        format!("{ANONYMOUS_NAME}#{ordinal}")
+    }
+}
+
+/// Leaf name given to a function that declares no name of its own.
+const ANONYMOUS_NAME: &str = "<anonymous>";
+
+/// Longest container segment kept before it is truncated.
+///
+/// Call labels come from source string literals, which are untrusted and can be
+/// arbitrarily long. Truncation is deterministic so the same source always
+/// produces the same identity.
+const MAX_SEGMENT_BYTES: usize = 64;
+
+fn symbol_id(kind: FunctionKind, qualified_name: &str) -> String {
+    let tag = match kind {
+        FunctionKind::Function => "fn",
+        FunctionKind::Method => "method",
+        FunctionKind::Constructor => "ctor",
+        FunctionKind::ArrowFunction => "arrow",
+    };
+    format!("{tag}:{qualified_name}")
 }
 
 fn function_kind(node: Node<'_>, source: &str) -> Option<FunctionKind> {
@@ -210,9 +248,18 @@ fn assigned_name(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn qualify_with_containers(node: Node<'_>, source: &str, name: &str) -> String {
+/// Resolve the constructs that contain a function, outermost first.
+///
+/// Type and module declarations contribute their own name. A call expression
+/// contributes the callee and, when the call leads with a string literal, that
+/// literal: `describe("parser")` and `it("rejects empty input")` identify a
+/// test callback far more stably than its position among the file's anonymous
+/// functions, and survive both reordering and insertion.
+fn container_path(node: Node<'_>, source: &str) -> Vec<String> {
     let mut containers = Vec::new();
+    let mut child = node;
     let mut parent = node.parent();
+
     while let Some(candidate) = parent {
         match candidate.kind() {
             "class_declaration"
@@ -224,13 +271,81 @@ fn qualify_with_containers(node: Node<'_>, source: &str, name: &str) -> String {
                     containers.push(container);
                 }
             }
+            "arguments" => {
+                if let Some(segment) = call_segment(candidate, child, source) {
+                    containers.push(segment);
+                }
+            }
             _ => {}
         }
+        child = candidate;
         parent = candidate.parent();
     }
+
     containers.reverse();
-    containers.push(name.to_owned());
-    containers.join(".")
+    containers
+}
+
+/// Describe the call that receives `argument` as one identity segment.
+fn call_segment(arguments: Node<'_>, argument: Node<'_>, source: &str) -> Option<String> {
+    let call = arguments.parent()?;
+    if !matches!(call.kind(), "call_expression" | "new_expression") {
+        return None;
+    }
+    let callee = call
+        .child_by_field_name("function")
+        .or_else(|| call.child_by_field_name("constructor"))
+        .and_then(|callee| node_text(callee, source))
+        .map(normalize_segment)?;
+
+    let mut cursor = arguments.walk();
+    let named = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+
+    if let Some(label) = named
+        .iter()
+        .find_map(|node| string_literal_text(*node, source))
+    {
+        return Some(format!("{callee}({label})"));
+    }
+
+    let index = named.iter().position(|node| node.id() == argument.id())?;
+    Some(format!("{callee}#{index}"))
+}
+
+/// Read a plain string or substitution-free template literal as its text.
+///
+/// A template literal with substitutions is not a constant, so it cannot
+/// identify anything stably and is deliberately not used as a label.
+fn string_literal_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node_text(node, source)?;
+    match node.kind() {
+        "string" => Some(quote(&normalize_segment(text.trim_matches(['\'', '"'])))),
+        // A template literal with substitutions is not a constant, so it cannot
+        // identify anything stably and is deliberately not used as a label.
+        "template_string" if node.named_child_count() == 0 => {
+            Some(quote(&normalize_segment(text.trim_matches('`'))))
+        }
+        _ => None,
+    }
+}
+
+fn quote(text: &str) -> String {
+    format!("\"{text}\"")
+}
+
+/// Reduce source text to one deterministic, bounded identity segment.
+fn normalize_segment(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= MAX_SEGMENT_BYTES {
+        return collapsed;
+    }
+    let mut end = MAX_SEGMENT_BYTES;
+    while end > 0 && !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = collapsed[..end].to_owned();
+    truncated.push_str("...");
+    truncated
 }
 
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {

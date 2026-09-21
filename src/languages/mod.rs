@@ -32,6 +32,9 @@ pub struct SourceRange {
 pub struct FunctionDefinition {
     pub language: Language,
     pub kind: FunctionKind,
+    /// Stable identity of this function within its file, independent of line
+    /// numbers. Callers pass it back to address one function.
+    pub symbol_id: String,
     pub qualified_name: String,
     pub range: SourceRange,
     pub metrics: FunctionMetrics,
