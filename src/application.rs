@@ -340,3 +340,64 @@ fn diagnostic_identity(diagnostic: &Diagnostic) -> DiagnosticIdentity<'_> {
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ANALYSIS_BYTES_IN_FLIGHT, ByteBudget, analysis_cost};
+    use crate::{BlobContent, FileChange, FileStatus, languages::MAX_ANALYZED_BLOB_BYTES};
+
+    #[test]
+    fn admits_work_larger_than_the_whole_budget() {
+        // A file too large for the budget must still be analyzed rather than
+        // waiting for room that can never appear.
+        let budget = ByteBudget::new();
+
+        budget.acquire(ANALYSIS_BYTES_IN_FLIGHT * 4);
+        budget.release(ANALYSIS_BYTES_IN_FLIGHT * 4);
+    }
+
+    #[test]
+    fn admits_every_worker_even_when_they_exceed_the_budget_together() {
+        let budget = ByteBudget::new();
+        let each = ANALYSIS_BYTES_IN_FLIGHT * 3 / 4;
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    budget.acquire(each);
+                    completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    budget.release(each);
+                });
+            }
+        });
+
+        assert_eq!(completed.load(std::sync::atomic::Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn counts_only_the_blobs_that_will_be_parsed() {
+        let small = vec![b'x'; 128];
+        let oversized = vec![b'x'; MAX_ANALYZED_BLOB_BYTES + 1];
+
+        assert_eq!(analysis_cost(&file_change(&small, &small)), 256);
+        // An oversized blob is never parsed, so it must not reserve budget.
+        assert_eq!(analysis_cost(&file_change(&oversized, &small)), 128);
+        assert_eq!(analysis_cost(&file_change(&oversized, &oversized)), 0);
+    }
+
+    fn file_change(base: &[u8], target: &[u8]) -> FileChange {
+        FileChange {
+            base_path: Some("sample.ts".to_owned()),
+            target_path: Some("sample.ts".to_owned()),
+            status: FileStatus::Modified,
+            old_blob_id: Some("base".to_owned()),
+            new_blob_id: Some("target".to_owned()),
+            base_blob: BlobContent::Available(base.to_vec()),
+            target_blob: BlobContent::Available(target.to_vec()),
+            added_lines: 0,
+            removed_lines: 0,
+            hunks: Vec::new(),
+        }
+    }
+}
