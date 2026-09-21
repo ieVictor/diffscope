@@ -1,4 +1,10 @@
-use std::{ffi::OsStr, path::Path, process::Command};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ffi::OsStr,
+    io::{self, Write},
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use crate::{
     BlobContent, ChangeInventory, ChangeSummary, DiffHunk, DiffScopeError, FileChange, FileStatus,
@@ -144,7 +150,7 @@ impl Repository {
         target_commit: &str,
         files: &mut [FileChange],
     ) -> Result<(), DiffScopeError> {
-        for file in files {
+        for file in &mut *files {
             let path = file
                 .target_path
                 .as_ref()
@@ -161,11 +167,16 @@ impl Repository {
                 file.status = FileStatus::Binary;
                 file.base_blob = blob_content_for_binary(file.old_blob_id.as_deref());
                 file.target_blob = blob_content_for_binary(file.new_blob_id.as_deref());
-                continue;
             }
+        }
 
-            file.base_blob = self.load_blob(file.old_blob_id.as_deref())?;
-            file.target_blob = self.load_blob(file.new_blob_id.as_deref())?;
+        let blobs = self.load_blobs(files)?;
+        for file in files
+            .iter_mut()
+            .filter(|file| file.status != FileStatus::Binary)
+        {
+            file.base_blob = blob_content(file.old_blob_id.as_deref(), &blobs);
+            file.target_blob = blob_content(file.new_blob_id.as_deref(), &blobs);
         }
         Ok(())
     }
@@ -198,15 +209,69 @@ impl Repository {
         Ok(output.lines().any(|line| line.starts_with("-\t-\t")))
     }
 
-    fn load_blob(&self, oid: Option<&str>) -> Result<BlobContent, DiffScopeError> {
-        let Some(oid) = oid else {
-            return Ok(BlobContent::NotApplicable);
-        };
-        if oid == ZERO_OID {
-            return Ok(BlobContent::NotApplicable);
+    fn load_blobs(
+        &self,
+        files: &[FileChange],
+    ) -> Result<HashMap<String, BlobContent>, DiffScopeError> {
+        let object_ids = files
+            .iter()
+            .filter(|file| file.status != FileStatus::Binary)
+            .flat_map(|file| [file.old_blob_id.as_deref(), file.new_blob_id.as_deref()])
+            .flatten()
+            .filter(|oid| *oid != ZERO_OID)
+            .collect::<BTreeSet<_>>();
+        if object_ids.is_empty() {
+            return Ok(HashMap::new());
         }
-        let bytes = self.git_bytes(["cat-file", "-p", oid])?;
-        Ok(BlobContent::Available(bytes))
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| DiffScopeError::Git {
+                command: "git cat-file --batch".to_owned(),
+                message: error.to_string(),
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| DiffScopeError::Git {
+            command: "git cat-file --batch".to_owned(),
+            message: "could not open standard input".to_owned(),
+        })?;
+        let write_object_ids = object_ids.clone();
+        let (write_result, output_result) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> io::Result<()> {
+                for oid in &write_object_ids {
+                    writeln!(stdin, "{oid}")?;
+                }
+                Ok(())
+            });
+            let output = child.wait_with_output();
+            let write = writer.join();
+            (write, output)
+        });
+        let output = output_result.map_err(|error| DiffScopeError::Git {
+            command: "git cat-file --batch".to_owned(),
+            message: error.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(DiffScopeError::Git {
+                command: "git cat-file --batch".to_owned(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        write_result
+            .map_err(|_| DiffScopeError::Git {
+                command: "git cat-file --batch".to_owned(),
+                message: "standard-input writer terminated unexpectedly".to_owned(),
+            })?
+            .map_err(|error| DiffScopeError::Git {
+                command: "git cat-file --batch".to_owned(),
+                message: error.to_string(),
+            })?;
+        parse_batch_blobs(&output.stdout, &object_ids)
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<String, DiffScopeError> {
@@ -372,6 +437,77 @@ fn parse_u32(value: Option<&str>, context: &str) -> Result<u32, DiffScopeError> 
         })
 }
 
+fn parse_batch_blobs(
+    output: &[u8],
+    object_ids: &BTreeSet<&str>,
+) -> Result<HashMap<String, BlobContent>, DiffScopeError> {
+    let mut blobs = HashMap::with_capacity(object_ids.len());
+    let mut offset = 0;
+    for expected_oid in object_ids {
+        let header_end = output
+            .get(offset..)
+            .and_then(|remaining| remaining.iter().position(|byte| *byte == b'\n'))
+            .map(|position| offset + position)
+            .ok_or_else(|| {
+                DiffScopeError::InvalidGitOutput("truncated cat-file batch header".to_owned())
+            })?;
+        let header = utf8(&output[offset..header_end], "cat-file batch header")?;
+        offset = header_end + 1;
+        let mut fields = header.split_whitespace();
+        let oid = fields.next().ok_or_else(|| {
+            DiffScopeError::InvalidGitOutput("cat-file batch header has no object id".to_owned())
+        })?;
+        if oid != *expected_oid {
+            return Err(DiffScopeError::InvalidGitOutput(format!(
+                "cat-file returned object {oid}, expected {expected_oid}"
+            )));
+        }
+        let object_type = fields.next().ok_or_else(|| {
+            DiffScopeError::InvalidGitOutput("cat-file batch header has no type".to_owned())
+        })?;
+        if object_type == "missing" {
+            blobs.insert(oid.to_owned(), BlobContent::Missing);
+            continue;
+        }
+        if object_type != "blob" {
+            return Err(DiffScopeError::InvalidGitOutput(format!(
+                "cat-file returned unsupported object type {object_type:?}"
+            )));
+        }
+        let size = fields
+            .next()
+            .ok_or_else(|| {
+                DiffScopeError::InvalidGitOutput("cat-file batch header has no size".to_owned())
+            })?
+            .parse::<usize>()
+            .map_err(|error| {
+                DiffScopeError::InvalidGitOutput(format!(
+                    "invalid cat-file batch object size: {error}"
+                ))
+            })?;
+        let content_end = offset.checked_add(size).ok_or_else(|| {
+            DiffScopeError::InvalidGitOutput("cat-file batch object size overflow".to_owned())
+        })?;
+        let content = output.get(offset..content_end).ok_or_else(|| {
+            DiffScopeError::InvalidGitOutput("truncated cat-file batch object".to_owned())
+        })?;
+        if output.get(content_end) != Some(&b'\n') {
+            return Err(DiffScopeError::InvalidGitOutput(
+                "cat-file batch object has no terminator".to_owned(),
+            ));
+        }
+        blobs.insert(oid.to_owned(), BlobContent::Available(content.to_vec()));
+        offset = content_end + 1;
+    }
+    Ok(blobs)
+}
+
+fn blob_content(oid: Option<&str>, blobs: &HashMap<String, BlobContent>) -> BlobContent {
+    oid.map_or(BlobContent::NotApplicable, |oid| {
+        blobs.get(oid).cloned().unwrap_or(BlobContent::Missing)
+    })
+}
+
 fn blob_content_for_binary(oid: Option<&str>) -> BlobContent {
     if oid.is_some() {
         BlobContent::Binary
@@ -390,7 +526,11 @@ fn compare_file_changes(left: &FileChange, right: &FileChange) -> std::cmp::Orde
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hunk_header, parse_hunks};
+    use std::collections::BTreeSet;
+
+    use crate::BlobContent;
+
+    use super::{parse_batch_blobs, parse_hunk_header, parse_hunks};
 
     #[test]
     fn parses_hunk_header_with_counts() {
@@ -408,5 +548,18 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].removed_lines, 1);
         assert_eq!(hunks[0].added_lines, 2);
+    }
+
+    #[test]
+    fn parses_available_and_missing_batch_blobs() {
+        let object_ids = BTreeSet::from(["aaaa", "bbbb"]);
+        let blobs = parse_batch_blobs(b"aaaa blob 4\nx\0y\n\nbbbb missing\n", &object_ids)
+            .expect("batch output parses");
+
+        assert_eq!(
+            blobs.get("aaaa"),
+            Some(&BlobContent::Available(b"x\0y\n".to_vec()))
+        );
+        assert_eq!(blobs.get("bbbb"), Some(&BlobContent::Missing));
     }
 }
