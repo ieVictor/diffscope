@@ -249,6 +249,75 @@ fn parallel_analysis_preserves_file_and_function_order() {
     assert_eq!(ids, expected_ids, "function ids must follow file order");
 }
 
+#[test]
+fn oversized_files_are_inventoried_with_a_diagnostic_and_no_metrics() {
+    let repo = TestRepo::new("oversized_file");
+    repo.git(["init"]);
+    repo.git(["config", "user.email", "diffscope@example.invalid"]);
+    repo.git(["config", "user.name", "DiffScope"]);
+
+    let mut generated = String::from("export function generated(): number {\n  return 1;\n}\n");
+    generated.push_str(&"// generated padding\n".repeat(280_000));
+    assert!(generated.len() > 5 * 1024 * 1024);
+
+    repo.write("src/generated.ts", &generated);
+    repo.write(
+        "src/small.ts",
+        "export function small(): number {\n  return 1;\n}\n",
+    );
+    repo.git(["add", "."]);
+    repo.git(["commit", "-m", "base"]);
+    let base = repo.rev_parse("HEAD");
+
+    repo.write(
+        "src/generated.ts",
+        &generated.replace("return 1;", "return 2;"),
+    );
+    repo.write(
+        "src/small.ts",
+        "export function small(): number {\n  return 2;\n}\n",
+    );
+    repo.git(["add", "-A"]);
+    repo.git(["commit", "-m", "target"]);
+    let target = repo.rev_parse("HEAD");
+
+    let result = analyze(&AnalysisRequest {
+        repository_path: repo.path().to_path_buf(),
+        base_revision: base,
+        target_revision: target,
+    })
+    .expect("analysis succeeds");
+
+    let oversized = result
+        .files
+        .iter()
+        .find(|file| file.target_path.as_deref() == Some("src/generated.ts"))
+        .expect("oversized file is inventoried");
+
+    // Inventoried with its diff statistics, but not parsed.
+    assert_eq!(oversized.status, FileStatus::Modified);
+    assert_eq!(oversized.added_lines, 1);
+    assert_eq!(oversized.removed_lines, 1);
+    assert!(oversized.functions.is_empty());
+    assert!(
+        oversized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::OversizedFile),
+        "expected an oversized_file diagnostic, got {:?}",
+        oversized.diagnostics
+    );
+
+    // Other files in the same comparison are unaffected.
+    let small = result
+        .files
+        .iter()
+        .find(|file| file.target_path.as_deref() == Some("src/small.ts"))
+        .expect("small file is analyzed");
+    assert_eq!(small.functions.len(), 1);
+    assert!(small.diagnostics.is_empty());
+}
+
 fn find<'a>(files: &'a [diffscope::FileChange], path: &str) -> &'a diffscope::FileChange {
     files
         .iter()

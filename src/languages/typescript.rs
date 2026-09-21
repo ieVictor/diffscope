@@ -634,6 +634,39 @@ function outer() {
     }
 
     #[test]
+    fn reports_oversized_files_without_parsing_them() {
+        use super::super::MAX_ANALYZED_BLOB_BYTES;
+
+        let mut source = b"export function kept(): number { return 1; }\n".to_vec();
+        source.resize(MAX_ANALYZED_BLOB_BYTES + 1, b'\n');
+
+        let analysis =
+            analyze_source(Path::new("generated.ts"), &source).expect("analysis succeeds");
+
+        assert_eq!(analysis.language, Some(Language::TypeScript));
+        assert_eq!(analysis.functions, Vec::new());
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == LanguageDiagnosticCode::OversizedFile
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn analyzes_files_at_the_size_limit() {
+        use super::super::MAX_ANALYZED_BLOB_BYTES;
+
+        let mut source = b"export function kept(): number { return 1; }\n".to_vec();
+        source.resize(MAX_ANALYZED_BLOB_BYTES, b'\n');
+
+        let analysis =
+            analyze_source(Path::new("generated.ts"), &source).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions.len(), 1);
+        assert_eq!(analysis.functions[0].qualified_name, "kept");
+        assert!(analysis.diagnostics.is_empty());
+    }
+
+    #[test]
     fn reports_unsupported_language() {
         let analysis =
             analyze_source(Path::new("readme.md"), b"# title").expect("analysis succeeds");
