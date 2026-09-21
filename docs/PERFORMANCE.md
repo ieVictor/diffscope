@@ -153,7 +153,37 @@ Source blobs above [`MAX_ANALYZED_BLOB_BYTES`](../src/languages/mod.rs) (5 MiB) 
 
 Output for every corpus whose files are below the limit is byte-identical to output from before it, including `ts-checker`, whose 2.9 MiB `checker.ts` stays fully analyzed.
 
-The limit bounds any single file, not the total of many. The `codegen` corpus -- 16 changed files of 1.36 MiB each, all below the limit -- still peaks near 1.3 GiB, because up to twelve files are analyzed at once and each holds two syntax trees. Bounding the bytes in flight rather than the number of files is the measured next step.
+The limit bounds any single file, not the total of many. That is what the in-flight budget below addresses.
+
+### In-flight byte budget
+
+The size limit cannot see a diff of many moderately large files: the `codegen` corpus, 16 changed files of 1.36 MiB each and every one below the limit, peaked near 1.3 GiB because up to twelve files were analyzed at once and each held two syntax trees.
+
+Workers now reserve the bytes they are about to parse against [`ANALYSIS_BYTES_IN_FLIGHT`](../src/application.rs) (8 MiB) and wait when the budget is full. A file larger than the whole budget is admitted whenever nothing else is in flight, so no file can deadlock the analysis, and blobs above the analysis size limit cost nothing because they are never parsed.
+
+| Corpus | Before the budget | With the budget |
+| --- | ---: | ---: |
+| `codegen`, peak RSS | 1,314,608 KiB | 709,020 KiB |
+| `codegen`, wall time | 14.799 s | 14.677 s |
+
+Ordinary diffs never reach the budget -- the 482-file corpus has roughly 16 KiB per file, so twelve files in flight is under 0.4 MiB -- and their time and memory are unchanged. Output is byte-identical with and without the budget, and repeated runs of `codegen` produce identical output, so throttling does not affect ordering.
+
+Roughly 288,000 KiB of what remains on `codegen` is glibc per-thread arena retention rather than live data: running the same comparison with `MALLOC_ARENA_MAX=1` peaks at 423,632 KiB, but costs 21% wall time from allocator contention, so no arena limit is imposed.
+
+### Single complexity traversal
+
+`complexity_points` computes cyclomatic and cognitive complexity in one walk of a function, but the two metrics were requested separately, so every function was traversed twice. Phase timings attributed roughly two thirds of the function collector's time to complexity, and the collector is about half of analysis CPU.
+
+| Corpus | Two traversals | One traversal |
+| --- | ---: | ---: |
+| vue-commit | 58.6 ms | 54.4 ms |
+| vue-week | 120.1 ms | 110.4 ms |
+| vue-minor | 448.1 ms | 411.7 ms |
+| vue-span | 589.9 ms | 558.7 ms |
+| ts-checker | 708.4 ms | 633.7 ms |
+| monorepo, 4,000 files | 791.8 ms | 718.3 ms |
+
+Output is byte-identical on every corpus.
 
 ### Cumulative effect
 
@@ -170,4 +200,4 @@ Against the first real-world measurement, before whole-range diff collection and
 
 Further optimization requires a new measurement. Phase timings collected on a 13.5 MiB file attribute 47% of analysis CPU to Tree-sitter parsing and 53% to the function collector, of which complexity accounts for roughly two thirds; Git access, grouping, matching, sorting, and rendering are each under 3%. On the `codegen` corpus the balance inverts and Git dominates at 83%, split evenly between the patch and numstat calls, which compute the same diff twice; requesting both from one invocation was measured and does not help, because Git recomputes internally.
 
-Remaining candidates, in the order the current measurements justify them: computing both complexity metrics in one traversal instead of two, measured at 7% to 14% end to end with byte-identical output; bounding the bytes analyzed at once; deriving binary status from loaded blob content instead of a second Git diff; and rendering output without buffering the entire result.
+Remaining candidates, in the order the current measurements justify them: deriving binary status from loaded blob content instead of a second Git diff, which costs about six seconds on `codegen`; and rendering output without buffering the entire result.

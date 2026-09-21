@@ -101,7 +101,7 @@ Diagnostics include a stable code, severity (`info`, `warning`, or `error`), hum
 - Functions are ordered by target range start for present target functions, otherwise base range start, then qualified name and kind.
 - Diagnostics are ordered as defined above.
 - JSON object field order is not semantically meaningful, but golden outputs may use a stable renderer order.
-- Parallel execution must not affect result ordering.
+- Parallel execution must not affect result ordering, including when analysis is throttled to bound memory.
 
 ## Schema version 1 result model
 
