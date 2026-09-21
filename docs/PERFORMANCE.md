@@ -128,6 +128,24 @@ Response size is the reason the queries exist. These figures were recorded under
 | `list_changed_functions`, production source at high risk, limit 10 | 8,729 |
 | `get_function_change` for one function | 1,221 |
 
+## Impact graph cost
+
+An impact graph is built from one analysis and the import indexes of both revisions, so a comparison's first graph query pays for one index beyond the target's, plus the comparison between the two, plus the rendering of the answer. Measured with the `impact_graph` Criterion group on the generated tiers, on the machine and toolchain described above, warm filesystem cache. Every file in a tier changes, so the changed set is the whole repository and the graph is built with no named root — the default a query applies:
+
+| Tier | Base index | Target index | Graph build | Dependency diff | Mermaid |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small | 3.14 ms | 3.37 ms | 48.9 us | 10.3 ns | 5.59 us |
+| medium | 5.54 ms | 7.10 ms | 2.67 ms | 10.4 ns | 18.23 us |
+| large | 11.83 ms | 15.32 ms | 24.80 ms | 10.3 ns | 17.83 us |
+
+The two index columns were measured back to back in one session — `impact_graph` benchmarks `index_revision` on the base commit, `import_graph` on the target — because Criterion's reported difference is against whatever it last stored. A repeat of the target-index run measured 3.33 ms, 7.17 ms, and 15.69 ms. The base index is cheaper on these tiers only because the generator's base files are shorter: the added cost is one more `index_revision` over whatever that revision contains, so a comparison between two revisions of the same size pays its target index a second time. The harness caches an index per commit, so this is a first-query cost; later queries of the same comparison pay neither index.
+
+Graph construction is not far below either index, and the tiers say why. The generated TypeScript files import nothing, so the indexes hold no edges and the walk visits the changed set alone; the cost is test-link attachment. Every reached module asks `impact::for_file` for its tests once per revision, and that call scans the index's whole file list looking for a name-matching test. With every file changed, the reached set is the whole repository, so the work grows with the product of the reached set and the index's file list: from medium to large, three times the files costs nine times the time (2.67 ms to 24.80 ms), and from small to medium, eight times the files costs fifty-five times the time (48.9 us to 2.67 ms). A query naming one root reaches that root's neighbourhood instead of the whole changed set, and attaches tests for the modules it reaches.
+
+Rendering is negligible. The dependency diff has no edges to write on these tiers, so its 10 ns is the cost of returning an empty string; Mermaid writes the delivered nodes' declarations and class lines at roughly 0.6 us per node. Neither is measurable against the analysis, and neither justifies letting `render` influence anything but the answer's text.
+
+The baseline table's `Import graph` column records 12.77 ms for the large tier from an earlier session; this session measured 15.32 ms and 15.69 ms on the same corpus. The difference is not attributed to a cause here, and the same-session figures above are the ones the comparison uses. A Vue-scale base-index figure is not recorded: those corpora are not recreated in this session, and the cost of indexing one revision is not estimated from the 412 ms target index above.
+
 ## Real-world corpus
 
 Generated tiers isolate per-file behavior but do not resemble real diffs: the large tier averages 268 bytes per changed file, while real TypeScript diffs average roughly 16 KiB. Real-repository measurements therefore accompany the generated tiers. These corpora are not committed; recreate them by cloning the repositories and using the pinned revisions.
