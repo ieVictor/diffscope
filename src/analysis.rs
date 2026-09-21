@@ -566,8 +566,8 @@ mod tests {
     use crate::{BlobContent, FileChange, FileStatus};
 
     use super::{
-        FunctionChangeStatus, FunctionMappingDiagnosticCode, map_changed_functions,
-        overlapping_lines, range_intersects_hunk_side,
+        FunctionChangeStatus, FunctionMappingDiagnosticCode, MatchConfidence,
+        map_changed_functions, overlapping_lines, range_intersects_hunk_side,
     };
 
     #[test]
@@ -856,11 +856,68 @@ mod tests {
 
         let mapped = map_changed_functions(&file).expect("mapping succeeds");
 
-        assert!(mapped.functions.is_empty());
+        // The ambiguity is still reported: nothing here is certain.
         assert!(mapped.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == FunctionMappingDiagnosticCode::AmbiguousFunctionMatch
                 && diagnostic.qualified_name.as_deref() == Some("duplicate")
         }));
+
+        // The functions themselves are still analyzed. Dropping the group put
+        // real, parsed functions outside the result with no way to ask for
+        // them; reporting them at a lower confidence keeps the caller informed
+        // without discarding the analysis.
+        assert_eq!(mapped.functions.len(), 2);
+        assert!(
+            mapped
+                .functions
+                .iter()
+                .all(|function| function.match_confidence != MatchConfidence::Exact)
+        );
+        assert_eq!(
+            mapped
+                .functions
+                .iter()
+                .filter(|function| function.status == FunctionChangeStatus::Removed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pairs_ambiguous_functions_by_identical_source_before_position() {
+        // Two `run` methods share one identity and swap places. Pairing by
+        // position would match each to the other's body and report churn in
+        // both; pairing identical sources first follows each one to its new
+        // place.
+        let file = file_change(
+            b"const a = { run() { return 1; } };\nconst b = { run() { return 2; } };\n",
+            b"const a = { run() { return 2; } };\nconst b = { run() { return 1; } };\n",
+            1,
+            2,
+            1,
+            2,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+
+        assert_eq!(mapped.functions.len(), 2);
+        assert!(
+            mapped
+                .functions
+                .iter()
+                .all(|function| function.match_confidence == MatchConfidence::IdenticalBody)
+        );
+
+        // The function that started on line 1 is now on line 2.
+        let moved = mapped
+            .functions
+            .iter()
+            .find(|function| function.base_range.as_ref().map(|range| range.start_line) == Some(1))
+            .expect("a function starts on base line 1");
+        assert_eq!(
+            moved.target_range.as_ref().map(|range| range.start_line),
+            Some(2)
+        );
     }
 
     #[test]
