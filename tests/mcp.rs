@@ -19,9 +19,10 @@ use serde_json::{Value, json};
 /// The protocol revision the tests speak.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// The five tools the server exposes, in the order it lists them.
-const TOOLS: [&str; 5] = [
+/// The six tools the server exposes, in the order it lists them.
+const TOOLS: [&str; 6] = [
     "get_change_summary",
+    "get_impact_graph",
     "list_changed_files",
     "list_changed_functions",
     "get_function_change",
@@ -29,7 +30,7 @@ const TOOLS: [&str; 5] = [
 ];
 
 #[test]
-fn handshake_negotiates_and_lists_exactly_the_five_tools() {
+fn handshake_negotiates_and_lists_exactly_the_six_tools() {
     let repo = sample_repo();
     let mut server = Server::start(repo.path());
 
@@ -79,6 +80,30 @@ fn handshake_negotiates_and_lists_exactly_the_five_tools() {
             "{tool}"
         );
     }
+
+    // The graph tool advertises the parameters this version accepts and no
+    // others: a client must not be shown an argument the server would reject.
+    let graph = tools
+        .iter()
+        .find(|tool| tool["name"] == json!("get_impact_graph"))
+        .expect("the impact graph tool");
+    let properties = &graph["inputSchema"]["properties"];
+    for parameter in [
+        "file",
+        "direction",
+        "relations",
+        "depth",
+        "view",
+        "max_nodes",
+        "max_edges",
+        "render",
+    ] {
+        assert!(properties[parameter].is_object(), "{graph}");
+    }
+    assert!(
+        properties.get("function_id").is_none(),
+        "function roots are not supported yet, so the schema must not offer one: {graph}"
+    );
 }
 
 #[test]
@@ -106,6 +131,17 @@ fn every_tool_answers_the_question_it_names() {
     let summary = server.call("get_change_summary", &comparison(&repo));
     assert_eq!(summary["isError"], json!(false));
     assert!(summary["structuredContent"]["data"]["files"].is_object());
+
+    let graph = server.call("get_impact_graph", &comparison(&repo));
+    let rendered = &graph["structuredContent"]["data"];
+    assert_eq!(rendered["root"], Value::Null);
+    assert_eq!(
+        rendered["graph"]["nodes"].as_array().map(Vec::len),
+        Some(3),
+        "the sample change modifies three modules: {rendered}"
+    );
+    assert!(rendered["graph"]["edges"].is_array());
+    assert!(rendered["visualization"]["recommended"].is_boolean());
 
     let files = server.call("list_changed_files", &comparison(&repo));
     assert!(files["structuredContent"]["data"]["files"].is_array());
@@ -234,7 +270,7 @@ fn client_disconnect_ends_the_session_cleanly() {
     let mut server = Server::start(repo.path());
 
     let listing = server.request("tools/list", &json!({}));
-    assert_eq!(listing["result"]["tools"].as_array().map(Vec::len), Some(5));
+    assert_eq!(listing["result"]["tools"].as_array().map(Vec::len), Some(6));
 
     assert_eq!(server.close(), Some(0));
 }

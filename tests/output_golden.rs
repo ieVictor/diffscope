@@ -1,6 +1,11 @@
 use diffscope::{
     AnalysisResult, AnalysisSummary, Diagnostic, DiagnosticCode, DiagnosticCounts, FileResult,
     RevisionResult,
+    graph::{
+        Edge, EdgeStatus, Graph, GraphBuilder, Limits, Node, NodeKind, NodeStatus, Relation,
+        Resolution,
+        render::{dependency_diff, mermaid},
+    },
     languages::DiagnosticSeverity,
     output::{render_human, render_json},
     result::SCHEMA_VERSION,
@@ -143,4 +148,123 @@ const GOLDEN: &str = r#"{
   ],
   "diagnostics": []
 }
+"#;
+
+/// A module graph in the shape M1 builds for one comparison: a modified module
+/// whose dependency was replaced, the unchanged importer that reaches it, and
+/// the test that covers it. It goes through `GraphBuilder` rather than being
+/// assembled by hand, so the goldens pin what a caller receives, render keys
+/// included.
+fn graph() -> Graph {
+    let module = |path: &str, status: NodeStatus, depth: u32| Node {
+        id: Node::module_id(path),
+        key: String::new(),
+        label: Node::basename(path),
+        kind: NodeKind::Module,
+        path: path.to_owned(),
+        status,
+        depth,
+    };
+    let edge =
+        |from: &str, to: &str, relation: Relation, status: EdgeStatus, resolution: Resolution| {
+            Edge {
+                from: Node::module_id(from),
+                to: Node::module_id(to),
+                relation,
+                status,
+                resolution,
+                evidence: None,
+            }
+        };
+
+    let root = "packages/compiler-sfc/src/style/cssVars.ts";
+    let mut builder = GraphBuilder::new();
+    builder.add_node(module(root, NodeStatus::Modified, 0));
+    builder.add_root(Node::module_id(root));
+    builder.add_node(module(
+        "packages/compiler-sfc/src/compileStyle.ts",
+        NodeStatus::Unchanged,
+        1,
+    ));
+    builder.add_node(module(
+        "packages/compiler-sfc/src/parse.ts",
+        NodeStatus::Added,
+        1,
+    ));
+    builder.add_node(module(
+        "packages/compiler-sfc/src/legacyParser.ts",
+        NodeStatus::Removed,
+        1,
+    ));
+    builder.add_node(module(
+        "packages/compiler-sfc/__tests__/cssVars.spec.ts",
+        NodeStatus::Added,
+        1,
+    ));
+    builder.add_edge(edge(
+        "packages/compiler-sfc/src/compileStyle.ts",
+        root,
+        Relation::Imports,
+        EdgeStatus::Unchanged,
+        Resolution::ResolvedSpecifier,
+    ));
+    builder.add_edge(edge(
+        root,
+        "packages/compiler-sfc/src/legacyParser.ts",
+        Relation::Imports,
+        EdgeStatus::Removed,
+        Resolution::ResolvedSpecifier,
+    ));
+    builder.add_edge(edge(
+        root,
+        "packages/compiler-sfc/src/parse.ts",
+        Relation::Imports,
+        EdgeStatus::Added,
+        Resolution::ResolvedSpecifier,
+    ));
+    builder.add_edge(edge(
+        "packages/compiler-sfc/__tests__/cssVars.spec.ts",
+        root,
+        Relation::TestedBy,
+        EdgeStatus::Added,
+        Resolution::TestImportsModule,
+    ));
+    builder.finish(Limits::default())
+}
+
+#[test]
+fn dependency_diff_matches_golden() {
+    assert_eq!(dependency_diff(&graph()), DEPENDENCY_DIFF_GOLDEN);
+}
+
+#[test]
+fn mermaid_matches_golden() {
+    assert_eq!(mermaid(&graph()), MERMAID_GOLDEN);
+}
+
+/// The compact rendering of the fixture: one line per relationship, the removed
+/// dependency beside the added one that replaced it.
+const DEPENDENCY_DIFF_GOLDEN: &str = r"+ packages/compiler-sfc/__tests__/cssVars.spec.ts -[tested_by]-> packages/compiler-sfc/src/style/cssVars.ts
+  packages/compiler-sfc/src/compileStyle.ts -> packages/compiler-sfc/src/style/cssVars.ts
+- packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/legacyParser.ts
++ packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/parse.ts
+";
+
+/// The diagram of the fixture, with each node's shape declared where it first
+/// appears. Only this source is deterministic; geometry belongs to whichever
+/// Mermaid version draws it.
+const MERMAID_GOLDEN: &str = r#"flowchart LR
+    classDef added fill:#e6ffed,stroke:#22863a
+    classDef removed fill:#ffeef0,stroke:#cb2431
+    classDef modified fill:#fff5b1,stroke:#b08800
+    classDef unchanged fill:#f6f8fa,stroke:#d1d5db
+    n0["cssVars.spec.ts · added"] -. "~0.9" .-> n4["cssVars.ts · modified"]
+    n1["compileStyle.ts"] --> n4
+    n4 -. "removed" .-> n2["legacyParser.ts · removed"]
+    n4 --> n3["parse.ts · added"]
+    class n0 added
+    class n1 unchanged
+    class n2 removed
+    class n3 added
+    class n4 modified
 "#;
