@@ -27,6 +27,21 @@ pub struct FunctionChange {
     pub target_range: Option<SourceRange>,
     pub metrics_before: Option<FunctionMetrics>,
     pub metrics_after: Option<FunctionMetrics>,
+    pub churn: FunctionChurn,
+}
+
+/// How much of a diff actually lands inside one function.
+///
+/// Counts are kept instead of a ratio so the model stays exactly comparable;
+/// renderers derive the overlap fraction when they present it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FunctionChurn {
+    /// Changed lines inside the function's base range.
+    pub lines_removed: u32,
+    /// Changed lines inside the function's target range.
+    pub lines_added: u32,
+    /// Hunks touching the function on either side.
+    pub changed_hunks: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +135,11 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                     language: key.language,
                     kind: key.kind,
                     qualified_name: key.qualified_name,
+                    churn: function_churn(
+                        Some(&base_function.range),
+                        Some(&target_function.range),
+                        &file.hunks,
+                    ),
                     base_range: Some(base_function.range.clone()),
                     target_range: Some(target_function.range.clone()),
                     metrics_before: Some(base_function.metrics.clone()),
@@ -131,6 +151,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 language: key.language,
                 kind: key.kind,
                 qualified_name: key.qualified_name,
+                churn: function_churn(Some(&base_function.range), None, &file.hunks),
                 base_range: Some(base_function.range.clone()),
                 target_range: None,
                 metrics_before: Some(base_function.metrics.clone()),
@@ -141,6 +162,7 @@ pub fn map_changed_functions(file: &FileChange) -> Result<FileFunctionChanges, D
                 language: key.language,
                 kind: key.kind,
                 qualified_name: key.qualified_name,
+                churn: function_churn(None, Some(&target_function.range), &file.hunks),
                 base_range: None,
                 target_range: Some(target_function.range.clone()),
                 metrics_before: None,
@@ -332,6 +354,51 @@ fn function_changed(
                     hunk.target_count,
                 )
         })
+}
+
+/// Measure the diff that lands inside one function.
+///
+/// The diff is read with `--unified=0`, so a hunk header's line span is exactly
+/// the span of changed lines on that side and carries no context. Intersecting
+/// the two spans therefore yields the function's real line churn rather than an
+/// estimate from the size of the surrounding hunk.
+fn function_churn(
+    base_range: Option<&SourceRange>,
+    target_range: Option<&SourceRange>,
+    hunks: &[DiffHunk],
+) -> FunctionChurn {
+    let mut churn = FunctionChurn::default();
+    for hunk in hunks {
+        let removed = base_range.map_or(0, |range| {
+            overlapping_lines(range, hunk.base_start, hunk.base_count)
+        });
+        let added = target_range.map_or(0, |range| {
+            overlapping_lines(range, hunk.target_start, hunk.target_count)
+        });
+        let touches = base_range.is_some_and(|range| {
+            range_intersects_hunk_side(range, hunk.base_start, hunk.base_count)
+        }) || target_range.is_some_and(|range| {
+            range_intersects_hunk_side(range, hunk.target_start, hunk.target_count)
+        });
+
+        churn.lines_removed += removed;
+        churn.lines_added += added;
+        churn.changed_hunks += u32::from(touches);
+    }
+    churn
+}
+
+/// Count the lines one hunk side contributes inside a source range.
+fn overlapping_lines(range: &SourceRange, start: u32, count: u32) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    let first = start.max(range.start_line);
+    let last = start.saturating_add(count - 1).min(range.end_line);
+    if first > last {
+        return 0;
+    }
+    last - first + 1
 }
 
 fn range_intersects_hunk_side(range: &SourceRange, start: u32, count: u32) -> bool {

@@ -1,6 +1,6 @@
 use crate::{
     DiffHunk, FileStatus,
-    analysis::FunctionChangeStatus,
+    analysis::{FunctionChangeStatus, FunctionChurn},
     languages::{DiagnosticSeverity, FunctionKind, Language, SourceRange},
     metrics::FunctionMetrics,
 };
@@ -66,6 +66,7 @@ pub struct FunctionResult {
     pub target_range: Option<SourceRange>,
     pub metrics_before: Option<FunctionMetrics>,
     pub metrics_after: Option<FunctionMetrics>,
+    pub churn: FunctionChurn,
     pub diagnostics: Vec<Diagnostic>,
 }
 

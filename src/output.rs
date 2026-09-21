@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::{
     DiffHunk, FileStatus,
-    analysis::FunctionChangeStatus,
+    analysis::{FunctionChangeStatus, FunctionChurn},
     languages::{DiagnosticSeverity, FunctionKind, Language, SourceRange},
     metrics::FunctionMetrics,
     result::{AnalysisResult, Diagnostic, DiagnosticCode, FileResult, FunctionResult},
@@ -325,6 +325,8 @@ struct JsonFunction<'a> {
     metrics_before: Option<JsonMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_after: Option<JsonMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change: Option<JsonChurn>,
     diagnostics: Vec<JsonDiagnostic<'a>>,
 }
 
@@ -339,6 +341,13 @@ impl<'a> From<&'a FunctionResult> for JsonFunction<'a> {
             target_range: function.target_range.as_ref().map(JsonRange::from),
             metrics_before: function.metrics_before.as_ref().map(JsonMetrics::from),
             metrics_after: function.metrics_after.as_ref().map(JsonMetrics::from),
+            change: JsonChurn::new(
+                &function.churn,
+                function
+                    .metrics_after
+                    .as_ref()
+                    .or(function.metrics_before.as_ref()),
+            ),
             diagnostics: function
                 .diagnostics
                 .iter()
@@ -346,6 +355,45 @@ impl<'a> From<&'a FunctionResult> for JsonFunction<'a> {
                 .collect(),
         }
     }
+}
+
+/// Per-function diff churn. Omitted for functions the diff does not touch.
+#[derive(Serialize)]
+struct JsonChurn {
+    changed_hunks: u32,
+    lines_added: u32,
+    lines_removed: u32,
+    /// Changed lines inside the function over its length, `0.0` to `1.0`.
+    hunk_overlap: f64,
+}
+
+impl JsonChurn {
+    fn new(churn: &FunctionChurn, metrics: Option<&FunctionMetrics>) -> Option<Self> {
+        if churn.changed_hunks == 0 && churn.lines_added == 0 && churn.lines_removed == 0 {
+            return None;
+        }
+        Some(Self {
+            changed_hunks: churn.changed_hunks,
+            lines_added: churn.lines_added,
+            lines_removed: churn.lines_removed,
+            hunk_overlap: overlap_fraction(churn, metrics),
+        })
+    }
+}
+
+/// Share of a function's lines the diff touches.
+///
+/// Measured against the revision the function still exists in, so an added or
+/// removed function reports overlap against its only range. Rounded to two
+/// decimals to keep the rendered value stable across platforms.
+fn overlap_fraction(churn: &FunctionChurn, metrics: Option<&FunctionMetrics>) -> f64 {
+    let length = metrics.map_or(0, |metrics| metrics.physical_loc);
+    if length == 0 {
+        return 0.0;
+    }
+    let touched = churn.lines_added.max(churn.lines_removed);
+    let ratio = f64::from(touched.min(length)) / f64::from(length);
+    (ratio * 100.0).round() / 100.0
 }
 
 #[derive(Serialize)]

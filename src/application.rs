@@ -273,6 +273,7 @@ fn build_file_result(
                 target_range: function.target_range,
                 metrics_before: function.metrics_before,
                 metrics_after: function.metrics_after,
+                churn: function.churn,
                 diagnostics: Vec::new(),
             }
         })
