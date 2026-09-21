@@ -721,6 +721,118 @@ function outer() {
     }
 
     #[test]
+    fn identifies_callbacks_by_their_call_context() {
+        let source = br"
+describe('parser', () => {
+  test('rejects empty input', () => {
+    if (a) { return 1; }
+  })
+})
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let names = analysis
+            .functions
+            .iter()
+            .map(|function| function.qualified_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"describe(\"parser\").<anonymous>#1"));
+        assert!(
+            names.contains(&"describe(\"parser\").test(\"rejects empty input\").<anonymous>#1")
+        );
+    }
+
+    #[test]
+    fn counts_anonymous_functions_within_their_container_not_the_file() {
+        // Each container restarts at #1. A file-wide counter would number the
+        // second container's callback #2 and make its identity depend on how
+        // many anonymous functions happen to precede it.
+        let source = br"
+describe('first', () => {
+  test('a', () => { return 1; })
+})
+describe('second', () => {
+  test('b', () => { return 2; })
+})
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let names = analysis
+            .functions
+            .iter()
+            .map(|function| function.qualified_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"describe(\"first\").test(\"a\").<anonymous>#1"));
+        assert!(names.contains(&"describe(\"second\").test(\"b\").<anonymous>#1"));
+        assert!(!names.iter().any(|name| name.ends_with("#2")));
+    }
+
+    #[test]
+    fn names_callback_arguments_without_a_label_by_position() {
+        let source = br"
+useEffect(() => { doThing(); }, [dep]);
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions.len(), 1);
+        assert_eq!(
+            analysis.functions[0].qualified_name,
+            "useEffect#0.<anonymous>#1"
+        );
+    }
+
+    #[test]
+    fn distinguishes_same_named_locals_declared_in_different_tests() {
+        // Before identities were scoped, every `makeComp` in a spec file shared
+        // one identity, collapsed into a single ambiguous group, and was
+        // dropped from the inventory entirely.
+        let source = br"
+describe('suite', () => {
+  test('a', () => { const makeComp = () => 1; })
+  test('b', () => { const makeComp = () => 2; })
+})
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+        let names = analysis
+            .functions
+            .iter()
+            .map(|function| function.qualified_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"describe(\"suite\").test(\"a\").makeComp"));
+        assert!(names.contains(&"describe(\"suite\").test(\"b\").makeComp"));
+    }
+
+    #[test]
+    fn ignores_template_literals_with_substitutions_as_labels() {
+        let source = br"
+test(`case ${index}`, () => { return 1; })
+";
+
+        let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
+
+        assert_eq!(analysis.functions[0].qualified_name, "test#1.<anonymous>#1");
+    }
+
+    #[test]
+    fn truncates_overlong_call_labels_deterministically() {
+        let label = "x".repeat(200);
+        let source = format!("test('{label}', () => {{ return 1; }})\n");
+
+        let analysis =
+            analyze_source(Path::new("sample.ts"), source.as_bytes()).expect("analysis succeeds");
+        let name = analysis.functions[0].qualified_name.as_str();
+
+        assert!(name.starts_with("test(\"xxx"));
+        assert!(name.contains("...\")"));
+        assert!(name.len() < 120);
+    }
+
+    #[test]
     fn reports_malformed_source_without_panicking() {
         let analysis = analyze_source(Path::new("broken.ts"), b"function broken( {")
             .expect("analysis succeeds");

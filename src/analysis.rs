@@ -552,6 +552,54 @@ mod tests {
     }
 
     #[test]
+    fn inserting_a_callback_does_not_cross_match_the_callbacks_below_it() {
+        // Anonymous identities were once numbered across the whole file, so an
+        // inserted callback renumbered every later one and matched unrelated
+        // bodies to each other: the callback of `a` was compared against the
+        // body of `new`, reporting complexity churn that no edit caused. Each
+        // surviving callback must still match its own previous self.
+        let file = file_change(
+            b"describe('s', () => {\n  test('a', () => { return 1; })\n  test('b', () => { if (x) { return 2; } return 3; })\n})\n",
+            b"describe('s', () => {\n  test('new', () => { while (y) { break; } })\n  test('a', () => { return 1; })\n  test('b', () => { if (x) { return 2; } return 3; })\n})\n",
+            2,
+            0,
+            2,
+            1,
+        );
+
+        let mapped = map_changed_functions(&file).expect("mapping succeeds");
+
+        let added = mapped
+            .functions
+            .iter()
+            .filter(|function| function.status == FunctionChangeStatus::Added)
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added[0].qualified_name,
+            "describe(\"s\").test(\"new\").<anonymous>#1"
+        );
+
+        // The two surviving callbacks kept their own metrics. The enclosing
+        // `describe` callback legitimately grew by the inserted line, so only
+        // the callbacks the edit did not touch are asserted here.
+        for name in [
+            "describe(\"s\").test(\"a\").<anonymous>#1",
+            "describe(\"s\").test(\"b\").<anonymous>#1",
+        ] {
+            let function = mapped
+                .functions
+                .iter()
+                .find(|function| function.qualified_name == name)
+                .unwrap_or_else(|| panic!("{name} is still matched"));
+            assert_eq!(
+                function.metrics_before, function.metrics_after,
+                "{name} was matched against a different function"
+            );
+        }
+    }
+
+    #[test]
     fn matches_functions_across_file_renames() {
         let mut file = file_change(
             b"function stable() { return 1; }\n",
