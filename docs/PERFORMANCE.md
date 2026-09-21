@@ -44,6 +44,34 @@ Measured on 2026-09-20 with:
 
 The complete large-corpus CLI measured `744.5 ms ± 4.3 ms` over 10 Hyperfine runs. Sampled peak RSS for the DiffScope process was 5,076 KiB. These numbers are local reference values, not cross-machine performance guarantees.
 
+## Real-world corpus
+
+Generated tiers isolate per-file behavior but do not resemble real diffs: the large tier averages 268 bytes per changed file, while real TypeScript diffs average roughly 16 KiB. Real-repository measurements therefore accompany the generated tiers. These corpora are not committed; recreate them by cloning the repositories and using the pinned revisions.
+
+| Corpus | Repository | Base | Target | Changed files | Analyzed bytes |
+| --- | --- | --- | --- | ---: | ---: |
+| vue-commit | `vuejs/core` | `897924c4f` | `4ab865a84` | 2 | 238,181 |
+| vue-week | `vuejs/core` | `eeff32e51` | `4ab865a84` | 49 | 2,068,989 |
+| vue-patches | `vuejs/core` | `v3.4.0` | `v3.4.15` | 104 | 2,973,234 |
+| vue-minor | `vuejs/core` | `v3.4.0` | `v3.5.0` | 482 | 8,029,520 |
+| vue-span | `vuejs/core` | `v3.0.0` | `v3.5.0` | 737 | 8,647,506 |
+| ts-checker | `microsoft/TypeScript` | `ff7169214` | `fefa70aa1` | 12 | 6,138,304 |
+
+`ts-checker` is one production pull request that edits eight lines of `src/compiler/checker.ts`, a single 2.9 MiB, 52,760-line file. It measures per-file parse cost, because both revisions of that file are parsed in full.
+
+Measured on the machine and toolchain described above, warm filesystem cache, Hyperfine with one warm-up and five runs:
+
+| Corpus | Wall time | Peak RSS |
+| --- | ---: | ---: |
+| vue-commit | 104.4 ms ± 1.1 ms | 8,860 KiB |
+| vue-week | 391.7 ms ± 2.8 ms | — |
+| vue-patches | 679.3 ms ± 4.0 ms | — |
+| vue-minor | 1.919 s ± 0.006 s | 29,356 KiB |
+| vue-span | 2.020 s ± 0.020 s | 32,768 KiB |
+| ts-checker | 1.222 s ± 0.005 s | 69,160 KiB |
+
+Summary line totals match `git diff --numstat --find-renames` exactly for every corpus.
+
 ## Measured optimization
 
 The initial benchmark showed near-linear process overhead because each text blob was loaded with a separate `git cat-file -p` process. The Git adapter now sends all unique affected blob IDs through one `git cat-file --batch` process per analysis. Missing objects remain explicit `Missing` blob outcomes, and binary blobs remain unloaded.
@@ -56,4 +84,23 @@ Criterion measured the following wall-time changes with unchanged result and gol
 | medium | 467.58 ms | 273.23 ms | 41.6% |
 | large | 1,396.5 ms | 778.72 ms | 44.2% |
 
-Further optimization requires a new measurement. In particular, per-file diff and binary detection still invoke Git separately and are candidates only after profiling against this corpus.
+### Whole-range diff collection
+
+Profiling against the real-world corpus confirmed the candidate named above. Hunk collection and binary detection each ran one Git process per changed file, so an analysis spawned `2N + 5` processes: 969 for `vue-minor`. Replaying those 964 per-file calls in isolation took 2.083 s, while the two whole-range calls that carry the same information took 0.115 s together. Per-file process overhead was therefore 57% of that corpus's total runtime.
+
+The Git adapter now reads all hunks from one `git diff --unified=0 --find-renames` over the range and all binary paths from one `git diff --numstat -z`, indexing both by path. Process count is constant at 7 regardless of changed-file count.
+
+| Corpus | Before | After | Improvement |
+| --- | ---: | ---: | ---: |
+| vue-commit | 107.2 ms | 104.4 ms | 2.6% |
+| vue-week | 556.8 ms | 391.7 ms | 29.7% |
+| vue-patches | 1.048 s | 679.3 ms | 35.2% |
+| vue-minor | 3.638 s | 1.919 s | 47.3% |
+| vue-span | 4.568 s | 2.020 s | 55.8% |
+| ts-checker | 1.376 s | 1.222 s | 11.2% |
+
+System time fell from 1.393 s to 0.075 s on `vue-minor` and from 2.135 s to 0.092 s on `vue-span`. Corpora dominated by parsing rather than by file count -- `vue-commit` and `ts-checker` -- improve least, as expected.
+
+Holding the whole range's patch text in memory raised peak RSS on the largest corpora, from 22,720 KiB to 29,356 KiB on `vue-minor` and from 24,636 KiB to 32,768 KiB on `vue-span`. Result and golden tests are unchanged.
+
+Further optimization requires a new measurement. Per-file analysis is now the dominant cost and runs on a single thread; parallel execution is permitted by [`DEFINITIONS.md`](DEFINITIONS.md) and is the next candidate after profiling.
