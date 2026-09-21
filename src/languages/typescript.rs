@@ -398,7 +398,7 @@ fn is_cyclomatic_decision(kind: &str) -> bool {
             | "do_statement"
             | "catch_clause"
             | "ternary_expression"
-            | "case_clause"
+            | "switch_case"
     )
 }
 
@@ -412,7 +412,7 @@ fn is_cognitive_decision(kind: &str) -> bool {
             | "do_statement"
             | "catch_clause"
             | "ternary_expression"
-            | "case_clause"
+            | "switch_case"
     )
 }
 
