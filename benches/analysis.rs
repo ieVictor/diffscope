@@ -4,6 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use diffscope::{
     AnalysisRequest, BlobContent, analyze,
     git::Repository,
+    graph::{self, Direction, Limits, Relation, View, build::Request, canonical_depth},
     imports::index_revision,
     inventory_changes,
     query::{self, FileFilter, FunctionFilter},
@@ -85,6 +86,97 @@ fn import_graph(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// A delta graph is built from one analysis and the import indexes of both
+/// revisions, so it costs one index beyond the target's plus the comparison
+/// between the two. The comparison only follows edges the indexes already hold,
+/// so it is measured against them rather than assumed cheap, and a rendering
+/// runs on every request that asks for one, so each is measured to prove it is
+/// negligible.
+fn impact_graph(criterion: &mut Criterion) {
+    let corpus_root = prepare_corpus();
+    let mut group = criterion.benchmark_group("impact_graph");
+
+    for tier in TIERS {
+        let analysis_request = AnalysisRequest {
+            repository_path: corpus_root.join(tier),
+            base_revision: "HEAD~1".to_owned(),
+            target_revision: "HEAD".to_owned(),
+        };
+        let result = analyze(&analysis_request).expect("benchmark analysis succeeds");
+        let repository =
+            Repository::open(&corpus_root.join(tier)).expect("benchmark repository opens");
+        let base_commit = repository
+            .resolve_revision("HEAD~1")
+            .expect("benchmark revision resolves")
+            .commit_id;
+        let target_commit = repository
+            .resolve_revision("HEAD")
+            .expect("benchmark revision resolves")
+            .commit_id;
+        let base = index_revision(&repository, &base_commit).expect("benchmark index succeeds");
+        let target = index_revision(&repository, &target_commit).expect("benchmark index succeeds");
+        // The request a default query makes: no named root (the changed set),
+        // both directions, every supported relation, and canonical bounds.
+        let request = Request {
+            roots: &[],
+            direction: Direction::Both,
+            relations: Relation::SUPPORTED,
+            depth: canonical_depth(None),
+            view: View::Delta,
+            limits: Limits::canonical(None, None),
+        };
+        let graph = graph::build::build(&result, &base, &target, &request);
+        eprintln!(
+            "{tier}: base_indexed_files={}, target_indexed_files={}, nodes={}, edges={}, truncated={}",
+            base.scanned_files(),
+            target.scanned_files(),
+            graph.nodes().len(),
+            graph.edges().len(),
+            graph.truncated()
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("base_index", tier),
+            &base_commit,
+            |bencher, commit| {
+                bencher.iter(|| {
+                    index_revision(&repository, std::hint::black_box(commit))
+                        .expect("index succeeds")
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("build", tier),
+            &request,
+            |bencher, request| {
+                bencher.iter(|| {
+                    graph::build::build(
+                        std::hint::black_box(&result),
+                        std::hint::black_box(&base),
+                        std::hint::black_box(&target),
+                        std::hint::black_box(request),
+                    )
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("render_dependency_diff", tier),
+            &graph,
+            |bencher, graph| {
+                bencher.iter(|| graph::render::dependency_diff(std::hint::black_box(graph)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("render_mermaid", tier),
+            &graph,
+            |bencher, graph| {
+                bencher.iter(|| graph::render::mermaid(std::hint::black_box(graph)));
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Projecting an analysis into one answer runs on every request, including the
 /// ones served from a cached analysis, so it is the floor on query latency.
 fn query_projection(criterion: &mut Criterion) {
@@ -116,8 +208,19 @@ fn query_projection(criterion: &mut Criterion) {
 fn prepare_corpus() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.join("target/benchmark-corpus");
+    // Each commit the generator makes spawns detached Git auto-maintenance
+    // (`git maintenance run --auto`, which repacks) that outlives the script and
+    // writes into `.git/objects` while the next generation removes that
+    // repository, failing the run on a non-empty directory. The benchmarks only
+    // read the corpus, so packing it is pure noise; disable the detached
+    // maintenance and the legacy auto-gc for the generator's own Git calls.
     let status = Command::new(manifest.join("scripts/generate-benchmark-corpus.sh"))
         .arg(&root)
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0")
         .status()
         .expect("run benchmark corpus generator");
     assert!(status.success(), "benchmark corpus generation failed");
@@ -137,6 +240,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = analysis, import_graph, query_projection
+    targets = analysis, import_graph, impact_graph, query_projection
 }
 criterion_main!(benches);
