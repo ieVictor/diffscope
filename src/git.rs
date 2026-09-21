@@ -626,7 +626,7 @@ mod tests {
 
     use crate::BlobContent;
 
-    use super::{parse_batch_blobs, parse_hunk_header, parse_patch};
+    use super::{parse_batch_blobs, parse_hunk_header, parse_numstat_binary_paths, parse_patch};
 
     #[test]
     fn parses_hunk_header_with_counts() {
@@ -647,6 +647,50 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].removed_lines, 1);
         assert_eq!(hunks[0].added_lines, 2);
+    }
+
+    #[test]
+    fn separates_hunks_of_every_file_in_one_patch() {
+        let by_path = parse_patch(concat!(
+            "diff --git a/one.ts b/one.ts\n--- a/one.ts\n+++ b/one.ts\n",
+            "@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/gone.ts b/gone.ts\n--- a/gone.ts\n+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n-a\n-b\n",
+            "diff --git a/before.ts b/after.ts\n--- a/before.ts\n+++ b/after.ts\n",
+            "@@ -2 +2 @@\n-old\n+new\n",
+        ))
+        .expect("diff parses");
+
+        assert_eq!(by_path.len(), 3);
+        assert_eq!(by_path["one.ts"].len(), 1);
+        assert_eq!(by_path["gone.ts"][0].removed_lines, 2);
+        assert_eq!(by_path["after.ts"][0].added_lines, 1);
+        assert_eq!(by_path["after.ts"][0].base_start, 2);
+    }
+
+    #[test]
+    fn keeps_content_lines_that_look_like_file_headers() {
+        let by_path = parse_patch(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n--- not a header\n+++ also not\n",
+        )
+        .expect("diff parses");
+        let hunks = by_path.get("a").expect("file a has hunks");
+
+        assert_eq!(hunks[0].removed_lines, 1);
+        assert_eq!(hunks[0].added_lines, 1);
+    }
+
+    #[test]
+    fn reads_binary_paths_including_renames_from_numstat() {
+        let binary_paths = parse_numstat_binary_paths(
+            b"1\t1\ttext.ts\0-\t-\timage.bin\0-\t-\t\0old.bin\0new.bin\0",
+        )
+        .expect("numstat parses");
+
+        assert!(binary_paths.contains("image.bin"));
+        assert!(binary_paths.contains("new.bin"));
+        assert!(!binary_paths.contains("text.ts"));
+        assert_eq!(binary_paths.len(), 2);
     }
 
     #[test]
