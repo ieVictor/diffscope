@@ -132,9 +132,9 @@ These are heuristics over naming conventions, not facts about a project. Every r
 
 ## Import graph
 
-Everything above describes files a diff contains. What a change reaches is a question about files it does not contain, so it is answered from an index of the target revision's module graph.
+Everything above describes files a diff contains. What a change reaches is a question about files it does not contain, so it is answered from an index of a revision's module graph.
 
-- Every source file in the target tree is scanned for the specifiers it imports or re-exports. Dynamic `import(...)` is not followed: its argument need not be a literal, and guessing at one would invent edges.
+- Every source file in that revision's tree is scanned for the specifiers it imports or re-exports. Dynamic `import(...)` is not followed: its argument need not be a literal, and guessing at one would invent edges.
 - Only each file's import region is parsed. An import statement's specifier follows the last `import` or `from` token in the statement, so the file is read up to that token plus 512 bytes. On a real Vue revision this recovers every import of all 491 TypeScript files while parsing 56% of their bytes. A file is additionally capped at 64 KiB and reports that it was cut, so an edge is never silently missing.
 - Specifiers resolve against the paths actually present in the revision, trying `.ts`, `.tsx`, `.mts`, `.cts`, `.d.ts`, `.js`, and `.jsx`, then `index` inside a directory.
 - `compilerOptions.paths` from the revision's `tsconfig.json` is applied, longest pattern first. In a monorepo most cross-package imports are written through these aliases — 18.4% of a Vue revision's specifiers are `@vue/*` — and without them every cross-package edge disappears. The file is read with comments and trailing commas tolerated, because TypeScript accepts both. A missing or malformed config yields no aliases rather than an error.
@@ -145,6 +145,126 @@ Everything above describes files a diff contains. What a change reaches is a que
 A test is offered as related to a changed file when it **imports that file directly** (confidence `0.9`) or when its **name matches** the file's, after extensions and test suffixes are removed (confidence `0.8`). Each result states which rule found it.
 
 Indirect imports are deliberately not offered. Through a package's barrel module almost every test reaches almost every file: on a real Vue revision one shared utility is reached by 166 modules within two hops, and the tests that surface are the compiler's, not the utility's. That reach is still reported, as `nearby_importers`, because a large number is itself a useful signal that a file is widely re-exported.
+
+## Change-impact graph
+
+The import graph answers how many modules reach a changed file. The change-impact graph answers **which** modules import it, which tests cover it, and which of those relationships the comparison added or removed. It is built from one comparison's analysis and the import index of each revision, and adds identity, status, a bounded walk, and presentation over them. It resolves nothing of its own: every edge corresponds to a relationship an index already resolved, so the graph and the queries that publish the same relationship cannot disagree about it.
+
+The graph is anchored to one comparison. A module map of a project, or of an unchanged revision, is not produced: nothing in a diff says what a directory means, so the graph reports relationships it resolved and never a judgment about structure.
+
+### Relations
+
+| Relation | Joins | Basis |
+| --- | --- | --- |
+| `imports` | An importer to a module it imports. | A specifier in the importer's import region resolved to a path in that revision. |
+| `tested_by` | A test file to the module it covers. | The test imports the module directly, or its name matches the module's. |
+
+The relation vocabulary is larger than the set DiffScope resolves. A relation outside `imports` and `tested_by` is rejected as `invalid_params` naming the accepted set rather than answered with an empty edge set, because "no such relationship" and "never looked for one" are different statements and only the first would be true.
+
+There is no `imported_by`; it is an `imports` edge read backwards, and storing the reverse as its own relation makes two facts out of one and invites them to disagree. Direction of travel is a property of the walk, not of the edge. There is no generic `depends_on` either: a caller cannot tell whether such an edge came from an import or from a test-name match, so it cannot decide whether to trust it.
+
+### Node and edge status
+
+An edge's status is its membership in the two revisions, never an estimate:
+
+| Present in base | Present in target | Status |
+| --- | --- | --- |
+| no | yes | `added` |
+| yes | no | `removed` |
+| yes | yes | `unchanged` |
+
+An edge has no `modified`. A relationship whose target changed is one removed edge and one added edge, which is exactly what a reader needs to see.
+
+A node's status is stronger than membership, because the analysis already computed it. A module takes the status of the file it names: `added` for a file the change creates, `removed` for one it deletes, `modified` for one the diff otherwise contains (an in-place edit, a rename, or a binary delta), and `unchanged` for a module the diff does not contain. A node is addressed at the path a reader would open: the target path when the file has one, otherwise the base path.
+
+That is why both revisions are indexed. A graph built from the target alone can show what exists now; it cannot prove that anything was removed, and a delta that cannot show a removal is not a delta.
+
+### Resolutions and confidence
+
+Confidence is fixed by how an edge was resolved, never a free-form number, so two runs cannot disagree and a reader can look up what `0.9` meant:
+
+| Relation | Resolution | Confidence | Basis |
+| --- | --- | ---: | --- |
+| `imports` | `resolved_specifier` | 1.0 | An import statement whose specifier resolved to a path in the revision. |
+| `tested_by` | `test_imports_module` | 0.9 | A test file imports the module directly. |
+| `tested_by` | `test_name_matches_module` | 0.8 | A test file's name matches the module's, after extensions and test suffixes are removed. |
+
+The two `tested_by` values are the ones [Related tests](#related-tests) publishes, so a test reported at `0.9` by `get_function_change` cannot appear in a graph at another number.
+
+An `imports` edge carries `evidence`: the importing file and the line its import statement sits on, read from the revision that has the edge — the target for an added or unchanged edge, the base for a removed one. A `tested_by` edge carries none: a name match has no site to point at, and the site of a direct import is the test file's own `imports` edge.
+
+### Traversal
+
+- A walk starts at a root: one changed file, or the changed set. With no root, every changed file becomes a root and the walk proceeds from all of them. A `function_id` root needs call resolution DiffScope does not perform; a request naming one — alone or beside `file` — is rejected as `invalid_params` with a message naming `file` as what is accepted.
+- `direction` decides which way edges are followed: `upstream` follows them backwards — what reaches the root — `downstream` follows them forwards, and `both` (the default) does both.
+- `depth` is hops from the root: `1` by default, clamped to 1–3. One hop of importers and one of imports is what a reviewer reads; a deeper walk is available by request, because depth grows a graph far faster than it grows what the graph says.
+- The walk is breadth-first and records the fewest hops by which each node was reached, matching `ImportIndex::reachable_importers`. A node already seen is not re-queued, but the edge that closed a cycle is kept: a cycle introduced by a change is one of the more interesting things a graph can report.
+- Tests are attached to the modules the walk reached rather than reached by it: every test either revision offers for a module becomes a `tested_by` edge, and the test node sits one hop beyond the module it covers.
+- `view` decides which relationships are shown: `delta` (the default) shows all of them, `base` shows only those present in the base revision, and `target` only those present in the target. A view narrows what is shown; it never rewrites what is true, so an edge shown under `target` still reads `added`.
+- A `file` that is not a changed file in this analysis is rejected as `invalid_params`; the message names the closest known changed paths, the way a detail query names the closest known function ids.
+
+### Truncation
+
+Every walk is bounded and every omission is reported. Budgets default to 30 nodes and 60 edges and are request parameters: `max_nodes` is clamped to 3–100 and `max_edges` to 3–200.
+
+When the node budget is reached, nodes are kept in this order:
+
+1. the root or roots;
+2. changed nodes — `added`, `removed`, or `modified`;
+3. remaining nodes by hop distance, nearest first;
+4. the graph's node ordering, as a total tiebreak.
+
+Hop distance is an input to this order, not a field of the answer: what a caller receives is the bounded graph, and the order is how it was chosen.
+
+Edges are kept when both endpoints were kept, then by the edge ordering. What was dropped is reported rather than hidden:
+
+```json
+{"truncated": true, "omitted": {"nodes": 47, "edges": 83}, "reasons": ["max_nodes"]}
+```
+
+A count is not a substitute for the nodes, but it is the difference between a small graph and a misleading one: a caller that reads `truncated: true` can raise a budget or narrow the root instead of taking the graph for complete. Counts are reported without collapsing — nothing in the graph stands in for the nodes a budget dropped.
+
+### Determinism
+
+Identical inputs produce byte-identical output, including the rendered strings:
+
+- node identities come from stable identities — a repository-relative path — never from iteration order, and a node reached twice keeps the fewest hops it was reached by;
+- nodes are ordered by kind, then path, then label;
+- edges are ordered by source node, then relation, then target node, then resolution, so a removal and the addition that replaced it sit together;
+- render keys `n0`…`nN` are assigned after ordering and truncation, so they are dense and are a function of the delivered graph rather than of the walk that produced it;
+- defaults, traversal, and the truncation preference order are fixed, and labels are sanitized identically every time.
+
+The Mermaid **source** is deterministic; that is what DiffScope controls. Rendered geometry belongs to the Mermaid version and layout engine that draw it, so identical pixels require pinning those.
+
+### Renderings
+
+The dependency diff is one line per edge, ordered by the edge ordering: a removed relationship's line opens with `-`, an added one's with `+`, and an unchanged one's with a space, so every path starts at the same column. Endpoints are paths, not labels: a diff line is read as a place in the repository, and two files sharing a basename are two different files. A relation other than `imports` is named, so a `tested_by` line cannot be read as an import:
+
+```text
+- packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/legacyParser.ts
++ packages/compiler-sfc/src/style/cssVars.ts -> packages/compiler-sfc/src/parse.ts
+  packages/compiler-sfc/src/compileStyle.ts -> packages/compiler-sfc/src/style/cssVars.ts
+```
+
+The Mermaid rendering is a `flowchart LR` document with one fixed `classDef` per node status, so a status never looks like two different things in two answers. A node's box shows its basename, with its status appended unless it is `unchanged`; labels are quoted, quotes are dropped, control characters and whitespace runs collapse to single spaces, and the result is truncated to 64 bytes with `...` appended, so a hostile or merely long path cannot break the syntax or produce an unbounded diagram line. A removed edge renders as `-. "removed" .->`, and an edge below full confidence as `-. "~0.9" .->`: one dashed style for both would make "this relationship is gone" and "this relationship may exist" look alike when they are opposites.
+
+### Visualization recommendation
+
+A graph is produced when asked for, and the answer states whether a diagram is worth rendering and why. Each criterion is a fixed threshold over a measured quantity and contributes one `{code, message, value}` reason in the shape the risk models use; there is no score, because a "diagram score" would be an opaque number where an explainable list works.
+
+A diagram is recommended when at least one positive signal applies and no negative signal does:
+
+| Signal | Trigger |
+| --- | --- |
+| `many_callers` | Three or more relationships point at the root. |
+| `many_dependencies` | The root points at three or more. |
+| `converges_and_branches` | Two or more relationships point at the root and two or more leave it. |
+| `crosses_areas` | The graph spans two or more change areas. |
+| `cycle` | The graph contains a cycle: a node lies on a walk that leaves it and returns. |
+| `changed_on_both_sides` | At least one relationship changed on each side of the root. |
+| `linear_and_small` (negative) | Fewer than four nodes and no branching — no node has more than one relationship entering or leaving it. |
+
+`linear_and_small` is the straight line that should always be a dependency diff, and it overrides every positive signal. The criteria are evaluated over the truncated graph — the graph the reader will actually see — so a diagram is never recommended for a topology the answer does not carry. Change areas reuse the derivation under [Queries](#queries), so "spans two areas" means the same thing here as in a change summary.
 
 ## Risk and review priority
 
@@ -271,6 +391,7 @@ A whole analysis answers every question at once and is far larger than any one q
 | `list_changed_files` | Changed files, ranked, with per-file complexity totals, risk and review priority, change shape, and export changes. Filters: `classification`, `minimum_risk`. |
 | `list_changed_functions` | Changed functions, ranked, with metric deltas, churn, risk and review priority, and match confidence. Filters: `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`. |
 | `get_function_change` | One function in full, with the hunks that touch it, its reach, and its diagnostics. Addressed by `function_id` only. |
+| `get_impact_graph` | The relationships the comparison added, removed, or left in place, walked from one changed `file` or from the changed set and bounded by `direction`, `relations`, `depth`, `view`, `max_nodes`, and `max_edges`; `render` asks for the dependency-diff and Mermaid renderings. |
 | `get_analysis_diagnostics` | Diagnostics for the analysis, optionally scoped to one file. |
 
 Every query answer is wrapped in the common envelope:
@@ -309,6 +430,17 @@ Shared shapes:
 `list_changed_functions` data: `functions` and `page`. Each function carries `function_id`, `file`, `symbol`, `qualified_name`, `kind`, `status`, `classification`, `metrics`, `change`, `risk`, `review_priority`, `match_confidence`, and `range` (`before` and `after`, each `start_line` and `end_line`).
 
 `get_function_change` data: `function` (the same record the list returns), `hunks` (`base_start`, `base_count`, `target_start`, `target_count`) for the hunks touching it, `impact`, and `diagnostics`. Naming a `function_id` the analysis does not contain is an error whose message names the closest known function ids.
+
+`get_impact_graph` data: `root`, `graph`, and `visualization`, plus `dependency_diff` and `mermaid` when `render` asks for them. The answer is not paginated: it is bounded by `max_nodes` and `max_edges`, and a `cursor` is rejected as `invalid_params`.
+
+- `root`: the root the request named, as `kind`, `id`, and `path`; `null` when the request named none and the graph is centered on the changed set.
+- `graph`: `nodes`, `edges`, `truncated`, `omitted`, and `reasons`.
+  - A node carries `id` (`module:<path>`), `key` (`n0`…`nN`), `label` (the path's basename), `kind` (`module`), `path`, and `status`.
+  - An edge carries `from` and `to` node ids, `relation`, `status`, `resolution`, `confidence`, and `evidence` (`file`, `line`) when one site produced it.
+  - `omitted` reports the dropped `nodes` and `edges` counts; `reasons` names the budgets that were reached — `max_nodes`, `max_edges`, or both — and is empty when nothing was dropped.
+- `dependency_diff`: the dependency diff, one line per edge, as described under [Change-impact graph](#change-impact-graph).
+- `mermaid`: the Mermaid `flowchart LR` document.
+- `visualization`: `recommended` and `reasons`, each reason `{code, message, value}`.
 
 `get_analysis_diagnostics` data: `diagnostics`, each with `code`, `severity`, `message`, `path`, and `related_entity_ids`; plus `counts` (`info`, `warnings`, `errors`, `total`).
 

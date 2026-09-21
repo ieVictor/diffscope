@@ -2,7 +2,7 @@
 
 DiffScope answers coding-agent questions from one analysis core and one projection layer. Two transports are shipped, and both return the same answer objects for the same query:
 
-- **MCP** — `diffscope mcp` serves the five queries as Model Context Protocol tools over standard input and output. This is what `diffscope setup` configures, and what a harness that speaks MCP should use.
+- **MCP** — `diffscope mcp` serves the six queries as Model Context Protocol tools over standard input and output. This is what `diffscope setup` configures, and what a harness that speaks MCP should use.
 - **JSONL** — `diffscope --jsonl` serves a versioned request/response protocol over standard input and output for adapters that manage the DiffScope process themselves. It additionally offers an `analyze` method that returns the complete analysis document.
 
 [`DEFINITIONS.md`](DEFINITIONS.md) defines the query semantics both transports carry: filters, ranking, cursors, and the result fields.
@@ -19,11 +19,11 @@ It speaks MCP over standard input and output: stdout carries one JSON-RPC messag
 
 ### Identity
 
-The server advertises `serverInfo` name `diffscope`, the crate version of the binary as its version, the title `DiffScope`, and the `tools` capability, and marks every tool read-only, non-destructive, and idempotent. Its `instructions` describe the workflow rather than the implementation: every tool compares a committed base revision with a committed target revision and requires `repository`, `base`, and `target`; there is no default repository, so a call never analyzes a tree the caller did not name; start with `get_change_summary`, page through the change with `list_changed_files` or `list_changed_functions` (handing `page.next_cursor` back unchanged to continue), read one function in full with `get_function_change`, and check `get_analysis_diagnostics` when an analysis looks incomplete. Every tool reuses the analyses already made in the session.
+The server advertises `serverInfo` name `diffscope`, the crate version of the binary as its version, the title `DiffScope`, and the `tools` capability, and marks every tool read-only, non-destructive, and idempotent. Its `instructions` describe the workflow rather than the implementation: every tool compares a committed base revision with a committed target revision and requires `repository`, `base`, and `target`; there is no default repository, so a call never analyzes a tree the caller did not name; start with `get_change_summary`, page through the change with `list_changed_files` or `list_changed_functions` (handing `page.next_cursor` back unchanged to continue), read one function in full with `get_function_change`, ask `get_impact_graph` when the question is what a change reaches and which relationships it changed, and check `get_analysis_diagnostics` when an analysis looks incomplete. Every tool reuses the analyses already made in the session.
 
 ### Tools
 
-The five tools are exactly:
+The six tools are exactly:
 
 | Tool | Additional parameters | Answers |
 | --- | --- | --- |
@@ -32,6 +32,7 @@ The five tools are exactly:
 | `list_changed_functions` | `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`, `cursor` | Ranked changed functions, cursor-paginated. |
 | `get_function_change` | `function_id` | One function by `function_id`, with its hunks, its reach, and its diagnostics. |
 | `get_analysis_diagnostics` | `file` | Diagnostics, optionally for one file. |
+| `get_impact_graph` | `file`, `direction`, `relations`, `depth`, `view`, `max_nodes`, `max_edges`, `render` | The module relationships a comparison added, removed, or left in place, walked from one changed file or the changed set, with optional dependency-diff and Mermaid renderings. |
 
 Every tool requires three inputs, and none of them has a default:
 
@@ -39,6 +40,8 @@ Every tool requires three inputs, and none of them has a default:
 - `base` and `target` — committed Git revisions, resolved by the repository's ref rules: a commit id, branch, tag, `HEAD`, or an expression such as `HEAD~1`. The working tree and the index are never inputs.
 
 Filter values are the ones the query API defines: `classification` is one of `source`, `test`, `generated`, `vendored`, `lockfile`, `config`, `docs`; `minimum_risk` is one of `low`, `medium`, `high`; `status` is one of `added`, `removed`, `modified`, `unchanged`; `min_complexity_delta` is an integer compared against the larger of a function's cognitive and cyclomatic deltas; `include_unchanged` defaults to `false`; `limit` defaults to `50` and is clamped to 1–200; and `cursor` continues a list. Each tool's input schema is an explicit JSON Schema object with `additionalProperties: false`, so a misspelled parameter is rejected instead of ignored.
+
+`get_impact_graph` takes no filter; its parameters shape the walk. `file` names one changed file to root the graph at, and with none every changed file is a root; `direction` is one of `upstream`, `downstream`, `both` (default `both`); `relations` is any subset of `imports` and `tested_by` (default: every supported relation); `depth` defaults to `1` and is clamped to 1–3; `view` is one of `delta`, `base`, `target` (default `delta`); `max_nodes` and `max_edges` default to `30` and `60` and are clamped to 3–100 and 3–200; and `render` is any subset of `diff` and `mermaid` (default: none), returned as `data.dependency_diff` and `data.mermaid`. Inputs that would ask a question DiffScope does not answer are rejected rather than approximated: the schema advertises those eight parameters and no others, and a request carrying a `function_id` — with or without `file` — is answered as `invalid_params` with a message naming `file` as what roots a graph. A relation outside `imports` and `tested_by` is rejected with a message naming the pair, a `render` name other than `diff` or `mermaid` is rejected, and a `file` the comparison did not change is rejected with the closest known changed paths. Answering any of them with an empty graph would report "nothing found" where the truth is "never asked".
 
 ### Results
 
@@ -81,7 +84,7 @@ Both transports wrap one implementation. They share the analysis cache, the proj
 They differ in framing and in surface:
 
 - MCP relies on JSON-RPC for framing and request identity; the JSONL protocol carries its own `protocol_version` and `id` fields.
-- MCP exposes the five query tools and no `analyze` method; the JSONL protocol also answers `analyze` with the complete analysis document (core output schema version 1).
+- MCP exposes the six query tools and no `analyze` method; the JSONL protocol also answers `analyze` with the complete analysis document (core output schema version 1).
 - Neither transport re-analyzes a comparison it already holds: the process keeps a small number of recent analyses keyed by the commits the revisions resolve to, so a summary followed by a list followed by a detail costs one analysis.
 
 ## Agent workflow
@@ -196,11 +199,12 @@ The process reads one request per line from standard input and writes and flushe
 | `list_changed_files` | Ranked changed files, cursor-paginated. |
 | `list_changed_functions` | Ranked changed functions, cursor-paginated. |
 | `get_function_change` | One function by `function_id`, with the hunks that touch it, its reach, and its diagnostics. |
+| `get_impact_graph` | The module relationships the comparison added, removed, or left in place, with optional dependency-diff and Mermaid renderings. |
 | `get_analysis_diagnostics` | Diagnostics, optionally for one `file`. |
 
-Every method but `get_analysis_diagnostics` and `analyze` consults an index of the target revision's module graph: the summary uses it to rank candidates by review priority, and the list and detail methods additionally report what each changed file reaches — how many modules import it, and the tests likely to cover it. The graph is built on first use and reused, so those methods cost more on a comparison's first query. [`DEFINITIONS.md`](DEFINITIONS.md) defines how the graph is built and what "related" means.
+Every method but `get_analysis_diagnostics` and `analyze` consults the module graph of at least one revision. The summary, list, and detail methods read the index of the target revision: the summary uses it to rank candidates by review priority, and the list and detail methods additionally report what each changed file reaches — how many modules import it, and the tests likely to cover it. `get_impact_graph` reads the index of both revisions, because a relationship can only be reported as removed against the revision that still had it, and a delta built from one revision's edges could not prove a removal. An index is built on first use and reused, so these methods cost more on a comparison's first query; a graph query builds both, and every comparison that touches a commit shares its index. [`DEFINITIONS.md`](DEFINITIONS.md) defines how an index is built and what "related" means.
 
-`params` accepts `function_id`, `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`, and `cursor`. Parameters that do not apply to the method are unused; an unknown parameter is rejected rather than ignored. `limit` defaults to 50 and is clamped to 1–200. Lists paginate by `cursor`; there is no offset parameter. [`DEFINITIONS.md`](DEFINITIONS.md) defines what each query returns and how results are ranked.
+`params` accepts `function_id`, `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`, `cursor`, `direction`, `relations`, `depth`, `view`, `max_nodes`, `max_edges`, and `render`. Parameters that do not apply to the method are unused; an unknown parameter is rejected rather than ignored. `limit` defaults to 50 and is clamped to 1–200. Lists paginate by `cursor`; there is no offset parameter. [`DEFINITIONS.md`](DEFINITIONS.md) defines what each query returns and how results are ranked.
 
 A whole analysis of a 49-file diff exceeds 1 MB, most of it functions the change did not touch. The same comparison's summary is a small fraction of that. Prefer a query, then narrow, rather than retrieving everything.
 
@@ -225,6 +229,7 @@ Every successful response has the same envelope. Transport fields stay at the to
   - `list_changed_files`: `classification`, `minimum_risk`, `limit`.
   - `list_changed_functions`: `file`, `status`, `classification`, `minimum_risk`, `min_complexity_delta`, `include_unchanged`, `limit`.
   - `get_function_change`: `function_id`.
+  - `get_impact_graph`: `file`, `function_id`, `direction`, `relations`, `depth`, `view`, `max_nodes`, `max_edges`, `render` — with the defaults filled in, the bounded budgets echoed as applied, and `relations` and `render` echoed in the fixed order they are applied in.
   - `get_analysis_diagnostics`: `file`.
 - `data` is the method's answer, shaped as described below.
 - `page` is present for `list_changed_files` and `list_changed_functions` and absent otherwise.
@@ -246,6 +251,7 @@ A cursor is opaque. It binds the schema version, the analysis id, the method, th
 - `list_changed_files` returns `{"files":[...]}`: ranked file records with classification, area, line and function counts, aggregate complexity, risk, review priority, change shape, export changes, reach, and diagnostics.
 - `list_changed_functions` returns `{"functions":[...]}`: ranked function records, each addressed by `function_id` and carrying its human-readable `symbol` and `qualified_name`, metrics, churn, risk and review priority, match confidence, and range.
 - `get_function_change` returns `{"function":{...},"hunks":[...],"impact":{...},"diagnostics":[...]}` for the function named by `function_id`.
+- `get_impact_graph` returns `{"root":...,"graph":{...},"visualization":{...}}`, with `root` `null` when the request named none and the graph is centered on the changed set. The graph carries `nodes`, `edges`, `truncated`, `omitted`, and `reasons`; `visualization` carries `recommended` and `reasons`. `dependency_diff` and `mermaid` are added when `render` asks for them.
 - `get_analysis_diagnostics` returns `{"diagnostics":[...],"counts":{"info":0,"warnings":2,"errors":0,"total":2}}`.
 
 [`DEFINITIONS.md`](DEFINITIONS.md) defines every field, the scoring models, and the meaning of `change_shape`.
@@ -273,7 +279,7 @@ The adapter is long-lived and keeps a small number of recent analyses, so the us
 
 Entries are keyed by the commits the two revisions resolve to, never by the revision names. `HEAD` and a branch name point at different commits over time, so caching against a name would serve a stale analysis after the branch moved; a commit is immutable. Resolving the two names costs one `rev-parse` each, against an analysis that costs orders of magnitude more.
 
-The import graph is cached separately and keyed by the target commit alone, because it describes one revision rather than a comparison: every comparison ending at the same commit shares one graph, however many bases they start from.
+Import indexes are cached separately and keyed by the commit each describes, never by a comparison: every comparison that touches a commit shares its index, however many bases or targets it involves, and a graph query holds the indexes of both revisions it compares.
 
 Reuse is not observable in results: a reused analysis answers identically to a fresh one, and it produces the same analysis id. Measured on the corpus in [`PERFORMANCE.md`](PERFORMANCE.md) with the version-1 protocol, a comparison's first query costs 114 ms without the import graph and 540 ms with it; later queries of the same comparison cost 2.5 ms and 9.3 ms.
 
