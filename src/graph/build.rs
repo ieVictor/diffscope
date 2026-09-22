@@ -170,6 +170,7 @@ pub fn build(result: &AnalysisResult, revisions: &Revisions<'_>, request: &Reque
 
     builder.set_completeness(module_completeness(revisions, request.view, &reached));
     builder.apply_view(request.view);
+    collapse_groups(&mut builder, request.limits);
     builder.finish(request.limits)
 }
 
