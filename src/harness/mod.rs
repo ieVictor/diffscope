@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
@@ -11,9 +11,9 @@ use crate::{
     analysis::FunctionChangeStatus,
     analyze,
     git::Repository,
-    graph::{Direction, Limits, View, canonical_depth},
+    graph::{self, Direction, Limits, View, canonical_depth},
     imports,
-    imports::ImportIndex,
+    imports::{ImportIndex, SymbolIndex},
     output,
     query::{
         self, FileFilter, FunctionFilter, Page,
@@ -179,12 +179,26 @@ const MAX_CACHED_INDEXES: usize = 8;
 pub struct HarnessSession {
     cached: Mutex<VecDeque<CacheEntry>>,
     indexes: Mutex<VecDeque<IndexEntry>>,
+    symbols: Mutex<VecDeque<SymbolEntry>>,
 }
 
 struct IndexEntry {
     repository_root: PathBuf,
     commit: String,
     index: Arc<ImportIndex>,
+}
+
+/// One commit's symbol index, and the files it has been grown to cover.
+///
+/// The index describes a commit, so it is keyed by one; the file set it covers
+/// describes a comparison, and two comparisons on one commit admit different
+/// files. The entry is therefore extended in place rather than rebuilt, so a
+/// second comparison neither re-parses what the first already read nor misses
+/// a caller the first never admitted.
+struct SymbolEntry {
+    repository_root: PathBuf,
+    commit: String,
+    index: Arc<SymbolIndex>,
 }
 
 struct CacheEntry {
@@ -273,6 +287,59 @@ impl HarnessSession {
             let _evicted = indexes.pop_front();
         }
         Ok(index)
+    }
+
+    /// Build, or grow, one commit's symbol index so that it covers `paths`.
+    ///
+    /// Only the files the caller admits are parsed, and only the ones a
+    /// cached index does not already hold. Parsing a whole revision at full
+    /// fidelity is what this avoids: it costs 676 ms on a Vue revision before
+    /// the function collector, against 381.5 ms for every file's import
+    /// prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot list the tree or read its blobs.
+    pub fn symbol_index(
+        &self,
+        repository: &Repository,
+        commit: &str,
+        paths: &BTreeSet<String>,
+    ) -> Result<Arc<SymbolIndex>, DiffScopeError> {
+        let root = repository.root().to_path_buf();
+        let existing = self.take_symbols(&root, commit);
+        if let Some(cached) = &existing
+            && paths.iter().all(|path| cached.covers(path))
+        {
+            return Ok(Arc::clone(cached));
+        }
+
+        let index = match &existing {
+            Some(cached) => Arc::new(imports::extend_symbols(repository, commit, cached, paths)?),
+            None => Arc::new(imports::index_symbols(repository, commit, paths)?),
+        };
+        let mut symbols = lock(&self.symbols);
+        symbols.retain(|entry| entry.repository_root != root || entry.commit != commit);
+        symbols.push_back(SymbolEntry {
+            repository_root: root,
+            commit: commit.to_owned(),
+            index: Arc::clone(&index),
+        });
+        while symbols.len() > MAX_CACHED_INDEXES {
+            let _evicted = symbols.pop_front();
+        }
+        Ok(index)
+    }
+
+    fn take_symbols(&self, root: &Path, commit: &str) -> Option<Arc<SymbolIndex>> {
+        let mut symbols = lock(&self.symbols);
+        let position = symbols
+            .iter()
+            .position(|entry| entry.repository_root == root && entry.commit == commit)?;
+        let entry = symbols.remove(position)?;
+        let index = Arc::clone(&entry.index);
+        symbols.push_back(entry);
+        Some(index)
     }
 
     fn take_index(&self, root: &Path, commit: &str) -> Option<Arc<ImportIndex>> {
@@ -528,6 +595,15 @@ pub(crate) fn answer(
 struct Indexes {
     base: Option<Arc<ImportIndex>>,
     target: Option<Arc<ImportIndex>>,
+    /// The exported symbols of each revision, over the files cross-file
+    /// resolution is allowed to parse.
+    ///
+    /// Built only for the one method that resolves across files, and only over
+    /// the changed files, their direct importers, and what they import: a
+    /// whole-revision parse at full fidelity is what that bound exists to
+    /// avoid.
+    base_symbols: Option<Arc<SymbolIndex>>,
+    target_symbols: Option<Arc<SymbolIndex>>,
 }
 
 impl Indexes {
@@ -551,18 +627,28 @@ impl Indexes {
         let target = session
             .import_index(&repository, &result.target.id)
             .map_err(|error| analysis_failed(&error))?;
-        let base = if requirement == ImportGraph::Both {
-            Some(
-                session
-                    .import_index(&repository, &result.base.id)
-                    .map_err(|error| analysis_failed(&error))?,
-            )
-        } else {
-            None
-        };
+        if requirement != ImportGraph::Both {
+            return Ok(Self {
+                target: Some(target),
+                ..Self::default()
+            });
+        }
+
+        let base = session
+            .import_index(&repository, &result.base.id)
+            .map_err(|error| analysis_failed(&error))?;
+        let admitted = graph::build::admitted_files(result, &base, &target);
+        let base_symbols = session
+            .symbol_index(&repository, &result.base.id, &admitted)
+            .map_err(|error| analysis_failed(&error))?;
+        let target_symbols = session
+            .symbol_index(&repository, &result.target.id, &admitted)
+            .map_err(|error| analysis_failed(&error))?;
         Ok(Self {
-            base,
+            base: Some(base),
             target: Some(target),
+            base_symbols: Some(base_symbols),
+            target_symbols: Some(target_symbols),
         })
     }
 
@@ -572,16 +658,29 @@ impl Indexes {
         self.target.as_deref()
     }
 
-    /// Both revisions' graphs.
+    /// Everything the impact graph is built from: both revisions' import
+    /// graphs and both revisions' symbol indexes.
     ///
     /// # Errors
     ///
     /// Returns an internal error when one is missing, which is a bug here
     /// rather than a caller error: [`Method::needs_import_graph`] resolving to
-    /// [`ImportGraph::Both`] is what builds both.
-    fn both(&self) -> Result<(&ImportIndex, &ImportIndex), ProjectionError> {
-        match (self.base.as_deref(), self.target.as_deref()) {
-            (Some(base), Some(target)) => Ok((base, target)),
+    /// [`ImportGraph::Both`] is what builds all four.
+    fn revisions(&self) -> Result<graph::build::Revisions<'_>, ProjectionError> {
+        match (
+            self.base.as_deref(),
+            self.target.as_deref(),
+            self.base_symbols.as_deref(),
+            self.target_symbols.as_deref(),
+        ) {
+            (Some(base), Some(target), Some(base_symbols), Some(target_symbols)) => {
+                Ok(graph::build::Revisions {
+                    base,
+                    target,
+                    base_symbols,
+                    target_symbols,
+                })
+            }
             _ => Err(ProjectionError {
                 code: "internal_error",
                 message: "the impact graph needs both revisions' import graphs".to_owned(),
@@ -623,10 +722,7 @@ fn project(
         Method::ListChangedFunctions => function_list(result, params, indexes.target(), analysis),
         Method::GetFunctionChange => function_detail(result, params, indexes.target()),
         Method::GetAnalysisDiagnostics => diagnostics(result, params),
-        Method::GetImpactGraph => {
-            let (base, target) = indexes.both()?;
-            impact_graph(result, params, base, target)
-        }
+        Method::GetImpactGraph => impact_graph(result, params, &indexes.revisions()?),
     }
 }
 
@@ -775,8 +871,7 @@ fn function_detail(
 fn impact_graph(
     result: &AnalysisResult,
     params: &QueryParams,
-    base: &ImportIndex,
-    target: &ImportIndex,
+    revisions: &graph::build::Revisions<'_>,
 ) -> Result<Projection, ProjectionError> {
     let direction = parse_enum(
         params.direction.as_deref(),
@@ -807,7 +902,7 @@ fn impact_graph(
 
     Ok(Projection {
         query: to_value(&request.applied())?,
-        data: to_value(&query::graph::project(result, base, target, &request))?,
+        data: to_value(&query::graph::project(result, revisions, &request))?,
         page: None,
     })
 }
