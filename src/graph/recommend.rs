@@ -354,6 +354,7 @@ mod tests {
             range_start: (0, 0),
             status: NodeStatus::Unchanged,
             depth: 1,
+            group: None,
         }
     }
 

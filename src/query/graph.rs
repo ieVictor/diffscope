@@ -263,6 +263,10 @@ pub struct NodeView {
     pub kind: &'static str,
     pub path: String,
     pub status: &'static str,
+    /// What the node collapses, when it is a group. Absent otherwise, so a
+    /// caller can tell a group from a file without reading its label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupView>,
 }
 
 impl NodeView {
@@ -274,6 +278,27 @@ impl NodeView {
             kind: node.kind.name(),
             path: node.path.clone(),
             status: node.status.name(),
+            group: node.group.map(GroupView::of),
+        }
+    }
+}
+
+/// How many nodes a group stands for, and what they were.
+///
+/// The count is a quantity rather than a phrase inside the label, because a
+/// caller that ranks or filters on it should not have to read prose; the role
+/// is the stable code the label's noun is built from.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct GroupView {
+    pub size: u32,
+    pub role: &'static str,
+}
+
+impl GroupView {
+    fn of(group: graph::Group) -> Self {
+        Self {
+            size: group.size,
+            role: group.role.name(),
         }
     }
 }

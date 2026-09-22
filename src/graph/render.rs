@@ -91,11 +91,14 @@ fn edge_line(marker: &str, from: &Node, to: &Node, relation: Relation) -> String
 /// A module is its path, because that is the place in the repository a reader
 /// looks for. A function is its path and its qualified name, because two
 /// functions of one file are two different places and a line naming the file
-/// alone would merge them.
+/// alone would merge them. A group is its label — the count and what it
+/// collapses — because a group is not one place, and the path it carries is
+/// the change area its members share rather than a file anyone can open.
 fn endpoint(node: &Node) -> String {
     match node.kind {
         NodeKind::Function => format!("{}::{}", node.path, node.label),
-        NodeKind::Module | NodeKind::Group => node.path.clone(),
+        NodeKind::Group => sanitize(&node.label),
+        NodeKind::Module => node.path.clone(),
     }
 }
 
@@ -290,6 +293,7 @@ mod tests {
             range_start: (0, 0),
             status,
             depth: 1,
+            group: None,
         }
     }
 
@@ -305,6 +309,7 @@ mod tests {
             range_start: (1, 0),
             status,
             depth: 1,
+            group: None,
         }
     }
 
