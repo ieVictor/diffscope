@@ -1108,6 +1108,67 @@ fn a_function_root_answers_with_calls_and_containment() {
 }
 
 #[test]
+fn a_function_root_answers_with_callers_in_other_files() {
+    let repo = caller_repo();
+
+    let listed = serve_all(&[query(
+        &repo,
+        "listed",
+        "list_changed_functions",
+        &json!({ "file": "src/parse.ts" }),
+    )]);
+    let strip_id = function_rows(&listed[0])
+        .iter()
+        .find(|row| row["qualified_name"] == json!("stripComments"))
+        .expect("the changed function is listed")["function_id"]
+        .as_str()
+        .expect("function_id")
+        .to_owned();
+
+    let responses = serve_all(&[query(
+        &repo,
+        "rooted",
+        "get_impact_graph",
+        &json!({ "function_id": strip_id, "render": ["diff"] }),
+    )]);
+    let answer = data(&responses[0]);
+    let edges = answer["graph"]["edges"].as_array().expect("edges");
+
+    let calls = edges
+        .iter()
+        .filter(|edge| edge["relation"] == json!("calls"))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "both callers are edges: {answer}");
+
+    // The surviving caller renames the import, so the edge proves the binding
+    // was followed rather than the local name matched.
+    let kept = calls
+        .iter()
+        .find(|edge| edge["evidence"]["file"] == json!("src/kept.ts"))
+        .unwrap_or_else(|| panic!("the kept caller is an edge: {answer}"));
+    assert_eq!(kept["status"], json!("unchanged"));
+    assert_eq!(kept["resolution"], json!("imported_symbol"));
+    assert_eq!(kept["confidence"], json!(1.0));
+    assert_eq!(kept["to"], json!(format!("function:{strip_id}")));
+
+    // The caller the change deleted exists only in the base, which is exactly
+    // what a delta must be able to say.
+    let gone = calls
+        .iter()
+        .find(|edge| edge["evidence"]["file"] == json!("src/gone.ts"))
+        .unwrap_or_else(|| panic!("the removed caller is an edge: {answer}"));
+    assert_eq!(gone["status"], json!("removed"));
+
+    let diff = answer["dependency_diff"]
+        .as_str()
+        .expect("a dependency diff");
+    assert!(
+        diff.contains("- src/gone.ts::legacy -[calls]-> src/parse.ts::stripComments"),
+        "the removed caller is a removed line: {diff}"
+    );
+}
+
+#[test]
 fn repeated_queries_are_byte_identical() {
     // Determinism is the property every other guarantee rests on: parallel file
     // analysis, throttling, hash-based pairing of ambiguous identities, and the
@@ -1491,6 +1552,26 @@ fn diagnostics_repo() -> TestRepo {
     repo
 }
 
+/// A comparison where a changed function is called from two other files: one
+/// that still calls it, and one the change deleted.
+fn caller_repo() -> TestRepo {
+    const PARSE_BASE: &str =
+        "export function stripComments(text: string) {\n  return text.trim();\n}\n";
+    const PARSE_TARGET: &str = "export function stripComments(text: string) {\n  if (!text) {\n    return \"\";\n  }\n  return text.trim();\n}\n";
+    const KEPT: &str = "import { stripComments as strip } from \"./parse\";\n\nexport function clean(text: string) {\n  return strip(text);\n}\n";
+    const GONE: &str = "import { stripComments } from \"./parse\";\n\nexport function legacy(text: string) {\n  return stripComments(text);\n}\n";
+
+    let repo = TestRepo::with_base();
+    repo.write("src/parse.ts", PARSE_BASE);
+    repo.write("src/kept.ts", KEPT);
+    repo.write("src/gone.ts", GONE);
+    repo.commit("add sources");
+    repo.write("src/parse.ts", PARSE_TARGET);
+    repo.remove("src/gone.ts");
+    repo.commit("change the parser and drop a caller");
+    repo
+}
+
 /// A comparison where one file extracts a helper out of a complex function and
 /// another only edits a function in place.
 fn extraction_repo() -> TestRepo {
@@ -1546,6 +1627,10 @@ impl TestRepo {
             fs::create_dir_all(parent).expect("create parent directory");
         }
         fs::write(path, contents).expect("write source file");
+    }
+
+    fn remove(&self, relative: &str) {
+        fs::remove_file(self.path.join(relative)).expect("remove source file");
     }
 
     fn commit(&self, message: &str) {
