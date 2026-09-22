@@ -613,6 +613,35 @@ pub fn canonical_depth(depth: Option<u32>) -> u32 {
     depth.unwrap_or(DEFAULT_DEPTH).clamp(MIN_DEPTH, MAX_DEPTH)
 }
 
+/// One loop the graph closes: the nodes that can all reach each other.
+///
+/// A cycle is a set rather than a path, because a set of mutually reachable
+/// nodes is what a reader has to treat as one unit, while which of the loops
+/// through it a walk happened to take is an artifact of the walk. Two loops
+/// sharing a node are therefore one cycle, which is also what keeps a node
+/// from being drawn inside two boxes at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycle {
+    /// Short render key, `c0`…`cN`, assigned in the graph's cycle order.
+    pub key: String,
+    /// The identities on the loop, in the graph's node order.
+    pub members: Vec<String>,
+}
+
+impl Cycle {
+    /// How many nodes the loop runs through.
+    #[must_use]
+    pub fn size(&self) -> u32 {
+        count(self.members.len())
+    }
+
+    /// Whether an identity lies on this loop.
+    #[must_use]
+    pub fn contains(&self, id: &str) -> bool {
+        self.members.iter().any(|member| member == id)
+    }
+}
+
 /// One delivered graph: ordered, bounded, and keyed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Graph {
@@ -672,6 +701,73 @@ impl Graph {
     #[must_use]
     pub fn is_root(&self, id: &str) -> bool {
         self.roots.iter().any(|root| root == id)
+    }
+
+    /// Every loop the delivered graph closes.
+    ///
+    /// The walk that produced the graph kept a cycle's closing edge without
+    /// re-queueing the node it led back to, so the loops are already in the
+    /// edge set and this only names them.
+    #[must_use]
+    pub fn cycles(&self) -> Vec<Cycle> {
+        self.cycles_in(View::Delta)
+    }
+
+    /// Every loop one revision's relationships close.
+    ///
+    /// A view narrows which edges are followed and nothing else, so the loops
+    /// of the base and of the target are read out of the delivered graph
+    /// rather than rebuilt: an edge already says which revisions have it, and
+    /// a cycle only one of them closes is a cycle the change introduced or
+    /// removed.
+    ///
+    /// Both the cycles and each cycle's members come out in the graph's own
+    /// node order — a cycle sits where its first member does — so the result
+    /// is a function of the ordered graph and never of how a map was walked.
+    /// Mutual reachability is measured per node because a delivered graph is
+    /// bounded to a hundred nodes, which makes the definition a reader can
+    /// check by walking the picture the one worth implementing.
+    #[must_use]
+    pub fn cycles_in(&self, view: View) -> Vec<Cycle> {
+        let mut outgoing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for edge in self.edges.iter().filter(|edge| view.includes(edge.status)) {
+            outgoing
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
+        }
+        let reaches = self
+            .nodes
+            .iter()
+            .map(|node| reachable(node.id.as_str(), &outgoing))
+            .collect::<Vec<_>>();
+
+        let mut cycles: Vec<Cycle> = Vec::new();
+        let mut placed: BTreeSet<&str> = BTreeSet::new();
+        for (position, node) in self.nodes.iter().enumerate() {
+            let id = node.id.as_str();
+            // A node lies on a loop exactly when leaving it can return to it,
+            // which covers the one-node loop a self-relationship draws.
+            if placed.contains(id) || !reaches[position].contains(id) {
+                continue;
+            }
+            let members = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(other, candidate)| {
+                    reaches[position].contains(candidate.id.as_str())
+                        && reaches[*other].contains(id)
+                })
+                .map(|(_, candidate)| candidate.id.as_str())
+                .collect::<Vec<_>>();
+            placed.extend(members.iter().copied());
+            cycles.push(Cycle {
+                key: format!("c{}", cycles.len()),
+                members: members.into_iter().map(str::to_owned).collect(),
+            });
+        }
+        cycles
     }
 }
 
@@ -981,6 +1077,30 @@ fn keep_nodes(ordered: &[&Node], roots: &BTreeSet<String>, max_nodes: usize) -> 
         .take(max_nodes)
         .map(|(_, node)| node.id.clone())
         .collect()
+}
+
+/// Everything one identity reaches by following relationships forwards.
+///
+/// The start is in the result only when a path returns to it, which is what
+/// makes membership in a loop a question this answers rather than a special
+/// case the caller has to add.
+fn reachable<'a>(start: &'a str, outgoing: &BTreeMap<&'a str, Vec<&'a str>>) -> BTreeSet<&'a str> {
+    let mut seen = BTreeSet::new();
+    let mut queue = outgoing
+        .get(start)
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect::<VecDeque<_>>();
+    while let Some(current) = queue.pop_front() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(next) = outgoing.get(current) {
+            queue.extend(next.iter().copied());
+        }
+    }
+    seen
 }
 
 /// One node a walk reached, and the fewest hops it took to reach it.

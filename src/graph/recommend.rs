@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::graph::{EdgeStatus, Graph};
+use crate::graph::{Cycle, EdgeStatus, Graph, View};
 use crate::query::change_area;
 
 /// Relationships on one side of the root that make that side worth showing.
@@ -134,17 +134,7 @@ pub fn evaluate(graph: &Graph) -> Recommendation {
             areas,
         ));
     }
-    let cyclic = cyclic_nodes(graph);
-    if cyclic > 0 {
-        reasons.push(signal(
-            "cycle",
-            format!(
-                "the graph contains a cycle through {}",
-                counted(cyclic, "node")
-            ),
-            cyclic,
-        ));
-    }
+    reasons.extend(cycle_signals(graph));
     if changed_inbound > 0 && changed_outbound > 0 {
         reasons.push(signal(
             "changed_on_both_sides",
@@ -266,57 +256,60 @@ fn area_count(graph: &Graph) -> u32 {
     )
 }
 
-/// The number of nodes that lie on at least one directed cycle.
+/// What the graph's loops are worth saying.
 ///
-/// A node lies on a cycle when a walk that leaves it along its outgoing
-/// relationships returns to it: the definition a reader can check by walking
-/// the picture. Each node is counted once however many cycles pass through it,
-/// and a self-loop counts, because one relationship that leaves and returns is
-/// a cycle of one. The walk repeats per node because a delivered graph is
-/// bounded to a hundred nodes, which makes the plainest definition affordable.
-fn cyclic_nodes(graph: &Graph) -> u32 {
-    let outgoing = outgoing_edges(graph);
+/// Two facts, in the order a reader needs them: that the graph loops at all,
+/// measured over the nodes the loops run through, and — the stronger fact —
+/// that the change is what closed one of them.
+fn cycle_signals(graph: &Graph) -> Vec<Signal> {
+    let mut signals = Vec::new();
+    let cyclic = graph.cycles().iter().map(Cycle::size).sum::<u32>();
+    if cyclic > 0 {
+        signals.push(signal(
+            "cycle",
+            format!(
+                "the graph contains a cycle through {}",
+                counted(cyclic, "node")
+            ),
+            cyclic,
+        ));
+    }
+    let introduced = introduced_cycles(graph);
+    if introduced > 0 {
+        signals.push(signal(
+            "cycle_introduced",
+            format!(
+                "the change closes {}; the target loops where the base did not",
+                counted(introduced, "cycle")
+            ),
+            introduced,
+        ));
+    }
+    signals
+}
+
+/// The number of loops the target closes and the base did not.
+///
+/// Every edge already says which revisions have it, so the two revisions'
+/// loops are read out of the one delivered graph by following only the edges
+/// each revision has: no second graph is built, and nothing here re-reads a
+/// repository. A loop counts as introduced when its exact set of nodes is a
+/// loop in the target and is not one in the base, so a cycle both revisions
+/// close reports nothing while one the change grew a node into is the new
+/// loop it is.
+fn introduced_cycles(graph: &Graph) -> u32 {
+    let before = graph
+        .cycles_in(View::Base)
+        .into_iter()
+        .map(|cycle| cycle.members)
+        .collect::<BTreeSet<_>>();
     count(
         graph
-            .nodes()
-            .iter()
-            .filter(|node| returns_to(&node.id, &outgoing))
+            .cycles_in(View::Target)
+            .into_iter()
+            .filter(|cycle| !before.contains(&cycle.members))
             .count(),
     )
-}
-
-/// Outgoing node identities by source identity.
-fn outgoing_edges(graph: &Graph) -> BTreeMap<&str, Vec<&str>> {
-    let mut outgoing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for edge in graph.edges() {
-        outgoing
-            .entry(edge.from.as_str())
-            .or_default()
-            .push(edge.to.as_str());
-    }
-    outgoing
-}
-
-/// Whether following outgoing relationships from `start` returns to it.
-fn returns_to(start: &str, outgoing: &BTreeMap<&str, Vec<&str>>) -> bool {
-    let Some(first) = outgoing.get(start) else {
-        // Nothing leaves the node, so nothing can come back to it.
-        return false;
-    };
-    let mut frontier = first.clone();
-    let mut seen = BTreeSet::new();
-    while let Some(current) = frontier.pop() {
-        if current == start {
-            return true;
-        }
-        if !seen.insert(current) {
-            continue;
-        }
-        if let Some(next) = outgoing.get(current) {
-            frontier.extend(next.iter().copied());
-        }
-    }
-    false
 }
 
 /// A count with its noun, spelled out for the case that can be singular.
@@ -846,9 +839,9 @@ mod tests {
     #[test]
     fn reasons_are_emitted_in_the_fixed_criterion_order() {
         // One graph earns every signal at once: three callers converge on the
-        // root, three dependencies branch from it, one caller closes a cycle
-        // through the root, the paths span three areas, and the change altered
-        // a relationship on each side.
+        // root, three dependencies branch from it, one added caller closes a
+        // cycle through the root that the base did not have, the paths span
+        // three areas, and the change altered a relationship on each side.
         let graph = graph(
             &[
                 "packages/a/root.ts",
@@ -900,6 +893,7 @@ mod tests {
                 "converges_and_branches",
                 "crosses_areas",
                 "cycle",
+                "cycle_introduced",
                 "changed_on_both_sides",
             ]
         );
@@ -908,7 +902,7 @@ mod tests {
                 .iter()
                 .map(|signal| signal.value)
                 .collect::<Vec<_>>(),
-            [3, 3, 3, 3, 3, 2]
+            [3, 3, 3, 3, 3, 1, 2]
         );
     }
 }

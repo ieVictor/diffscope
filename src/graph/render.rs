@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{Edge, EdgeStatus, Graph, Node, NodeKind, NodeStatus, Relation};
+use super::{Cycle, Edge, EdgeStatus, Graph, Node, NodeKind, NodeStatus, Relation};
 
 /// Longest label a diagram line may carry before it is truncated.
 ///
@@ -120,7 +120,34 @@ pub fn mermaid(graph: &Graph) -> String {
         );
     }
 
+    // A loop drawn as an arrow back across the diagram is a shape the reader
+    // has to trace; the same loop drawn as a box is one they can see. The
+    // members are declared here so the boxes inside are the subgraph's, and
+    // every later mention is the bare key an edge line carries.
     let mut declared = BTreeSet::new();
+    for cycle in graph.cycles() {
+        let members = cycle
+            .members
+            .iter()
+            .filter_map(|id| graph.node(id))
+            .collect::<Vec<_>>();
+        // A relationship that leaves one node and returns to it already reads
+        // as a loop; a box around the single node it runs through would add a
+        // frame and no information.
+        if members.len() < 2 {
+            continue;
+        }
+        push_line(
+            &mut output,
+            &format!("    subgraph {}[\"{}\"]", cycle.key, cycle_label(&cycle)),
+        );
+        for node in members {
+            let member = reference(node, &mut declared);
+            push_line(&mut output, &format!("        {member}"));
+        }
+        push_line(&mut output, "    end");
+    }
+
     for edge in graph.edges() {
         let (Some(from), Some(to)) = (graph.node(&edge.from), graph.node(&edge.to)) else {
             continue;
@@ -166,6 +193,16 @@ fn reference(node: &Node, declared: &mut BTreeSet<String>) -> String {
 /// The declaration of a node: its key, with the label quoted.
 fn declaration(node: &Node) -> String {
     format!("{}[\"{}\"]", node.key, label(node))
+}
+
+/// The caption a cycle's box carries.
+///
+/// A loop has no name in the repository, so the caption states what it is and
+/// how large it is and invents nothing: a description written for a diagram is
+/// neither reproducible nor checkable against the code. Only a loop of two or
+/// more nodes is ever drawn, so the noun is always plural.
+fn cycle_label(cycle: &Cycle) -> String {
+    format!("cycle · {} nodes", cycle.size())
 }
 
 /// The text a node's box shows.
