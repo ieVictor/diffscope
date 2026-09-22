@@ -357,25 +357,22 @@ pub fn index_revision(
         }
 
         for (specifier, line) in &scan.specifiers {
-            match resolve(specifier, &entry.path, &paths, &aliases) {
-                Some(target) => {
-                    index
-                        .targets
-                        .entry(entry.path.clone())
-                        .or_default()
-                        .insert(specifier.clone(), target.clone());
-                    index.add_edge(&entry.path, &target, *line);
-                }
+            if let Some(target) = resolve(specifier, &entry.path, &paths, &aliases) {
+                index
+                    .targets
+                    .entry(entry.path.clone())
+                    .or_default()
+                    .insert(specifier.clone(), target.clone());
+                index.add_edge(&entry.path, &target, *line);
+            } else {
                 // An unresolved specifier names something outside this
                 // revision, almost always an installed package. It is counted,
                 // not guessed at.
-                None => {
-                    *index
-                        .unresolved_by_file
-                        .entry(entry.path.clone())
-                        .or_default() += 1;
-                    index.unresolved += 1;
-                }
+                *index
+                    .unresolved_by_file
+                    .entry(entry.path.clone())
+                    .or_default() += 1;
+                index.unresolved += 1;
             }
         }
         if !scan.bindings.is_empty() {
