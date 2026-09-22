@@ -541,6 +541,58 @@ mod tests {
     }
 
     #[test]
+    fn a_guessed_edge_is_told_apart_from_a_removed_one_at_a_glance() {
+        // A reader has to see which arrows are guesses without reading the
+        // node names: the guess states its confidence where a removal states
+        // that it is gone.
+        let guessed = graph_of(
+            &[
+                ("src/a.ts", NodeStatus::Modified),
+                ("src/b.ts", NodeStatus::Unchanged),
+            ],
+            &[edge(
+                "src/a.ts",
+                "src/b.ts",
+                EdgeStatus::Added,
+                Relation::PossibleCall,
+                Resolution::PropertyNameMatch,
+            )],
+        );
+        let gone = graph_of(
+            &[
+                ("src/a.ts", NodeStatus::Modified),
+                ("src/b.ts", NodeStatus::Removed),
+            ],
+            &[edge(
+                "src/a.ts",
+                "src/b.ts",
+                EdgeStatus::Removed,
+                Relation::Imports,
+                Resolution::ResolvedSpecifier,
+            )],
+        );
+
+        let dashed = |document: String| {
+            document
+                .lines()
+                .find(|line| line.contains("-. "))
+                .expect("the edge is drawn dashed")
+                .to_owned()
+        };
+        let guessed_line = dashed(mermaid(&guessed));
+        let removed_line = dashed(mermaid(&gone));
+
+        assert!(guessed_line.contains("-. \"~0.5\" .->"), "{guessed_line}");
+        assert_ne!(guessed_line, removed_line);
+        // The dependency diff names the relation, so the compact rendering
+        // says it is a guess too.
+        assert_eq!(
+            dependency_diff(&guessed),
+            "+ src/a.ts -[possible_call]-> src/b.ts\n"
+        );
+    }
+
+    #[test]
     fn a_re_export_is_told_apart_from_the_import_beside_it() {
         // A barrel module both imports and forwards the module it re-exports,
         // so two bare arrows between one pair of boxes would say nothing about

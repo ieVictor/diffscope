@@ -3096,6 +3096,228 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------- heuristic calls ---
+
+    /// The `possible_call` edge between two published function identities.
+    fn guessed_edge<'a>(graph: &'a Graph, from: &str, to: &str) -> Option<&'a Edge> {
+        graph.edges().iter().find(|edge| {
+            edge.relation == Relation::PossibleCall
+                && edge.from == Node::function_id(from)
+                && edge.to == Node::function_id(to)
+        })
+    }
+
+    /// An index in which `src/a.ts` calls a method on a default import of
+    /// every module given, which no exact rule can resolve.
+    fn imports_objects(modules: &[&str]) -> ImportIndex {
+        let mut index = ImportIndex::default();
+        for (position, module) in modules.iter().enumerate() {
+            index.bind(
+                "src/a.ts",
+                &format!("handlers{position}"),
+                ImportedName::Default,
+                &format!("./{position}"),
+                module,
+                2,
+            );
+        }
+        index
+    }
+
+    #[test]
+    fn a_property_call_matching_one_function_is_a_possible_call_at_half_confidence() {
+        let file = rooted(&[], &[site("stripComments", Some("handlers0"), 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let index = imports_objects(&["src/parse.ts"]);
+        let symbols = with_root(&[("src/parse.ts", declares("stripComments", 12, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let callee = external_id("src/parse.ts", "stripComments", "target", 12);
+        let edge = guessed_edge(&graph, &root_id, &callee).expect("one name, one candidate");
+        assert_eq!(edge.resolution, Resolution::PropertyNameMatch);
+        assert!((edge.confidence() - 0.5).abs() < f64::EPSILON);
+        // Only the target side writes the call, and the site is the caller's
+        // own file.
+        assert_eq!(edge.status, EdgeStatus::Added);
+        assert_eq!(
+            edge.evidence.as_ref().map(|evidence| evidence.line),
+            Some(7)
+        );
+        // A guess never doubles as a proof.
+        assert!(call_edge(&graph, &root_id, &callee).is_none());
+    }
+
+    #[test]
+    fn a_property_name_two_modules_share_produces_nothing() {
+        let file = rooted(&[], &[site("stripComments", Some("handlers0"), 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let index = imports_objects(&["src/parse.ts", "src/legacy.ts"]);
+        let symbols = with_root(&[
+            ("src/parse.ts", declares("stripComments", 12, Vec::new())),
+            ("src/legacy.ts", declares("stripComments", 30, Vec::new())),
+        ]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        // Two candidates are no answer: naming one of them would be a coin
+        // toss a reader cannot check.
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.relation != Relation::PossibleCall)
+        );
+        assert!(
+            function_node(&graph, &external_id("src/parse.ts", "stripComments", "target", 12))
+                .is_none()
+        );
+        assert!(
+            function_node(
+                &graph,
+                &external_id("src/legacy.ts", "stripComments", "target", 30)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_guess_is_delivered_only_to_a_request_that_names_it() {
+        let file = rooted(&[], &[site("stripComments", Some("handlers0"), 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let index = imports_objects(&["src/parse.ts"]);
+        let symbols = with_root(&[("src/parse.ts", declares("stripComments", 12, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+        let callee = external_id("src/parse.ts", "stripComments", "target", 12);
+
+        let default = Relation::by_default();
+        let proven = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, &default, DEFAULT_DEPTH),
+        );
+        assert!(
+            proven
+                .edges()
+                .iter()
+                .all(|edge| edge.relation != Relation::PossibleCall)
+        );
+        // The guessed callee is not in the graph at all: nothing proven
+        // reaches it.
+        assert!(function_node(&proven, &callee).is_none());
+
+        let asked = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, &[Relation::PossibleCall], DEFAULT_DEPTH),
+        );
+        assert!(guessed_edge(&asked, &root_id, &callee).is_some());
+    }
+
+    #[test]
+    fn a_property_call_in_an_importer_is_a_possible_caller_of_the_root() {
+        let file = rooted(&[], &[]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/direct.ts",
+            "core",
+            ImportedName::Default,
+            "./a",
+            "src/a.ts",
+            1,
+        );
+        let symbols = with_root(&[(
+            "src/direct.ts",
+            declares("direct", 5, vec![site("root", Some("core"), 6)]),
+        )]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let caller = external_id("src/direct.ts", "direct", "target", 5);
+        let edge = guessed_edge(&graph, &caller, &root_id).expect("the importer may call the root");
+        assert_eq!(edge.resolution, Resolution::PropertyNameMatch);
+        // The site is the importing file, not the root's.
+        assert_eq!(
+            edge.evidence
+                .as_ref()
+                .map(|evidence| evidence.file.as_str()),
+            Some("src/direct.ts")
+        );
+        assert!(call_edge(&graph, &caller, &root_id).is_none());
+    }
+
+    #[test]
+    fn a_guessed_graph_is_identical_across_two_builds_of_one_input() {
+        let file = rooted(&[], &[site("stripComments", Some("handlers0"), 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let index = imports_objects(&["src/parse.ts"]);
+        let symbols = with_root(&[("src/parse.ts", declares("stripComments", 12, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+        let build_once = || {
+            let graph = build(
+                &result,
+                &revisions,
+                &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+            );
+            (
+                graph.edges().to_vec(),
+                render::dependency_diff(&graph),
+                render::mermaid(&graph),
+            )
+        };
+
+        let once = build_once();
+        assert_eq!(build_once(), once);
+        assert!(once.1.contains("-[possible_call]->"));
+        assert!(once.2.contains("-. \"~0.5\" .->"));
+    }
+
     /// One index in which every path imports `src/core.ts`.
     fn importers_of_core(importers: &[String]) -> ImportIndex {
         let edges = importers
