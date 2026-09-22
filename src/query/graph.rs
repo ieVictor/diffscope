@@ -187,6 +187,7 @@ fn answer_of(graph: &Graph, request: &GraphRequest, root: Option<RootView>) -> G
             },
             reasons: graph.reasons().iter().map(|reason| reason.name()).collect(),
         },
+        completeness: CompletenessView::of(graph.completeness()),
         dependency_diff: request
             .render
             .diff
@@ -369,6 +370,33 @@ pub struct GraphView {
     pub reasons: Vec<&'static str>,
 }
 
+/// What the examined graph scope could not represent or resolve.
+///
+/// Always present: zero says the scope was complete on that dimension, unlike
+/// an absent field which says no completeness contract was supplied.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletenessView {
+    pub scan_truncated_files: u32,
+    pub unresolved_specifiers: u32,
+    pub unresolved_calls: u32,
+    pub relations_supported: Vec<&'static str>,
+}
+
+impl CompletenessView {
+    fn of(completeness: &graph::Completeness) -> Self {
+        Self {
+            scan_truncated_files: completeness.scan_truncated_files,
+            unresolved_specifiers: completeness.unresolved_specifiers,
+            unresolved_calls: completeness.unresolved_calls,
+            relations_supported: completeness
+                .relations_supported
+                .iter()
+                .map(|relation| relation.name())
+                .collect(),
+        }
+    }
+}
+
 /// Whether a diagram is worth drawing, and the signals that decided it.
 #[derive(Debug, Clone, Serialize)]
 pub struct VisualizationView {
@@ -396,6 +424,7 @@ pub struct GraphAnswer {
     /// root from an absent field.
     pub root: Option<RootView>,
     pub graph: GraphView,
+    pub completeness: CompletenessView,
     /// The dependency diff, exactly when it was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_diff: Option<String>,
@@ -634,8 +663,27 @@ fn renderings(requested: &[String]) -> Result<Renderings, GraphRequestError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Renderings, affinity, relations, renderings};
-    use crate::graph::Relation;
+    use super::{CompletenessView, Renderings, affinity, relations, renderings};
+    use crate::graph::{Completeness, Relation};
+
+    #[test]
+    fn completeness_serializes_zeros_and_supported_relations_without_a_request() {
+        let value = serde_json::to_value(CompletenessView::of(&Completeness::default()))
+            .expect("a completeness view serializes");
+
+        assert_eq!(value["scan_truncated_files"], 0);
+        assert_eq!(value["unresolved_specifiers"], 0);
+        assert_eq!(value["unresolved_calls"], 0);
+        assert_eq!(
+            value["relations_supported"],
+            serde_json::json!(
+                Relation::SUPPORTED
+                    .iter()
+                    .map(|relation| relation.name())
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
 
     #[test]
     fn a_relation_list_is_normalized_to_the_supported_order() {

@@ -675,12 +675,37 @@ impl Cycle {
     }
 }
 
+/// What the graph build could not represent or resolve in its examined scope.
+///
+/// This is domain data, not a transport view. The builder records it before
+/// grouping and delivery budgets, so a smaller answer cannot make its source
+/// look more complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completeness {
+    pub scan_truncated_files: u32,
+    pub unresolved_specifiers: u32,
+    pub unresolved_calls: u32,
+    pub relations_supported: Vec<Relation>,
+}
+
+impl Default for Completeness {
+    fn default() -> Self {
+        Self {
+            scan_truncated_files: 0,
+            unresolved_specifiers: 0,
+            unresolved_calls: 0,
+            relations_supported: Relation::SUPPORTED.to_vec(),
+        }
+    }
+}
+
 /// One delivered graph: ordered, bounded, and keyed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Graph {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     roots: Vec<String>,
+    completeness: Completeness,
     truncated: bool,
     omitted_nodes: u32,
     omitted_edges: u32,
@@ -722,6 +747,13 @@ impl Graph {
     #[must_use]
     pub fn reasons(&self) -> &[TruncationReason] {
         &self.reasons
+    }
+
+    /// What the graph build could not represent or resolve in its examined
+    /// scope, independently of what delivery budgets later omitted.
+    #[must_use]
+    pub fn completeness(&self) -> &Completeness {
+        &self.completeness
     }
 
     /// The node an identity refers to.
@@ -820,6 +852,7 @@ pub struct GraphBuilder {
     nodes: BTreeMap<String, Node>,
     edges: BTreeMap<(String, Relation, String, Resolution), Edge>,
     roots: BTreeSet<String>,
+    completeness: Completeness,
     /// Nodes a budget, rather than a grouping rule, is why a caller cannot see
     /// individually. Reported as omitted, because raising the budget brings
     /// them back.
@@ -849,6 +882,11 @@ impl GraphBuilder {
     /// Mark an identity already added as a node the walk started from.
     pub fn add_root(&mut self, id: String) {
         self.roots.insert(id);
+    }
+
+    /// Set the build's pre-presentation completeness information.
+    pub fn set_completeness(&mut self, completeness: Completeness) {
+        self.completeness = completeness;
     }
 
     /// Add an edge, or keep the one already present.
@@ -1037,6 +1075,7 @@ impl GraphBuilder {
             nodes,
             edges,
             roots,
+            completeness,
             omitted_by_budget,
         } = self;
 
@@ -1082,6 +1121,7 @@ impl GraphBuilder {
             omitted_edges: count(total_edges - ordered_edges.len()),
             truncated: !reasons.is_empty(),
             reasons,
+            completeness,
             nodes: ordered,
             edges: ordered_edges,
             roots,

@@ -63,6 +63,11 @@ pub struct ImportIndex {
     /// Files scanned only up to the import scan limit, whose later imports are
     /// therefore not represented.
     truncated: BTreeSet<String>,
+    /// Specifiers that named no file in this revision, by importing file.
+    ///
+    /// The total remains available for revision-wide reporting; graph queries
+    /// need this partition to describe only the files they examined.
+    unresolved_by_file: BTreeMap<String, u32>,
     /// Specifiers that named no file in this revision, such as npm packages.
     unresolved: u32,
     /// Every source file scanned, whether or not it takes part in an edge.
@@ -193,6 +198,17 @@ impl ImportIndex {
         self.unresolved
     }
 
+    /// Unresolved specifiers written by the named files.
+    ///
+    /// Paths absent from this revision contribute zero, so a graph can retain
+    /// one scope per revision without first intersecting it with the index.
+    #[must_use]
+    pub fn unresolved_specifiers_in(&self, files: &BTreeSet<String>) -> u32 {
+        files.iter().fold(0_u32, |total, path| {
+            total.saturating_add(self.unresolved_by_file.get(path).copied().unwrap_or(0))
+        })
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.outbound.is_empty()
@@ -277,7 +293,15 @@ impl ImportIndex {
             },
         );
         self.files.insert(from.to_owned());
+        *self.unresolved_by_file.entry(from.to_owned()).or_default() += 1;
         self.unresolved += 1;
+    }
+
+    /// Mark one test index file as having reached the import scan cap.
+    #[cfg(test)]
+    pub(crate) fn truncate(&mut self, path: &str) {
+        self.files.insert(path.to_owned());
+        self.truncated.insert(path.to_owned());
     }
 
     /// Record a re-export's resolved specifier without binding a local name.
@@ -345,7 +369,13 @@ pub fn index_revision(
                 // An unresolved specifier names something outside this
                 // revision, almost always an installed package. It is counted,
                 // not guessed at.
-                None => index.unresolved += 1,
+                None => {
+                    *index
+                        .unresolved_by_file
+                        .entry(entry.path.clone())
+                        .or_default() += 1;
+                    index.unresolved += 1;
+                }
             }
         }
         if !scan.bindings.is_empty() {

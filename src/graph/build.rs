@@ -19,8 +19,8 @@ use crate::{
     FileStatus,
     analysis::FunctionChangeStatus,
     graph::{
-        Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, GroupRole, Limits, Node,
-        NodeKind, NodeStatus, Reached, Relation, Resolution, View, walk,
+        Completeness, Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, GroupRole, Limits,
+        Node, NodeKind, NodeStatus, Reached, Relation, Resolution, View, walk,
     },
     imports::{ExportedDefinition, ImportIndex, SymbolIndex},
     languages::{CallSite, ImportedName, SourceRange, symbol_id},
@@ -168,8 +168,8 @@ pub fn build(result: &AnalysisResult, revisions: &Revisions<'_>, request: &Reque
         add_re_export_edges(&mut builder, revisions, &reached);
     }
 
+    builder.set_completeness(module_completeness(revisions, request.view, &reached));
     builder.apply_view(request.view);
-    collapse_groups(&mut builder, request.limits);
     builder.finish(request.limits)
 }
 
@@ -236,10 +236,28 @@ fn function_graph(
         changed: changed_files(result),
         guess: request.relations.contains(&Relation::PossibleCall),
     };
+    let mut unresolved = UnresolvedCalls::default();
     let mut calls = local_calls(functions, &path, &locals);
 
-    add_cross_file_callees(&mut calls, &mut places, &resolver, &path, functions, &locals);
-    add_cross_file_callers(&mut calls, &mut places, &resolver, file, &path);
+    add_cross_file_callees(
+        &mut calls,
+        &mut unresolved,
+        &mut places,
+        &resolver,
+        &path,
+        functions,
+        &locals,
+        request.view,
+    );
+    add_cross_file_callers(
+        &mut calls,
+        &mut unresolved,
+        &mut places,
+        &resolver,
+        file,
+        &path,
+        request.view,
+    );
 
     let (outgoing, incoming) = call_adjacency(&calls, request.relations);
     let root_id = function_node_id(file, root);
@@ -277,9 +295,82 @@ fn function_graph(
         );
     }
 
+    let mut completeness = function_completeness(revisions, file, &path, request.view);
+    completeness.unresolved_calls = unresolved.count();
+    builder.set_completeness(completeness);
     builder.apply_view(request.view);
     collapse_groups(&mut builder, request.limits);
     builder.finish(request.limits)
+}
+
+/// Completeness for the module paths the request's walk examined.
+///
+/// The reached set is captured before view filtering, grouping, and delivery
+/// budgets. A one-sided view counts only its selected revision; delta counts
+/// the union of both side-specific observations.
+fn module_completeness(
+    revisions: &Revisions<'_>,
+    view: View,
+    reached: &Reached,
+) -> Completeness {
+    let scope = reached
+        .keys()
+        .map(|id| path_of(id).to_owned())
+        .collect::<BTreeSet<_>>();
+    index_completeness(revisions, view, &scope, &scope)
+}
+
+/// Completeness of named source-file scopes on the relevant revision sides.
+fn index_completeness(
+    revisions: &Revisions<'_>,
+    view: View,
+    base_scope: &BTreeSet<String>,
+    target_scope: &BTreeSet<String>,
+) -> Completeness {
+    let mut completeness = Completeness::default();
+    for (side, scope) in [(Side::Base, base_scope), (Side::Target, target_scope)] {
+        if !view_includes_side(view, side) {
+            continue;
+        }
+        let (index, _) = revisions.side(side);
+        completeness.scan_truncated_files = completeness
+            .scan_truncated_files
+            .saturating_add(u32::try_from(index.truncated_files().intersection(scope).count()).unwrap_or(u32::MAX));
+        completeness.unresolved_specifiers = completeness
+            .unresolved_specifiers
+            .saturating_add(index.unresolved_specifiers_in(scope));
+    }
+    completeness
+}
+
+/// Whether a response view reports information observed on this revision side.
+const fn view_includes_side(view: View, side: Side) -> bool {
+    matches!(
+        (view, side),
+        (View::Delta, _) | (View::Base, Side::Base) | (View::Target, Side::Target)
+    )
+}
+
+/// Completeness for the source files function resolution inspected.
+fn function_completeness(
+    revisions: &Revisions<'_>,
+    file: &FileResult,
+    path: &str,
+    view: View,
+) -> Completeness {
+    let base_scope = file
+        .base_path
+        .iter()
+        .chain(revisions.base.importers(path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let target_scope = file
+        .target_path
+        .iter()
+        .chain(revisions.target.importers(path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    index_completeness(revisions, view, &base_scope, &target_scope)
 }
 
 /// Collapse what a reader does not need one box per, before a budget drops any
@@ -579,12 +670,40 @@ type CallEdges = BTreeMap<(String, String, Relation), CallEdge>;
 type Adjacency<'a> = BTreeMap<&'a str, Vec<&'a str>>;
 
 /// Which revision a call site was read from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Side {
     Base,
     Target,
 }
 
+/// Call sites no exact rule, nor an opted-in possible-call rule, resolved.
+///
+/// Site identity includes its function range and revision side, so passes that
+/// inspect the same source site cannot inflate the report.
+#[derive(Default)]
+struct UnresolvedCalls {
+    sites: BTreeSet<(Side, String, u32, u32, String, Option<String>, u32)>,
+}
+
+impl UnresolvedCalls {
+    fn record(&mut self, side: Side, path: &str, range: &SourceRange, call: &CallSite, view: View) {
+        if view_includes_side(view, side) {
+            self.sites.insert((
+                side,
+                path.to_owned(),
+                range.start_line,
+                range.start_column,
+                call.name.clone(),
+                call.receiver.clone(),
+                call.line,
+            ));
+        }
+    }
+
+    fn count(&self) -> u32 {
+        u32::try_from(self.sites.len()).unwrap_or(u32::MAX)
+    }
+}
 /// Every local call relationship in one file, keyed by caller and callee.
 ///
 /// Both revisions' call sites are resolved and merged, so a relationship only
@@ -928,11 +1047,13 @@ struct Resolver<'a> {
 /// Add an edge for every call the root's file makes into another module.
 fn add_cross_file_callees<'a>(
     calls: &mut CallEdges,
+    unresolved: &mut UnresolvedCalls,
     places: &mut Places<'a>,
     resolver: &Resolver<'a>,
     path: &str,
     functions: &'a [FunctionResult],
     locals: &Locals<'_>,
+    view: View,
 ) {
     let node_ids = &locals.ids;
     let (base_names, target_names) = (&locals.base, &locals.target);
@@ -950,6 +1071,9 @@ fn add_cross_file_callees<'a>(
                 }
                 let Some((relation, resolution, target)) = callee(resolver, side, path, call)
                 else {
+                    if let Some(range) = side_range(caller, side) {
+                        unresolved.record(side, path, range, call, view);
+                    }
                     continue;
                 };
                 let Some(to) = place_function(
@@ -967,6 +1091,16 @@ fn add_cross_file_callees<'a>(
                     .saw(side, call.line, resolution);
             }
         }
+    }
+}
+
+/// The declaration range identifying one function on the side its call came
+/// from. A call without a declaration on that side cannot occur in normal
+/// analysis output, but is ignored rather than making malformed input panic.
+fn side_range(function: &FunctionResult, side: Side) -> Option<&SourceRange> {
+    match side {
+        Side::Base => function.base_range.as_ref(),
+        Side::Target => function.target_range.as_ref(),
     }
 }
 
@@ -1018,10 +1152,12 @@ fn callee(
 /// the changed function.
 fn add_cross_file_callers<'a>(
     calls: &mut CallEdges,
+    unresolved: &mut UnresolvedCalls,
     places: &mut Places<'a>,
     resolver: &Resolver<'a>,
     file: &'a FileResult,
     path: &'a str,
+    view: View,
 ) {
     let revisions = resolver.revisions;
     let functions = file.functions.as_slice();
@@ -1033,6 +1169,7 @@ fn add_cross_file_callers<'a>(
                     let Some((relation, resolution, target)) =
                         callee(resolver, side, importer, call)
                     else {
+                        unresolved.record(side, caller.path, caller.range, call, view);
                         continue;
                     };
                     if target.0 != path {
@@ -3531,5 +3668,62 @@ mod tests {
         // Both renderings carry the group rather than quietly leaving a gap.
         assert!(diff.contains(&label));
         assert!(mermaid.contains(&label));
+    }
+    #[test]
+    fn completeness_counts_scan_and_specifier_gaps_in_the_walk_scope() {
+        let mut index = ImportIndex::from_edges(&[], &["src/core.ts"]);
+        index.truncate("src/core.ts");
+        index.bind_external(
+            "src/core.ts",
+            "package",
+            ImportedName::Default,
+            "package",
+            1,
+        );
+        let result = analysis(vec![modified("src/core.ts")]);
+        let roots = paths_of(&["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &request(&roots, Relation::SUPPORTED),
+        );
+
+        assert_eq!(graph.completeness().scan_truncated_files, 2);
+        assert_eq!(graph.completeness().unresolved_specifiers, 2);
+        assert_eq!(graph.completeness().relations_supported, Relation::SUPPORTED);
+    }
+
+    #[test]
+    fn completeness_counts_only_unresolved_call_sites() {
+        let root = function(
+            "root",
+            "root",
+            FunctionChangeStatus::Added,
+            None,
+            Some(1),
+            &[],
+            &[("missing", 2), ("helper", 3)],
+        );
+        let helper = function(
+            "helper",
+            "helper",
+            FunctionChangeStatus::Added,
+            None,
+            Some(10),
+            &[],
+            &[],
+        );
+        let result = analysis(vec![modified_with("src/core.ts", vec![root, helper])]);
+        let root_id = query::function_id(&result.files[0], &result.files[0].functions[0]);
+        let index = ImportIndex::from_edges(&[], &["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        assert_eq!(graph.completeness().unresolved_calls, 1);
     }
 }
