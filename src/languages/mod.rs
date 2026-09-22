@@ -34,11 +34,13 @@ pub struct SourceRange {
 /// One call written inside a function body, as the collector saw it.
 ///
 /// A plain identifier callee is a call to a name the file has: a declaration
-/// of its own, or something it imports. A member callee is recorded only in
-/// the `receiver.name()` shape, because a receiver that is a namespace import
-/// names a module whose exports are known; a computed callee (`a[b]()`), a
-/// call on a call, and a deeper chain need information no stage has, and a
-/// name guessed from one of them would become an edge that may not exist.
+/// of its own, or something it imports. A member callee is recorded in the
+/// two shapes that write a property name — `receiver.name()` and
+/// `receiver["name"]` — because a receiver that is a namespace import names
+/// a module whose exports are known, and a property name a receiver does not
+/// explain is still a name a heuristic may match. A computed callee with a
+/// non-literal key (`a[b]()`), a call on a call, and a deeper chain record
+/// nothing at all: they name no property for any stage to work from.
 ///
 /// The file is not recorded per call: a call site belongs to the function whose
 /// body contains it, and that function's own path is the file. Storing it again
@@ -50,8 +52,8 @@ pub struct CallSite {
     /// The receiver a member callee was written on, if it was one.
     ///
     /// `None` is a bare `name()`, which resolves against the file's own
-    /// declarations and its imports. `Some` is `receiver.name()`, which
-    /// resolves only when the receiver is a namespace import.
+    /// declarations and its imports. `Some` is a property or computed access,
+    /// which resolves exactly only when the receiver is a namespace import.
     pub receiver: Option<String>,
     /// 1-based line the call expression starts on.
     pub line: u32,

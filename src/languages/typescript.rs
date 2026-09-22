@@ -529,13 +529,14 @@ fn body_facts(node: Node<'_>, source: &str, nesting: u32) -> BodyFacts {
 /// `new Foo()` names its callee in a `constructor` field and `Foo()` in a
 /// `function` field; that is the only difference between the two here.
 ///
-/// A member callee is recorded only in the one shape that can be resolved
-/// exactly: `receiver.name()`, where both halves are plain identifiers. A
-/// receiver that is a namespace import names a module whose exports are
-/// known, so the call resolves; a receiver that is anything else resolves to
-/// nothing, which is the answer the collector gave before it recorded these at
-/// all. A computed access (`a[b]()`), a call on a call, and a deeper member
-/// chain still record nothing rather than a lower-confidence guess.
+/// A member callee is recorded in the two shapes whose property name is
+/// written in the source: `receiver.name()` and `receiver["name"]`, where the
+/// receiver is a plain identifier. A receiver that is a namespace import
+/// names a module whose exports are known, so the call resolves exactly;
+/// anything else resolves to nothing exactly, and leaves a property name a
+/// later stage may match heuristically. A computed access with a non-literal
+/// key (`a[b]()`), a call on a call, and a deeper member chain still record
+/// nothing: they name no property at all.
 ///
 /// The line is the call expression's own, not the callee's: that is the
 /// position a reader jumps to to see the call, and a call spread over several
@@ -566,8 +567,41 @@ fn call_site(node: Node<'_>, source: &str) -> Option<CallSite> {
                 line,
             })
         }
+        "subscript_expression" => {
+            let object = callee.child_by_field_name("object")?;
+            let index = callee.child_by_field_name("index")?;
+            if object.kind() != "identifier" {
+                return None;
+            }
+            Some(CallSite {
+                name: literal_key(index, source)?.to_owned(),
+                receiver: Some(node_text(object, source)?.to_owned()),
+                line,
+            })
+        }
         _ => None,
     }
+}
+
+/// The property name a computed key writes, when it writes one.
+///
+/// Only a string with no interpolation and no escape names a property the
+/// source states: `handlers["parse"]` is `parse`, and `handlers[key]` names
+/// whatever the variable holds at run time, which is nothing a parser can
+/// read.
+fn literal_key<'a>(index: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if index.kind() != "string" {
+        return None;
+    }
+    let mut cursor = index.walk();
+    let fragments = index
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "string_fragment")
+        .collect::<Vec<_>>();
+    let [fragment] = fragments.as_slice() else {
+        return None;
+    };
+    node_text(*fragment, source)
 }
 
 fn is_cyclomatic_decision(kind: &str) -> bool {
@@ -1294,19 +1328,21 @@ function outer() {
     }
 
     #[test]
-    fn records_a_member_callee_only_when_both_halves_are_names() {
-        // `holder.method(...)` names a receiver and a property, which resolves
-        // exactly when the receiver turns out to be a namespace import. A
-        // computed callee and a call on a call name something no stage can
-        // resolve, so they still record nothing. The plain call inside the
-        // first one's arguments is still reached by the walk.
-        let source = br"
+    fn records_a_member_callee_only_when_the_property_is_written() {
+        // `holder.method(...)` names a receiver and a property, which
+        // resolves exactly when the receiver turns out to be a namespace
+        // import. `holder["named"]()` writes the same property another way.
+        // A key that is a variable and a call on a call name no property at
+        // all, so they record nothing. The plain call inside the first one's
+        // arguments is still reached by the walk.
+        let source = br#"
 function indirect(holder: Holder, key: string) {
   holder.method(direct());
   holder[key]();
+  holder["named"]();
   holder.create()();
 }
-";
+"#;
 
         let analysis = analyze_source(Path::new("sample.ts"), source).expect("analysis succeeds");
         let indirect = &analysis.functions[0];
@@ -1325,9 +1361,14 @@ function indirect(holder: Holder, key: string) {
                     line: 3,
                 },
                 CallSite {
-                    name: "create".to_owned(),
+                    name: "named".to_owned(),
                     receiver: Some("holder".to_owned()),
                     line: 5,
+                },
+                CallSite {
+                    name: "create".to_owned(),
+                    receiver: Some("holder".to_owned()),
+                    line: 6,
                 },
             ]
         );

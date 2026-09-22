@@ -231,26 +231,22 @@ fn function_graph(
         base: declared_names(functions, |function| function.base_range.is_some()),
         target: declared_names(functions, |function| function.target_range.is_some()),
     };
+    let resolver = Resolver {
+        revisions,
+        changed: changed_files(result),
+        guess: request.relations.contains(&Relation::PossibleCall),
+    };
     let mut calls = local_calls(functions, &path, &locals);
 
-    let changed = changed_files(result);
-    add_cross_file_callees(
-        &mut calls,
-        &mut places,
-        revisions,
-        &changed,
-        &path,
-        functions,
-        &locals,
-    );
-    add_cross_file_callers(&mut calls, &mut places, revisions, &changed, file, &path);
+    add_cross_file_callees(&mut calls, &mut places, &resolver, &path, functions, &locals);
+    add_cross_file_callers(&mut calls, &mut places, &resolver, file, &path);
 
-    let (outgoing, incoming) = call_adjacency(&calls);
+    let (outgoing, incoming) = call_adjacency(&calls, request.relations);
     let root_id = function_node_id(file, root);
 
     let mut builder = GraphBuilder::new();
     builder.add_root(root_id.clone());
-    let reached = if request.relations.contains(&Relation::Calls) {
+    let reached = if request.relations.contains(&Relation::Calls) || resolver.guess {
         walk(
             &[root_id],
             request.direction,
@@ -258,9 +254,9 @@ fn function_graph(
             |id, direction| call_neighbors(&outgoing, &incoming, id, direction),
         )
     } else {
-        // A graph that may not follow calls is still centered on the root, so
-        // the walk is skipped rather than run over a relation it may not
-        // follow.
+        // A graph that may not follow a call relationship is still centered
+        // on the root, so the walk is skipped rather than run over a relation
+        // it may not follow.
         BTreeMap::from([(root_id, 0)])
     };
     for (id, depth) in &reached {
@@ -269,9 +265,7 @@ fn function_graph(
         }
     }
 
-    if request.relations.contains(&Relation::Calls) {
-        add_call_edges(&mut builder, &calls, &reached);
-    }
+    add_call_edges(&mut builder, &calls, &reached, request.relations);
     if request.relations.contains(&Relation::Contains) {
         add_contains_edges(
             &mut builder,
@@ -573,9 +567,13 @@ impl CallEdge {
     }
 }
 
-/// Every call relationship a function graph holds, keyed by caller and callee
-/// node identity.
-type CallEdges = BTreeMap<(String, String), CallEdge>;
+/// Every call relationship a function graph holds, keyed by caller, callee,
+/// and the relation it is reported under.
+///
+/// The relation is part of the key because a guess and a proof about one pair
+/// of functions are two different statements: a `possible_call` never merges
+/// into the `calls` edge beside it, and neither takes the other's confidence.
+type CallEdges = BTreeMap<(String, String, Relation), CallEdge>;
 
 /// One direction of a file's call relationships, as node identities.
 type Adjacency<'a> = BTreeMap<&'a str, Vec<&'a str>>;
@@ -653,7 +651,7 @@ fn resolve_calls<'a>(
             continue;
         };
         edges
-            .entry((from.clone(), to.clone()))
+            .entry((from.clone(), to.clone(), Relation::Calls))
             .or_insert_with(|| CallEdge::new(path, Resolution::DirectLocalSymbol))
             .saw(side, call.line, Resolution::DirectLocalSymbol);
     }
@@ -711,6 +709,64 @@ fn cross_file_callee(
         Resolution::ReExportedSymbol
     };
     Some((definition, resolution))
+}
+
+/// Where one definition a property call could mean is written.
+///
+/// A path and a range are what [`place_function`] needs, and they are what
+/// makes two sightings of one function one candidate rather than two.
+type Candidate = (String, SourceRange);
+
+/// The function a property call's name could mean, when it can only mean one.
+///
+/// This is the heuristic, and it resolves nothing: `handlers.parse()` says
+/// the callee is a property of something, and nothing in the file says what
+/// that something holds. What the name can be checked against is the scope
+/// the calling file can see a function through — the functions it declares
+/// itself, and the functions the modules it imports export — which is the
+/// same reach the exact resolutions have and reads no file they do not.
+///
+/// A name that scope answers with two or more definitions produces nothing.
+/// Picking one of them would be the arbitrary choice
+/// [`declared_names`] already refuses for a local name, and a heuristic that
+/// fires on an ambiguous name is noise rather than a lead.
+fn possible_callee(
+    revisions: &Revisions<'_>,
+    side: Side,
+    from: &str,
+    call: &CallSite,
+) -> Option<Candidate> {
+    // Only a property or computed access is guessed at. A bare `name()` is
+    // resolved exactly or not at all, and lowering it to a guess would put a
+    // second, weaker answer beside an exact one.
+    call.receiver.as_ref()?;
+    let (imports, symbols) = revisions.side(side);
+    // Keyed by where a definition is written, so one function reached both as
+    // a declaration and through an export is one candidate.
+    let mut candidates: BTreeMap<(String, u32, u32), Candidate> = BTreeMap::new();
+    let mut remember = |path: String, range: SourceRange| {
+        let _existing = candidates.insert(
+            (path.clone(), range.start_line, range.start_column),
+            (path, range),
+        );
+    };
+    if let Some(file) = symbols.file(from) {
+        for function in &file.functions {
+            if declared_name(&function.qualified_name) == call.name {
+                remember(from.to_owned(), function.range.clone());
+            }
+        }
+    }
+    for module in imports.dependencies(from) {
+        if let Some(definition) = symbols.definition(imports, module, &call.name) {
+            remember(definition.path, definition.range);
+        }
+    }
+    if candidates.len() == 1 {
+        candidates.into_values().next()
+    } else {
+        None
+    }
 }
 
 /// A function node the graph can place, by identity.
@@ -857,12 +913,23 @@ struct Locals<'a> {
     target: BTreeMap<&'a str, Option<&'a FunctionResult>>,
 }
 
+/// What cross-file call resolution reads from, for one comparison.
+///
+/// The two revisions to resolve against, the files the diff contains, and
+/// whether this request admits a guess. The three travel together because
+/// every cross-file resolution needs all of them, and because the flag
+/// belongs beside the indexes it decides how far to search.
+struct Resolver<'a> {
+    revisions: &'a Revisions<'a>,
+    changed: BTreeMap<&'a str, &'a FileResult>,
+    guess: bool,
+}
+
 /// Add an edge for every call the root's file makes into another module.
 fn add_cross_file_callees<'a>(
     calls: &mut CallEdges,
     places: &mut Places<'a>,
-    revisions: &Revisions<'_>,
-    changed: &BTreeMap<&'a str, &'a FileResult>,
+    resolver: &Resolver<'a>,
     path: &str,
     functions: &'a [FunctionResult],
     locals: &Locals<'_>,
@@ -881,26 +948,59 @@ fn add_cross_file_callees<'a>(
                 if declares(declared, call) {
                     continue;
                 }
-                let Some((definition, resolution)) = cross_file_callee(revisions, side, path, call)
+                let Some((relation, resolution, target)) = callee(resolver, side, path, call)
                 else {
                     continue;
                 };
                 let Some(to) = place_function(
                     places,
-                    revisions,
-                    changed,
-                    &definition.path,
-                    &definition.range,
+                    resolver.revisions,
+                    &resolver.changed,
+                    &target.0,
+                    &target.1,
                 ) else {
                     continue;
                 };
                 calls
-                    .entry((from.clone(), to))
+                    .entry((from.clone(), to, relation))
                     .or_insert_with(|| CallEdge::new(path, resolution))
                     .saw(side, call.line, resolution);
             }
         }
     }
+}
+
+/// What one call site points at, exactly or at a guess.
+///
+/// The exact rules are asked first and the heuristic only sees what they
+/// leave, so a call that resolves exactly is never also reported as a guess
+/// and `calls` says exactly what it said before this relation existed. A
+/// request that did not name `possible_call` never reaches the heuristic at
+/// all: its search costs one lookup per module the file imports, and an
+/// answer nobody asked for should not pay it.
+fn callee(
+    resolver: &Resolver<'_>,
+    side: Side,
+    from: &str,
+    call: &CallSite,
+) -> Option<(Relation, Resolution, Candidate)> {
+    if let Some((definition, resolution)) = cross_file_callee(resolver.revisions, side, from, call)
+    {
+        return Some((
+            Relation::Calls,
+            resolution,
+            (definition.path, definition.range),
+        ));
+    }
+    if !resolver.guess {
+        return None;
+    }
+    let candidate = possible_callee(resolver.revisions, side, from, call)?;
+    Some((
+        Relation::PossibleCall,
+        Resolution::PropertyNameMatch,
+        candidate,
+    ))
 }
 
 /// Add an edge for every call into the root's file from a module that imports
@@ -911,38 +1011,47 @@ fn add_cross_file_callees<'a>(
 /// visible. Their bodies come from the analysis when the diff contains them and
 /// from the revision's symbol index otherwise, which is the only place files
 /// outside the diff are read at all.
+///
+/// A property call in an importing file is guessed at under the same rule and
+/// the same request: the importer can see the root's exported names, so a
+/// method call whose name only one of them matches is a lead about who calls
+/// the changed function.
 fn add_cross_file_callers<'a>(
     calls: &mut CallEdges,
     places: &mut Places<'a>,
-    revisions: &'a Revisions<'a>,
-    changed: &BTreeMap<&'a str, &'a FileResult>,
+    resolver: &Resolver<'a>,
     file: &'a FileResult,
     path: &'a str,
 ) {
+    let revisions = resolver.revisions;
     let functions = file.functions.as_slice();
     for side in [Side::Base, Side::Target] {
         let (imports, _) = revisions.side(side);
         for importer in imports.importers(path) {
-            for caller in callers_of(revisions, changed, importer, side) {
+            for caller in callers_of(revisions, &resolver.changed, importer, side) {
                 for call in caller.calls {
-                    let Some((definition, resolution)) =
-                        cross_file_callee(revisions, side, importer, call)
+                    let Some((relation, resolution, target)) =
+                        callee(resolver, side, importer, call)
                     else {
                         continue;
                     };
-                    if definition.path != path {
+                    if target.0 != path {
                         continue;
                     }
-                    let Some(to) = root_file_function(file, functions, &definition, side) else {
+                    let Some(to) = root_file_function(file, functions, &target.1, side) else {
                         continue;
                     };
-                    let Some(from) =
-                        place_function(places, revisions, changed, caller.path, caller.range)
-                    else {
+                    let Some(from) = place_function(
+                        places,
+                        revisions,
+                        &resolver.changed,
+                        caller.path,
+                        caller.range,
+                    ) else {
                         continue;
                     };
                     calls
-                        .entry((from, to))
+                        .entry((from, to, relation))
                         .or_insert_with(|| CallEdge::new(importer, resolution))
                         .saw(side, call.line, resolution);
                 }
@@ -1005,12 +1114,12 @@ fn callers_of<'a>(
         .collect()
 }
 
-/// The root file's function a definition points at, by the range that side
+/// The root file's function a call points at, by the range that side
 /// reported.
 fn root_file_function(
     file: &FileResult,
     functions: &[FunctionResult],
-    definition: &ExportedDefinition,
+    definition: &SourceRange,
     side: Side,
 ) -> Option<String> {
     let function = functions.iter().find(|function| {
@@ -1018,7 +1127,7 @@ fn root_file_function(
             Side::Base => function.base_range.as_ref(),
             Side::Target => function.target_range.as_ref(),
         };
-        range == Some(&definition.range)
+        range == Some(definition)
     })?;
     Some(function_node_id(file, function))
 }
@@ -1091,10 +1200,19 @@ fn earliest(slot: &mut Option<u32>, line: u32) {
 ///
 /// The walk asks one node at a time and a file can hold thousands of call
 /// sites, so the two directions are indexed once rather than scanned per hop.
-fn call_adjacency(calls: &CallEdges) -> (Adjacency<'_>, Adjacency<'_>) {
+///
+/// Only the relations the request follows are indexed, so a walk that may not
+/// follow guesses does not reach a function through one.
+fn call_adjacency<'a>(
+    calls: &'a CallEdges,
+    relations: &[Relation],
+) -> (Adjacency<'a>, Adjacency<'a>) {
     let mut outgoing: Adjacency<'_> = BTreeMap::new();
     let mut incoming: Adjacency<'_> = BTreeMap::new();
-    for (from, to) in calls.keys() {
+    for (from, to, relation) in calls.keys() {
+        if !relations.contains(relation) {
+            continue;
+        }
         outgoing.entry(from.as_str()).or_default().push(to.as_str());
         incoming.entry(to.as_str()).or_default().push(from.as_str());
     }
@@ -1136,15 +1254,27 @@ fn call_neighbors(
     neighbors
 }
 
-/// Add a `calls` edge for every relationship between functions the walk
+/// Add an edge for every call relationship between functions the walk
 /// reached.
 ///
 /// Both endpoints must be reached, for the same reason an import edge needs
 /// both: an edge to a function outside the walk would show a relationship the
 /// request asked not to follow. A cycle's closing edge is among the reached
 /// pairs, so it survives while the walk still terminates.
-fn add_call_edges(builder: &mut GraphBuilder, calls: &CallEdges, reached: &Reached) {
-    for ((from, to), call) in calls {
+///
+/// Each relationship keeps the relation it was resolved under, so a guess is
+/// delivered as `possible_call` and is delivered at all only to a request
+/// that named it.
+fn add_call_edges(
+    builder: &mut GraphBuilder,
+    calls: &CallEdges,
+    reached: &Reached,
+    relations: &[Relation],
+) {
+    for ((from, to, relation), call) in calls {
+        if !relations.contains(relation) {
+            continue;
+        }
         if !reached.contains_key(from) || !reached.contains_key(to) {
             continue;
         }
@@ -1161,7 +1291,7 @@ fn add_call_edges(builder: &mut GraphBuilder, calls: &CallEdges, reached: &Reach
         builder.add_edge(Edge {
             from: from.clone(),
             to: to.clone(),
-            relation: Relation::Calls,
+            relation: *relation,
             status,
             resolution: call.resolution,
             // The site is the caller's file, which is not the root's file for

@@ -120,7 +120,7 @@ struct GraphArguments {
     #[arg(long, value_name = "DIRECTION", default_value = "both")]
     direction: String,
 
-    /// Relations to follow, comma-separated (default: every supported relation).
+    /// Relations to follow, comma-separated (default: every relation but `possible_call`).
     #[arg(long, value_name = "NAMES")]
     relations: Option<String>,
 

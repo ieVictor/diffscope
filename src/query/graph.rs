@@ -584,13 +584,17 @@ fn file_stem(path: &str) -> &str {
 
 /// The relations a walk may follow, in the supported order.
 ///
-/// An empty list means every supported relation, which is the documented
-/// default. A name this version does not resolve is rejected rather than
-/// dropped: an edge set short by one relation would report "no such
-/// relationship" for a relationship this version never looks for.
+/// An empty list means [`Relation::by_default`], which is every relation this
+/// version resolves except the heuristic one: `possible_call` says a
+/// relationship may exist, and an answer nobody asked a question of reports
+/// what the revisions prove. A caller opts into guesses by naming them.
+///
+/// A name this version does not resolve is rejected rather than dropped: an
+/// edge set short by one relation would report "no such relationship" for a
+/// relationship this version never looks for.
 fn relations(requested: &[String]) -> Result<Vec<Relation>, GraphRequestError> {
     if requested.is_empty() {
-        return Ok(Relation::SUPPORTED.to_vec());
+        return Ok(Relation::by_default());
     }
     for name in requested {
         if Relation::parse(name).is_none() {
@@ -645,10 +649,26 @@ mod tests {
             relations(&named).expect("every named relation is supported"),
             vec![Relation::Imports, Relation::TestedBy, Relation::Calls]
         );
-        // An empty list is the documented default, not an empty graph.
+        // An empty list is the documented default, not an empty graph — and
+        // the default proves its edges, so the heuristic relation is not in
+        // it.
         assert_eq!(
-            relations(&[]).expect("the default is every supported relation"),
-            Relation::SUPPORTED.to_vec()
+            relations(&[]).expect("the default is every relation but the heuristic one"),
+            Relation::by_default()
+        );
+        assert!(!relations(&[]).unwrap().contains(&Relation::PossibleCall));
+    }
+
+    #[test]
+    fn the_heuristic_relation_is_followed_only_when_it_is_named() {
+        assert_eq!(
+            relations(&["possible_call".to_owned(), "calls".to_owned()])
+                .expect("a caller may opt into guesses"),
+            vec![Relation::Calls, Relation::PossibleCall]
+        );
+        assert_eq!(
+            relations(&["possible_call".to_owned()]).expect("guesses alone are a request too"),
+            vec![Relation::PossibleCall]
         );
     }
 
