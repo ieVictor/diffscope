@@ -26,7 +26,6 @@ diffScope/
 │   ├── ROADMAP.md          # Forward-only implementation plan
 │   ├── HARNESS.md          # Versioned JSONL harness protocol
 │   ├── PERFORMANCE.md      # Reproducible benchmark methodology and baselines
-│   ├── plans/              # Plans for contracts that are not yet shipped
 │   └── STRUCTURE.MD        # Directory ownership and conventions
 ├── scripts/                # Local setup and maintenance scripts
 ├── AGENTS.MD               # Development rules
@@ -44,6 +43,6 @@ diffScope/
 - Keep Git access behind the `git/` boundary.
 - Keep the change-impact graph in `graph/`: the model, the walk, and the renderers are pure functions over one analysis and the import indexes, and the serialized shape a transport carries belongs to the projection in `query/`.
 - Place unit tests beside their modules and cross-module behavior in `tests/`.
-- Keep `docs/` for contracts DiffScope delivers and `docs/plans/` for contracts it intends to deliver. A plan moves into the documents above it when the milestone that implements it ships, so a reader never has to check whether a document describes behavior that exists.
+- Keep `docs/` for contracts DiffScope delivers. Working plans stay local under the ignored `docs/plans/` directory; move their shipped definitions into the versioned documents above rather than committing the plans themselves.
 - Store only compact, intentional fixtures. Do not commit generated benchmark or coverage output.
 - Add directories only when they contain a real responsibility; avoid empty architectural scaffolding.
