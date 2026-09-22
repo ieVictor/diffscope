@@ -62,6 +62,88 @@ impl NodeKind {
     }
 }
 
+/// What a group node stands for.
+///
+/// A role fixes both the identity a group is addressed by and the noun its
+/// label counts in, so a collapse is reproducible and no rendering has to
+/// invent prose for it. The order is the order the grouping rules are applied
+/// in: context first, then what a reader does not review, then what a budget
+/// could not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupRole {
+    /// A module's related tests.
+    Tests,
+    /// Machine-written files.
+    Generated,
+    /// Files owned by another project.
+    Vendored,
+    /// Dependency lock files.
+    Lockfile,
+    /// What reaches the root and did not fit the node budget.
+    Callers,
+    /// What the root reaches and did not fit the node budget.
+    Dependencies,
+}
+
+impl GroupRole {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tests => "tests",
+            Self::Generated => "generated",
+            Self::Vendored => "vendored",
+            Self::Lockfile => "lockfile",
+            Self::Callers => "callers",
+            Self::Dependencies => "dependencies",
+        }
+    }
+
+    /// The noun a group of `size` members is counted in.
+    ///
+    /// Fixed per role and per number rather than derived from a name, because
+    /// a label is part of a rendering a caller compares byte for byte and a
+    /// written description is neither reproducible nor checkable.
+    #[must_use]
+    pub fn noun(self, size: u32) -> &'static str {
+        let one = size == 1;
+        match self {
+            Self::Tests if one => "test",
+            Self::Tests => "tests",
+            Self::Generated if one => "generated file",
+            Self::Generated => "generated files",
+            Self::Vendored if one => "vendored file",
+            Self::Vendored => "vendored files",
+            Self::Lockfile if one => "lockfile",
+            Self::Lockfile => "lockfiles",
+            Self::Callers if one => "caller",
+            Self::Callers => "callers",
+            Self::Dependencies if one => "dependency",
+            Self::Dependencies => "dependencies",
+        }
+    }
+}
+
+/// What one group node collapses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Group {
+    /// How many nodes this one stands for.
+    pub size: u32,
+    pub role: GroupRole,
+}
+
+impl Group {
+    /// The text a rendering shows: the count, what was collapsed, and the
+    /// change area the members share when they share one.
+    #[must_use]
+    pub fn label(self, area: Option<&str>) -> String {
+        let counted = format!("{} {}", self.size, self.role.noun(self.size));
+        match area {
+            Some(area) => format!("{counted} · {area}"),
+            None => counted,
+        }
+    }
+}
+
 /// Whether a node is in one revision, the other, or both — and, for something
 /// the analysis examined, what the comparison said about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -397,6 +479,9 @@ pub struct Node {
     pub status: NodeStatus,
     /// Fewest hops by which the walk reached this node. Zero for a root.
     pub depth: u32,
+    /// What this node collapses, when it is a `group`. Absent for a module and
+    /// for a function, which stand for themselves.
+    pub group: Option<Group>,
 }
 
 impl Node {
@@ -410,6 +495,16 @@ impl Node {
     #[must_use]
     pub fn function_id(function_id: &str) -> String {
         format!("function:{function_id}")
+    }
+
+    /// The identity of the group that collapses `role`.
+    ///
+    /// Derived from what the group collapses rather than from its members'
+    /// number or order, so one graph holds one group per role and the same
+    /// collapse produces the same identity on every run.
+    #[must_use]
+    pub fn group_id(role: GroupRole) -> String {
+        format!("group:{}", role.name())
     }
 
     /// The last path segment, which is what a diagram shows.
@@ -587,6 +682,10 @@ pub struct GraphBuilder {
     nodes: BTreeMap<String, Node>,
     edges: BTreeMap<(String, Relation, String, Resolution), Edge>,
     roots: BTreeSet<String>,
+    /// Nodes a budget, rather than a grouping rule, is why a caller cannot see
+    /// individually. Reported as omitted, because raising the budget brings
+    /// them back.
+    omitted_by_budget: u32,
 }
 
 impl GraphBuilder {
@@ -636,12 +735,139 @@ impl GraphBuilder {
         self.nodes.contains_key(id)
     }
 
+    /// The node an identity refers to, while the graph is being built.
+    #[must_use]
+    pub fn node(&self, id: &str) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+
+    /// Whether an identity is one the walk started from.
+    #[must_use]
+    pub fn is_root(&self, id: &str) -> bool {
+        self.roots.contains(id)
+    }
+
+    /// Every edge added so far, in the graph's edge order.
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        self.edges.values()
+    }
+
     /// Every node added so far, in the graph's order.
     #[must_use]
     pub fn nodes(&self) -> Vec<&Node> {
         let mut nodes = self.nodes.values().collect::<Vec<_>>();
         nodes.sort_by(|left, right| left.order().cmp(&right.order()));
         nodes
+    }
+
+    /// The nodes a budget of `max_nodes` would not admit.
+    ///
+    /// Neither a root nor a group is ever among them: a root is what the graph
+    /// was asked about, and a group already stands for nodes, so collapsing
+    /// either would answer a different question than the one that was asked.
+    #[must_use]
+    pub fn overflow(&self, max_nodes: usize) -> BTreeSet<String> {
+        let ordered = self.nodes();
+        let kept = keep_nodes(&ordered, &self.roots, max_nodes);
+        ordered
+            .into_iter()
+            .filter(|node| {
+                !kept.contains(&node.id)
+                    && node.kind != NodeKind::Group
+                    && !self.roots.contains(&node.id)
+            })
+            .map(|node| node.id.clone())
+            .collect()
+    }
+
+    /// Replace `members` with one group node standing for them.
+    ///
+    /// The group takes the fewest hops any member was reached by and the status
+    /// every member shares, or `unchanged` when they do not share one: a mixed
+    /// set has no single status, and a group is context rather than a claim
+    /// about one file. Its label is built from what it collapses and the change
+    /// area `area` names, so nothing in a rendering is written prose.
+    ///
+    /// Edges are rewired onto the group and merged by relation, status, and
+    /// resolution, so eight tests that import a module contribute one edge
+    /// while a test that merely matches the module's name keeps its own,
+    /// different claim. A relationship between two members is internal to the
+    /// group and is dropped, having no endpoints left to draw, and evidence
+    /// goes with the member it pointed at, because a group has no single site.
+    ///
+    /// A root is never collapsed. Returns how many nodes the group replaced.
+    pub fn collapse(
+        &mut self,
+        role: GroupRole,
+        members: &BTreeSet<String>,
+        area: Option<String>,
+    ) -> u32 {
+        let mut collapsed = BTreeSet::new();
+        let mut statuses = BTreeSet::new();
+        let mut depth = u32::MAX;
+        for id in members {
+            if self.roots.contains(id) {
+                continue;
+            }
+            let Some(node) = self.nodes.remove(id) else {
+                continue;
+            };
+            depth = depth.min(node.depth);
+            statuses.insert(node.status);
+            collapsed.insert(node.id);
+        }
+        let size = count(collapsed.len());
+        if size == 0 {
+            return 0;
+        }
+        let mut shared = statuses.into_iter();
+        let status = match (shared.next(), shared.next()) {
+            (Some(status), None) => status,
+            _ => NodeStatus::Unchanged,
+        };
+
+        let group = Group { size, role };
+        let id = Node::group_id(role);
+        let path = area.unwrap_or_default();
+        let label = group.label((!path.is_empty()).then_some(path.as_str()));
+        self.nodes.insert(
+            id.clone(),
+            Node {
+                id: id.clone(),
+                key: String::new(),
+                label,
+                kind: NodeKind::Group,
+                path,
+                range_start: (0, 0),
+                status,
+                depth,
+                group: Some(group),
+            },
+        );
+
+        for (_, mut edge) in std::mem::take(&mut self.edges) {
+            let from = collapsed.contains(&edge.from);
+            let to = collapsed.contains(&edge.to);
+            if from && to {
+                continue;
+            }
+            if from {
+                edge.from.clone_from(&id);
+            }
+            if to {
+                edge.to.clone_from(&id);
+            }
+            if from || to {
+                edge.evidence = None;
+            }
+            self.add_edge(edge);
+        }
+        size
+    }
+
+    /// Record that a budget is why `nodes` nodes are not individually present.
+    pub fn omit(&mut self, nodes: u32) {
+        self.omitted_by_budget = self.omitted_by_budget.saturating_add(nodes);
     }
 
     /// Drop the edges a view does not show, and the nodes that leaves isolated.
@@ -673,13 +899,18 @@ impl GraphBuilder {
             nodes,
             edges,
             roots,
+            omitted_by_budget,
         } = self;
 
         let mut ordered = nodes.into_values().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.order().cmp(&right.order()));
 
         let total_nodes = ordered.len();
-        let kept_ids = keep_nodes(&ordered, &roots, limits.max_nodes);
+        let kept_ids = keep_nodes(
+            &ordered.iter().collect::<Vec<_>>(),
+            &roots,
+            limits.max_nodes,
+        );
         ordered.retain(|node| kept_ids.contains(&node.id));
 
         let mut ordered_edges = edges
@@ -690,7 +921,7 @@ impl GraphBuilder {
 
         let total_edges = ordered_edges.len();
         let mut reasons = Vec::new();
-        if total_nodes > ordered.len() {
+        if total_nodes > ordered.len() || omitted_by_budget > 0 {
             reasons.push(TruncationReason::MaxNodes);
         }
         if total_edges > limits.max_edges {
@@ -709,7 +940,7 @@ impl GraphBuilder {
         roots.sort();
 
         Graph {
-            omitted_nodes: count(total_nodes - ordered.len()),
+            omitted_nodes: count(total_nodes - ordered.len()).saturating_add(omitted_by_budget),
             omitted_edges: count(total_edges - ordered_edges.len()),
             truncated: !reasons.is_empty(),
             reasons,
@@ -726,7 +957,12 @@ impl GraphBuilder {
 /// comparison changed, then the nearest, then the graph's own order as a total
 /// tiebreak. Dropping the far unchanged nodes first keeps a truncated graph
 /// centered on what was asked about.
-fn keep_nodes(ordered: &[Node], roots: &BTreeSet<String>, max_nodes: usize) -> BTreeSet<String> {
+///
+/// Groups rank directly behind the roots: one stands for several nodes at
+/// once, so dropping it costs a reader more than dropping any single node it
+/// replaced — which is also why a group can never be dropped in favour of a
+/// node it collapsed.
+fn keep_nodes(ordered: &[&Node], roots: &BTreeSet<String>, max_nodes: usize) -> BTreeSet<String> {
     if ordered.len() <= max_nodes {
         return ordered.iter().map(|node| node.id.clone()).collect();
     }
@@ -734,6 +970,7 @@ fn keep_nodes(ordered: &[Node], roots: &BTreeSet<String>, max_nodes: usize) -> B
     ranked.sort_by_key(|(position, node)| {
         (
             u8::from(!roots.contains(&node.id)),
+            u8::from(node.kind != NodeKind::Group),
             u8::from(!node.status.is_changed()),
             node.depth,
             *position,
@@ -812,6 +1049,7 @@ mod tests {
             range_start: (0, 0),
             status,
             depth,
+            group: None,
         }
     }
 
@@ -946,6 +1184,7 @@ mod tests {
             range_start: (line, 0),
             status: NodeStatus::Unchanged,
             depth: 1,
+            group: None,
         };
 
         let mut builder = GraphBuilder::new();

@@ -19,12 +19,16 @@ use crate::{
     FileStatus,
     analysis::FunctionChangeStatus,
     graph::{
-        Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, Limits, Node, NodeKind,
-        NodeStatus, Reached, Relation, Resolution, View, walk,
+        Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, GroupRole, Limits, Node,
+        NodeKind, NodeStatus, Reached, Relation, Resolution, View, walk,
     },
     imports::{ExportedDefinition, ImportIndex, SymbolIndex},
     languages::{CallSite, ImportedName, SourceRange, symbol_id},
-    query::{self, impact},
+    query::{
+        self,
+        classify::{self, FileClassification},
+        impact,
+    },
     result::{AnalysisResult, FileResult, FunctionResult},
 };
 
@@ -165,6 +169,7 @@ pub fn build(result: &AnalysisResult, revisions: &Revisions<'_>, request: &Reque
     }
 
     builder.apply_view(request.view);
+    collapse_groups(&mut builder, request.limits);
     builder.finish(request.limits)
 }
 
@@ -279,7 +284,148 @@ fn function_graph(
     }
 
     builder.apply_view(request.view);
+    collapse_groups(&mut builder, request.limits);
     builder.finish(request.limits)
+}
+
+/// Collapse what a reader does not need one box per, before a budget drops any
+/// of it.
+///
+/// The rules are the documented ones, in order. A module's related tests are
+/// context rather than topology, so eight of them become one group and
+/// contribute one `tested_by` edge. Generated, vendored, and lockfile nodes
+/// are classified from their path alone by [`classify::classify`], with no
+/// filesystem access, so the same graph collapses identically on every
+/// machine. Whatever the node budget still cannot fit collapses by direction,
+/// so the two sides of the root stay distinguishable.
+///
+/// An external dependency needs no rule of its own: a specifier that resolved
+/// to nothing never became a node — [`ImportIndex::unresolved_specifiers`]
+/// counts it instead — and one that resolved into a vendored directory is a
+/// node the classification rule already collapses.
+///
+/// This runs before [`GraphBuilder::finish`] truncates, so a group is never
+/// dropped in favour of a node it replaced.
+fn collapse_groups(builder: &mut GraphBuilder, limits: Limits) {
+    collapse_tests(builder);
+    collapse_classified(builder);
+    collapse_overflow(builder, limits);
+}
+
+/// Collapse the tests that point at anything in the graph.
+///
+/// Membership is the `tested_by` edge rather than the path, because a test is
+/// grouped for the relationship it has to the graph: a test file reached as a
+/// plain importer of something else is still a place a reader may want named.
+fn collapse_tests(builder: &mut GraphBuilder) {
+    let tests = builder
+        .edges()
+        .filter(|edge| edge.relation == Relation::TestedBy)
+        .map(|edge| edge.from.clone())
+        .collect::<BTreeSet<_>>();
+    collapse(builder, GroupRole::Tests, &tests);
+}
+
+/// Collapse the nodes whose path says nobody reads them individually.
+fn collapse_classified(builder: &mut GraphBuilder) {
+    for (classification, role) in [
+        (FileClassification::Generated, GroupRole::Generated),
+        (FileClassification::Vendored, GroupRole::Vendored),
+        (FileClassification::Lockfile, GroupRole::Lockfile),
+    ] {
+        let members = builder
+            .nodes()
+            .into_iter()
+            .filter(|node| {
+                node.kind != NodeKind::Group && classify::classify(&node.path) == classification
+            })
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        collapse(builder, role, &members);
+    }
+}
+
+/// Collapse whatever the node budget cannot fit, by the side of the root it
+/// sits on.
+///
+/// A group occupies a node slot of its own, so the budget is asked what it
+/// would drop with those slots already spent: the smallest reservation whose
+/// own groups fit inside it is the one applied, which is why a graph that
+/// overflows on one side keeps one more node than a graph that overflows on
+/// both.
+fn collapse_overflow(builder: &mut GraphBuilder, limits: Limits) {
+    for reserve in 0..=2 {
+        let (callers, dependencies) = sides(
+            builder,
+            &builder.overflow(limits.max_nodes.saturating_sub(reserve)),
+        );
+        if groups_needed(&callers) + groups_needed(&dependencies) > reserve {
+            continue;
+        }
+        let omitted = collapse(builder, GroupRole::Callers, &callers)
+            + collapse(builder, GroupRole::Dependencies, &dependencies);
+        builder.omit(omitted);
+        return;
+    }
+}
+
+/// How many group nodes a side costs: one, or none when it has nothing to
+/// collapse.
+fn groups_needed(side: &BTreeSet<String>) -> usize {
+    usize::from(side.len() > 1)
+}
+
+/// Which side of the root each node sits on.
+///
+/// A node that points into the graph reaches the root and is a caller;
+/// anything else is something the root reaches. The sides are read from the
+/// edges the graph kept rather than from the walk, so a node's side is a
+/// property of the answer a reader sees.
+fn sides(builder: &GraphBuilder, nodes: &BTreeSet<String>) -> (BTreeSet<String>, BTreeSet<String>) {
+    let sources = builder
+        .edges()
+        .map(|edge| edge.from.as_str())
+        .collect::<BTreeSet<_>>();
+    nodes
+        .iter()
+        .cloned()
+        .partition(|id| sources.contains(id.as_str()))
+}
+
+/// Collapse one set of nodes, naming the change area they share when they
+/// share one.
+///
+/// A root is never a member: the graph is the answer to a question about it.
+/// A rule that matches a single node leaves it alone, because a group of one
+/// replaces a named file with a vaguer node and saves no room at all.
+fn collapse(builder: &mut GraphBuilder, role: GroupRole, members: &BTreeSet<String>) -> u32 {
+    let members = members
+        .iter()
+        .filter(|id| !builder.is_root(id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if members.len() < 2 {
+        return 0;
+    }
+    let area = shared_area(builder, &members);
+    builder.collapse(role, &members, area)
+}
+
+/// The change area every member sits in, when they all sit in one.
+///
+/// The derivation is [`query::change_area`], so an area named here means what
+/// it means in a change summary.
+fn shared_area(builder: &GraphBuilder, members: &BTreeSet<String>) -> Option<String> {
+    let mut shared: Option<String> = None;
+    for node in members.iter().filter_map(|id| builder.node(id)) {
+        let area = query::change_area(&node.path);
+        match &shared {
+            None => shared = Some(area),
+            Some(existing) if *existing == area => {}
+            Some(_) => return None,
+        }
+    }
+    shared
 }
 
 /// The rooted function, the file it belongs to, and the path the graph names.
@@ -332,6 +478,7 @@ fn function_node(file: &FileResult, path: &str, function: &FunctionResult, depth
         range_start: (line, column),
         status: function_status(function.status),
         depth,
+        group: None,
     }
 }
 
@@ -614,6 +761,7 @@ impl Placed<'_> {
                 // needs to: a caller the change removed is in the base alone.
                 status: NodeStatus::from_membership(external.in_base, external.in_target),
                 depth,
+                group: None,
             },
         }
     }
@@ -1140,6 +1288,7 @@ fn module_node(path: &str, statuses: &BTreeMap<String, NodeStatus>, depth: u32) 
         range_start: (0, 0),
         status: statuses.get(path).copied().unwrap_or(NodeStatus::Unchanged),
         depth,
+        group: None,
     }
 }
 
@@ -1318,8 +1467,8 @@ mod tests {
         FileStatus,
         analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
         graph::{
-            DEFAULT_DEPTH, Direction, Edge, EdgeStatus, Evidence, Graph, Limits, Node, NodeKind,
-            NodeStatus, Relation, Resolution, View,
+            DEFAULT_DEPTH, Direction, Edge, EdgeStatus, Evidence, Graph, GroupRole, Limits, Node,
+            NodeKind, NodeStatus, Relation, Resolution, View,
         },
         imports::{FileSymbols, ImportIndex, SymbolIndex},
         languages::{
@@ -1525,16 +1674,15 @@ mod tests {
             .find(|edge| edge.from == Node::module_id(from) && edge.to == Node::module_id(to))
     }
 
-    fn edge_with<'a>(
+    /// The edge one group states about a module.
+    fn group_edge<'a>(
         graph: &'a Graph,
-        from: &str,
+        group: &str,
         to: &str,
         resolution: Resolution,
     ) -> Option<&'a Edge> {
         graph.edges().iter().find(|edge| {
-            edge.from == Node::module_id(from)
-                && edge.to == Node::module_id(to)
-                && edge.resolution == resolution
+            edge.from == group && edge.to == Node::module_id(to) && edge.resolution == resolution
         })
     }
 
@@ -1677,30 +1825,28 @@ mod tests {
             &request(&roots, &[Relation::TestedBy]),
         );
 
-        let imports = edge_with(
-            &graph,
-            "src/__tests__/core.spec.ts",
-            "src/core.ts",
-            Resolution::TestImportsModule,
-        )
-        .expect("the test imports the module");
+        // The two tests are one group, and each resolution is a different claim
+        // about the module, so each keeps its own edge and its own confidence.
+        let tests = Node::group_id(GroupRole::Tests);
+        let imports = group_edge(&graph, &tests, "src/core.ts", Resolution::TestImportsModule)
+            .expect("a test imports the module");
         assert_eq!(imports.relation, Relation::TestedBy);
         assert_eq!(imports.status, EdgeStatus::Unchanged);
         assert!((imports.confidence() - 0.9).abs() < f64::EPSILON);
 
-        let convention = edge_with(
+        let convention = group_edge(
             &graph,
-            "src/__tests__/core.test.ts",
+            &tests,
             "src/core.ts",
             Resolution::TestNameMatchesModule,
         )
-        .expect("the test is named after the module");
+        .expect("a test is named after the module");
         assert!((convention.confidence() - 0.8).abs() < f64::EPSILON);
 
-        // A test is a node one hop past the module it covers.
-        let test = node(&graph, "src/__tests__/core.spec.ts").expect("the test is a node");
-        assert_eq!(test.depth, 1);
-        assert_eq!(test.status, NodeStatus::Unchanged);
+        // The group sits one hop past the module its tests cover.
+        let group = graph.node(&tests).expect("the tests are a node");
+        assert_eq!(group.depth, 1);
+        assert_eq!(group.status, NodeStatus::Unchanged);
     }
 
     #[test]
@@ -2771,4 +2917,5 @@ mod tests {
             Some(3)
         );
     }
+
 }

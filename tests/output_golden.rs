@@ -165,6 +165,7 @@ fn graph() -> Graph {
         range_start: (0, 0),
         status,
         depth,
+        group: None,
     };
     let edge =
         |from: &str, to: &str, relation: Relation, status: EdgeStatus, resolution: Resolution| {
