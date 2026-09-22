@@ -524,14 +524,18 @@ fn body_facts(node: Node<'_>, source: &str, nesting: u32) -> BodyFacts {
     facts
 }
 
-/// Read the call one node records, when it is a call with a plain identifier
-/// callee.
+/// Read the call one node records, when its callee is a name.
 ///
 /// `new Foo()` names its callee in a `constructor` field and `Foo()` in a
-/// `function` field; that is the only difference between the two here. Every
-/// other callee shape -- a member expression, a computed access, a call on a
-/// call -- records nothing rather than a lower-confidence guess: the call graph
-/// shows a relationship it is sure of or shows none.
+/// `function` field; that is the only difference between the two here.
+///
+/// A member callee is recorded only in the one shape that can be resolved
+/// exactly: `receiver.name()`, where both halves are plain identifiers. A
+/// receiver that is a namespace import names a module whose exports are
+/// known, so the call resolves; a receiver that is anything else resolves to
+/// nothing, which is the answer the collector gave before it recorded these at
+/// all. A computed access (`a[b]()`), a call on a call, and a deeper member
+/// chain still record nothing rather than a lower-confidence guess.
 ///
 /// The line is the call expression's own, not the callee's: that is the
 /// position a reader jumps to to see the call, and a call spread over several
@@ -543,14 +547,27 @@ fn call_site(node: Node<'_>, source: &str) -> Option<CallSite> {
         _ => return None,
     };
     let callee = node.child_by_field_name(field)?;
-    if callee.kind() != "identifier" {
-        return None;
+    let line = start_line(node);
+    match callee.kind() {
+        "identifier" => Some(CallSite {
+            name: node_text(callee, source)?.to_owned(),
+            receiver: None,
+            line,
+        }),
+        "member_expression" => {
+            let object = callee.child_by_field_name("object")?;
+            let property = callee.child_by_field_name("property")?;
+            if object.kind() != "identifier" || property.kind() != "property_identifier" {
+                return None;
+            }
+            Some(CallSite {
+                name: node_text(property, source)?.to_owned(),
+                receiver: Some(node_text(object, source)?.to_owned()),
+                line,
+            })
+        }
+        _ => None,
     }
-    let name = node_text(callee, source)?;
-    Some(CallSite {
-        name: name.to_owned(),
-        line: start_line(node),
-    })
 }
 
 fn is_cyclomatic_decision(kind: &str) -> bool {
@@ -1227,6 +1244,7 @@ function caller(): number {
             caller.calls,
             vec![CallSite {
                 name: "helper".to_owned(),
+                receiver: None,
                 line: 5,
             }]
         );
@@ -1261,6 +1279,7 @@ function outer() {
             inner.calls,
             vec![CallSite {
                 name: "helper".to_owned(),
+                receiver: None,
                 line: 3,
             }]
         );
@@ -1268,17 +1287,19 @@ function outer() {
             outer.calls,
             vec![CallSite {
                 name: "other".to_owned(),
+                receiver: None,
                 line: 4,
             }]
         );
     }
 
     #[test]
-    fn ignores_callees_that_are_not_plain_identifiers() {
-        // A member callee, a computed one, and a call on a call each name
-        // something this stage cannot resolve, so they record nothing. The
-        // plain call inside the first one's arguments is still reached by the
-        // walk and is still a call to a name this file could declare.
+    fn records_a_member_callee_only_when_both_halves_are_names() {
+        // `holder.method(...)` names a receiver and a property, which resolves
+        // exactly when the receiver turns out to be a namespace import. A
+        // computed callee and a call on a call name something no stage can
+        // resolve, so they still record nothing. The plain call inside the
+        // first one's arguments is still reached by the walk.
         let source = br"
 function indirect(holder: Holder, key: string) {
   holder.method(direct());
@@ -1292,10 +1313,23 @@ function indirect(holder: Holder, key: string) {
 
         assert_eq!(
             indirect.calls,
-            vec![CallSite {
-                name: "direct".to_owned(),
-                line: 3,
-            }]
+            vec![
+                CallSite {
+                    name: "method".to_owned(),
+                    receiver: Some("holder".to_owned()),
+                    line: 3,
+                },
+                CallSite {
+                    name: "direct".to_owned(),
+                    receiver: None,
+                    line: 3,
+                },
+                CallSite {
+                    name: "create".to_owned(),
+                    receiver: Some("holder".to_owned()),
+                    line: 5,
+                },
+            ]
         );
     }
 
@@ -1312,14 +1346,23 @@ function build(factory: Factory): Widget {
         let build = &analysis.functions[0];
 
         // A `new_expression` names its callee in a different field than a
-        // `call_expression` does, and a member constructor is no more a plain
-        // identifier than a member call is.
+        // `call_expression` does, and a member constructor is read the same
+        // way a member call is: receiver and property, resolvable only when
+        // the receiver turns out to name a module.
         assert_eq!(
             build.calls,
-            vec![CallSite {
-                name: "Widget".to_owned(),
-                line: 4,
-            }]
+            vec![
+                CallSite {
+                    name: "Widget".to_owned(),
+                    receiver: Some("factory".to_owned()),
+                    line: 3,
+                },
+                CallSite {
+                    name: "Widget".to_owned(),
+                    receiver: None,
+                    line: 4,
+                },
+            ]
         );
     }
 
@@ -1341,6 +1384,7 @@ function countdown(value: number): number {
             countdown.calls,
             vec![CallSite {
                 name: "countdown".to_owned(),
+                receiver: None,
                 line: 6,
             }]
         );
@@ -1372,22 +1416,27 @@ function mixed(flag: boolean) {
             vec![
                 CallSite {
                     name: "second".to_owned(),
+                    receiver: None,
                     line: 3,
                 },
                 CallSite {
                     name: "first".to_owned(),
+                    receiver: None,
                     line: 5,
                 },
                 CallSite {
                     name: "second".to_owned(),
+                    receiver: None,
                     line: 6,
                 },
                 CallSite {
                     name: "first".to_owned(),
+                    receiver: None,
                     line: 8,
                 },
                 CallSite {
                     name: "second".to_owned(),
+                    receiver: None,
                     line: 8,
                 },
             ]

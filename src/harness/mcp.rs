@@ -413,7 +413,7 @@ fn direction_argument() -> Value {
 fn relations_argument() -> Value {
     json!({
         "type": "array",
-        "items": { "type": "string", "enum": ["imports", "tested_by", "calls", "contains"] },
+        "items": { "type": "string", "enum": ["imports", "tested_by", "calls", "contains", "re_exports"] },
         "description": "Which relationships get_impact_graph may follow. Defaults to every \
                         relation this version resolves.",
     })

@@ -275,7 +275,7 @@ fn graph_rejects_an_unsupported_relation_naming_what_is_accepted() {
         stderr.contains("extends"),
         "the rejected name is echoed: {stderr}"
     );
-    for accepted in ["imports", "tested_by", "calls", "contains"] {
+    for accepted in ["imports", "tested_by", "calls", "contains", "re_exports"] {
         assert!(
             stderr.contains(accepted),
             "the message names `{accepted}` as accepted: {stderr}"

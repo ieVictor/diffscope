@@ -88,6 +88,22 @@ impl NodeStatus {
     pub fn is_changed(self) -> bool {
         !matches!(self, Self::Unchanged)
     }
+
+    /// The status membership alone decides.
+    ///
+    /// A node the analysis examined takes the status the comparison reported,
+    /// which can say `modified`; a node read from a revision rather than from
+    /// the diff cannot be modified by definition, because the diff does not
+    /// contain it. A thing in neither revision is `removed`, which is the only
+    /// reading left for a node that was reached from the base and is gone.
+    #[must_use]
+    pub fn from_membership(in_base: bool, in_target: bool) -> Self {
+        match (in_base, in_target) {
+            (true, true) => Self::Unchanged,
+            (false, true) => Self::Added,
+            (_, false) => Self::Removed,
+        }
+    }
 }
 
 /// Whether a relationship exists in one revision, the other, or both.
@@ -149,8 +165,13 @@ impl Relation {
     /// rejected by name rather than answered with silence. A newly resolved
     /// relation is appended, so a default request keeps the prefix it already
     /// reported in the order it reported it.
-    pub const SUPPORTED: &'static [Self] =
-        &[Self::Imports, Self::TestedBy, Self::Calls, Self::Contains];
+    pub const SUPPORTED: &'static [Self] = &[
+        Self::Imports,
+        Self::TestedBy,
+        Self::Calls,
+        Self::Contains,
+        Self::ReExports,
+    ];
 
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -206,6 +227,13 @@ pub enum Resolution {
     TestImportsModule,
     /// A test file's name matches the module's, after extensions and suffixes.
     TestNameMatchesModule,
+    /// A call whose callee is a name the caller imports, resolving to a
+    /// function the imported module exports itself.
+    ImportedSymbol,
+    /// An export clause that forwards names from another module.
+    ExportClause,
+    /// A call whose callee resolves through one or more re-export hops.
+    ReExportedSymbol,
 }
 
 impl Resolution {
@@ -217,6 +245,9 @@ impl Resolution {
             Self::Declaration => "declaration",
             Self::TestImportsModule => "test_imports_module",
             Self::TestNameMatchesModule => "test_name_matches_module",
+            Self::ImportedSymbol => "imported_symbol",
+            Self::ExportClause => "export_clause",
+            Self::ReExportedSymbol => "re_exported_symbol",
         }
     }
 
@@ -225,14 +256,25 @@ impl Resolution {
     /// Fixed per resolution rather than computed, so two runs cannot disagree
     /// and a reader can look up what a number meant. A local call and a
     /// declared containment are facts of the one parsed file, so both are
-    /// exact; the two test values are the ones
+    /// exact; an imported symbol is one resolution of a specifier the import
+    /// index already resolved, against a name the exporting module publishes,
+    /// so it is exact too. The two test values are the ones
     /// [`crate::query::impact::TestLink`] already publishes, so a test reported
     /// at `0.9` by a detail answer cannot appear here at some other number.
+    ///
+    /// A re-exported symbol is the one call resolution below 1.0: each hop is
+    /// a separate specifier resolution that could be wrong, and a barrel
+    /// module's `export *` forwards names from a file the scan has not read,
+    /// so a chain is believed slightly less than the name it ends at.
     #[must_use]
     pub fn confidence(self) -> f64 {
         match self {
-            Self::ResolvedSpecifier | Self::DirectLocalSymbol | Self::Declaration => 1.0,
-            Self::TestImportsModule => 0.9,
+            Self::ResolvedSpecifier
+            | Self::DirectLocalSymbol
+            | Self::Declaration
+            | Self::ImportedSymbol
+            | Self::ExportClause => 1.0,
+            Self::TestImportsModule | Self::ReExportedSymbol => 0.9,
             Self::TestNameMatchesModule => 0.8,
         }
     }
@@ -817,9 +859,13 @@ mod tests {
         assert_eq!(Relation::parse("tested_by"), Some(Relation::TestedBy));
         assert_eq!(Relation::parse("calls"), Some(Relation::Calls));
         assert_eq!(Relation::parse("contains"), Some(Relation::Contains));
+        assert_eq!(Relation::parse("re_exports"), Some(Relation::ReExports));
         assert_eq!(Relation::parse("possible_call"), None);
         assert_eq!(Relation::parse("depends_on"), None);
-        assert_eq!(Relation::accepted(), "imports, tested_by, calls, contains");
+        assert_eq!(
+            Relation::accepted(),
+            "imports, tested_by, calls, contains, re_exports"
+        );
     }
 
     #[test]
@@ -828,6 +874,26 @@ mod tests {
         assert!((Resolution::DirectLocalSymbol.confidence() - 1.0).abs() < f64::EPSILON);
         assert_eq!(Resolution::Declaration.name(), "declaration");
         assert!((Resolution::Declaration.confidence() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_re_exported_symbol_is_the_one_call_resolution_below_certainty() {
+        assert_eq!(Resolution::ImportedSymbol.name(), "imported_symbol");
+        assert!((Resolution::ImportedSymbol.confidence() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(Resolution::ExportClause.name(), "export_clause");
+        assert!((Resolution::ExportClause.confidence() - 1.0).abs() < f64::EPSILON);
+        // Each hop is a separate resolution that could be wrong, so a chain is
+        // believed exactly as much as a test that imports its module.
+        assert_eq!(Resolution::ReExportedSymbol.name(), "re_exported_symbol");
+        assert!(
+            (Resolution::ReExportedSymbol.confidence()
+                - Resolution::TestImportsModule.confidence())
+            .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            Resolution::ReExportedSymbol.confidence() < Resolution::ImportedSymbol.confidence()
+        );
     }
 
     #[test]
