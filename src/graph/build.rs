@@ -236,6 +236,7 @@ fn function_graph(
         revisions,
         changed: changed_files(result),
         guess: request.relations.contains(&Relation::PossibleCall),
+        view: request.view,
     };
     let mut unresolved = UnresolvedCalls::default();
     let mut calls = local_calls(functions, &path, &locals);
@@ -248,7 +249,6 @@ fn function_graph(
         &path,
         functions,
         &locals,
-        request.view,
     );
     add_cross_file_callers(
         &mut calls,
@@ -257,7 +257,6 @@ fn function_graph(
         &resolver,
         file,
         &path,
-        request.view,
     );
 
     let (outgoing, incoming) = call_adjacency(&calls, request.relations);
@@ -672,6 +671,7 @@ enum Side {
     Base,
     Target,
 }
+type UnresolvedCallSite = (Side, String, u32, u32, String, Option<String>, u32);
 
 /// Call sites no exact rule, nor an opted-in possible-call rule, resolved.
 ///
@@ -679,7 +679,7 @@ enum Side {
 /// inspect the same source site cannot inflate the report.
 #[derive(Default)]
 struct UnresolvedCalls {
-    sites: BTreeSet<(Side, String, u32, u32, String, Option<String>, u32)>,
+    sites: BTreeSet<UnresolvedCallSite>,
 }
 
 impl UnresolvedCalls {
@@ -1031,14 +1031,16 @@ struct Locals<'a> {
 
 /// What cross-file call resolution reads from, for one comparison.
 ///
-/// The two revisions to resolve against, the files the diff contains, and
-/// whether this request admits a guess. The three travel together because
-/// every cross-file resolution needs all of them, and because the flag
-/// belongs beside the indexes it decides how far to search.
+/// The two revisions to resolve against, the files the diff contains, whether
+/// this request admits a guess, and the requested view travel together because
+/// every cross-file resolution needs them. Keeping the view here also prevents
+/// unresolved-call accounting from drifting from the edge resolution it
+/// observes.
 struct Resolver<'a> {
     revisions: &'a Revisions<'a>,
     changed: BTreeMap<&'a str, &'a FileResult>,
     guess: bool,
+    view: View,
 }
 
 /// Add an edge for every call the root's file makes into another module.
@@ -1050,7 +1052,6 @@ fn add_cross_file_callees<'a>(
     path: &str,
     functions: &'a [FunctionResult],
     locals: &Locals<'_>,
-    view: View,
 ) {
     let node_ids = &locals.ids;
     let (base_names, target_names) = (&locals.base, &locals.target);
@@ -1069,7 +1070,7 @@ fn add_cross_file_callees<'a>(
                 let Some((relation, resolution, target)) = callee(resolver, side, path, call)
                 else {
                     if let Some(range) = side_range(caller, side) {
-                        unresolved.record(side, path, range, call, view);
+                        unresolved.record(side, path, range, call, resolver.view);
                     }
                     continue;
                 };
@@ -1154,7 +1155,6 @@ fn add_cross_file_callers<'a>(
     resolver: &Resolver<'a>,
     file: &'a FileResult,
     path: &'a str,
-    view: View,
 ) {
     let revisions = resolver.revisions;
     let functions = file.functions.as_slice();
@@ -1166,7 +1166,7 @@ fn add_cross_file_callers<'a>(
                     let Some((relation, resolution, target)) =
                         callee(resolver, side, importer, call)
                     else {
-                        unresolved.record(side, caller.path, caller.range, call, view);
+                        unresolved.record(side, caller.path, caller.range, call, resolver.view);
                         continue;
                     };
                     if target.0 != path {
