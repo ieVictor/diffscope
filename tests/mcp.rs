@@ -149,6 +149,22 @@ fn every_tool_answers_the_question_it_names() {
     );
     assert!(rendered["graph"]["edges"].is_array());
     assert!(rendered["visualization"]["recommended"].is_boolean());
+    assert_eq!(
+        rendered["completeness"],
+        json!({
+            "scan_truncated_files": 0,
+            "unresolved_specifiers": 0,
+            "unresolved_calls": 0,
+            "relations_supported": [
+                "imports",
+                "tested_by",
+                "calls",
+                "contains",
+                "re_exports",
+                "possible_call"
+            ]
+        })
+    );
 
     let files = server.call("list_changed_files", &comparison(&repo));
     assert!(files["structuredContent"]["data"]["files"].is_array());
