@@ -19,8 +19,8 @@ use crate::{
     FileStatus,
     analysis::FunctionChangeStatus,
     graph::{
-        Completeness, Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, GroupRole, Limits,
-        Node, NodeKind, NodeStatus, Reached, Relation, Resolution, View, walk,
+        Completeness, Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, GroupRole,
+        Limits, Node, NodeKind, NodeStatus, Reached, Relation, Resolution, View, walk,
     },
     imports::{ExportedDefinition, ImportIndex, SymbolIndex},
     languages::{CallSite, ImportedName, SourceRange, symbol_id},
@@ -309,11 +309,7 @@ fn function_graph(
 /// The reached set is captured before view filtering, grouping, and delivery
 /// budgets. A one-sided view counts only its selected revision; delta counts
 /// the union of both side-specific observations.
-fn module_completeness(
-    revisions: &Revisions<'_>,
-    view: View,
-    reached: &Reached,
-) -> Completeness {
+fn module_completeness(revisions: &Revisions<'_>, view: View, reached: &Reached) -> Completeness {
     let scope = reached
         .keys()
         .map(|id| path_of(id).to_owned())
@@ -334,9 +330,9 @@ fn index_completeness(
             continue;
         }
         let (index, _) = revisions.side(side);
-        completeness.scan_truncated_files = completeness
-            .scan_truncated_files
-            .saturating_add(u32::try_from(index.truncated_files().intersection(scope).count()).unwrap_or(u32::MAX));
+        completeness.scan_truncated_files = completeness.scan_truncated_files.saturating_add(
+            u32::try_from(index.truncated_files().intersection(scope).count()).unwrap_or(u32::MAX),
+        );
         completeness.unresolved_specifiers = completeness
             .unresolved_specifiers
             .saturating_add(index.unresolved_specifiers_in(scope));
@@ -3329,8 +3325,11 @@ mod tests {
                 .all(|edge| edge.relation != Relation::PossibleCall)
         );
         assert!(
-            function_node(&graph, &external_id("src/parse.ts", "stripComments", "target", 12))
-                .is_none()
+            function_node(
+                &graph,
+                &external_id("src/parse.ts", "stripComments", "target", 12)
+            )
+            .is_none()
         );
         assert!(
             function_node(
@@ -3692,7 +3691,10 @@ mod tests {
 
         assert_eq!(graph.completeness().scan_truncated_files, 2);
         assert_eq!(graph.completeness().unresolved_specifiers, 2);
-        assert_eq!(graph.completeness().relations_supported, Relation::SUPPORTED);
+        assert_eq!(
+            graph.completeness().relations_supported,
+            Relation::SUPPORTED
+        );
     }
 
     #[test]
