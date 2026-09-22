@@ -108,7 +108,7 @@ fn handshake_negotiates_and_lists_exactly_the_six_tools() {
     );
     assert_eq!(
         properties["relations"]["items"]["enum"],
-        json!(["imports", "tested_by", "calls", "contains"]),
+        json!(["imports", "tested_by", "calls", "contains", "re_exports"]),
         "{graph}"
     );
 }

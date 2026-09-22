@@ -17,7 +17,6 @@ use super::display_path;
 use crate::{
     AnalysisResult,
     graph::{self, Direction, Graph, Limits, Node, NodeKind, Relation, View},
-    imports::ImportIndex,
 };
 
 /// Which renderings a request asked for.
@@ -153,15 +152,13 @@ impl GraphRequest {
 #[must_use]
 pub fn project(
     result: &AnalysisResult,
-    base: &ImportIndex,
-    target: &ImportIndex,
+    revisions: &graph::build::Revisions<'_>,
     request: &GraphRequest,
 ) -> GraphAnswer {
     let roots = request.root.iter().cloned().collect::<Vec<_>>();
     let graph = graph::build::build(
         result,
-        base,
-        target,
+        revisions,
         &graph::build::Request {
             roots: &roots,
             function_root: request.function_root.as_deref(),

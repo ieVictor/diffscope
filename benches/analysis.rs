@@ -4,8 +4,12 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use diffscope::{
     AnalysisRequest, BlobContent, analyze,
     git::Repository,
-    graph::{self, Direction, Limits, Relation, View, build::Request, canonical_depth},
-    imports::index_revision,
+    graph::{
+        self, Direction, Limits, Relation, View,
+        build::{Request, Revisions},
+        canonical_depth,
+    },
+    imports::{index_revision, index_symbols},
     inventory_changes,
     query::{self, FileFilter, FunctionFilter},
 };
@@ -105,8 +109,20 @@ fn import_graph(criterion: &mut Criterion) {
 fn impact_graph(criterion: &mut Criterion) {
     let corpus_root = prepare_corpus();
     let mut group = criterion.benchmark_group("impact_graph");
-
     for tier in TIERS {
+        impact_graph_tier(&mut group, &corpus_root, tier);
+    }
+    group.finish();
+}
+
+/// One corpus tier's graph costs: both indexes, the symbol index caller
+/// discovery needs, the build, and each rendering.
+fn impact_graph_tier(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    corpus_root: &std::path::Path,
+    tier: &str,
+) {
+    {
         let analysis_request = AnalysisRequest {
             repository_path: corpus_root.join(tier),
             base_revision: "HEAD~1".to_owned(),
@@ -125,6 +141,21 @@ fn impact_graph(criterion: &mut Criterion) {
             .commit_id;
         let base = index_revision(&repository, &base_commit).expect("benchmark index succeeds");
         let target = index_revision(&repository, &target_commit).expect("benchmark index succeeds");
+        // The files cross-file resolution is allowed to parse: the changed
+        // files, their direct importers, and what they import. This is the
+        // bound that makes function-level impact affordable, so its size is
+        // reported per corpus rather than assumed small.
+        let admitted = graph::build::admitted_files(&result, &base, &target);
+        let base_symbols = index_symbols(&repository, &base_commit, &admitted)
+            .expect("benchmark symbol index succeeds");
+        let target_symbols = index_symbols(&repository, &target_commit, &admitted)
+            .expect("benchmark symbol index succeeds");
+        let revisions = Revisions {
+            base: &base,
+            target: &target,
+            base_symbols: &base_symbols,
+            target_symbols: &target_symbols,
+        };
         // The request a default query makes: no named root (the changed set),
         // both directions, every supported relation, and canonical bounds.
         let request = Request {
@@ -136,11 +167,13 @@ fn impact_graph(criterion: &mut Criterion) {
             view: View::Delta,
             limits: Limits::canonical(None, None),
         };
-        let graph = graph::build::build(&result, &base, &target, &request);
+        let graph = graph::build::build(&result, &revisions, &request);
         eprintln!(
-            "{tier}: base_indexed_files={}, target_indexed_files={}, nodes={}, edges={}, truncated={}",
+            "{tier}: base_indexed_files={}, target_indexed_files={}, changed_files={}, admitted_files={}, nodes={}, edges={}, truncated={}",
             base.scanned_files(),
             target.scanned_files(),
+            result.files.len(),
+            admitted.len(),
             graph.nodes().len(),
             graph.edges().len(),
             graph.truncated()
@@ -156,6 +189,23 @@ fn impact_graph(criterion: &mut Criterion) {
                 });
             },
         );
+        // Caller discovery is the first thing DiffScope parses at full
+        // fidelity outside the diff, so the cost of the files the bound admits
+        // is measured as its own phase.
+        group.bench_with_input(
+            BenchmarkId::new("symbol_index", tier),
+            &target_commit,
+            |bencher, commit| {
+                bencher.iter(|| {
+                    index_symbols(
+                        &repository,
+                        std::hint::black_box(commit),
+                        std::hint::black_box(&admitted),
+                    )
+                    .expect("symbol index succeeds")
+                });
+            },
+        );
         group.bench_with_input(
             BenchmarkId::new("build", tier),
             &request,
@@ -163,29 +213,37 @@ fn impact_graph(criterion: &mut Criterion) {
                 bencher.iter(|| {
                     graph::build::build(
                         std::hint::black_box(&result),
-                        std::hint::black_box(&base),
-                        std::hint::black_box(&target),
+                        std::hint::black_box(&revisions),
                         std::hint::black_box(request),
                     )
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("render_dependency_diff", tier),
-            &graph,
-            |bencher, graph| {
-                bencher.iter(|| graph::render::dependency_diff(std::hint::black_box(graph)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("render_mermaid", tier),
-            &graph,
-            |bencher, graph| {
-                bencher.iter(|| graph::render::mermaid(std::hint::black_box(graph)));
-            },
-        );
+        render_benches(group, tier, &graph);
     }
-    group.finish();
+}
+
+/// Every rendering runs on the request that asks for it, so each is measured
+/// to prove it is negligible beside the build.
+fn render_benches(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    tier: &str,
+    graph: &diffscope::graph::Graph,
+) {
+    group.bench_with_input(
+        BenchmarkId::new("render_dependency_diff", tier),
+        graph,
+        |bencher, graph| {
+            bencher.iter(|| graph::render::dependency_diff(std::hint::black_box(graph)));
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("render_mermaid", tier),
+        graph,
+        |bencher, graph| {
+            bencher.iter(|| graph::render::mermaid(std::hint::black_box(graph)));
+        },
+    );
 }
 
 /// Projecting an analysis into one answer runs on every request, including the

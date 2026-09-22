@@ -1115,10 +1115,12 @@ mod tests {
             (
                 vec![CallSite {
                     name: "helper".to_owned(),
+                    receiver: None,
                     line: 2,
                 }],
                 vec![CallSite {
                     name: "other".to_owned(),
+                    receiver: None,
                     line: 2,
                 }],
             )
@@ -1128,6 +1130,7 @@ mod tests {
             (
                 vec![CallSite {
                     name: "helper".to_owned(),
+                    receiver: None,
                     line: 3,
                 }],
                 Vec::new(),
@@ -1139,6 +1142,7 @@ mod tests {
                 Vec::new(),
                 vec![CallSite {
                     name: "helper".to_owned(),
+                    receiver: None,
                     line: 3,
                 }],
             )

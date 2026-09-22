@@ -22,14 +22,74 @@ use crate::{
         Direction, Edge, EdgeStatus, Evidence, Graph, GraphBuilder, Limits, Node, NodeKind,
         NodeStatus, Reached, Relation, Resolution, View, walk,
     },
-    imports::ImportIndex,
-    languages::CallSite,
+    imports::{ExportedDefinition, ImportIndex, SymbolIndex},
+    languages::{CallSite, ImportedName, SourceRange, symbol_id},
     query::{self, impact},
     result::{AnalysisResult, FileResult, FunctionResult},
 };
 
 /// The prefix [`Node::module_id`] puts in front of a path.
 const MODULE_PREFIX: &str = "module:";
+
+/// Everything one comparison's two revisions know about relationships.
+///
+/// The import graphs cover every file of each revision; the symbol indexes
+/// cover only the files cross-file resolution is allowed to parse, which is
+/// the changed files, their direct importers, and what they import. Both sides
+/// are always present, because only two revisions can prove that a
+/// relationship was removed.
+pub struct Revisions<'a> {
+    pub base: &'a ImportIndex,
+    pub target: &'a ImportIndex,
+    pub base_symbols: &'a SymbolIndex,
+    pub target_symbols: &'a SymbolIndex,
+}
+
+impl Revisions<'_> {
+    /// The import graph and symbol index of one side.
+    fn side(&self, side: Side) -> (&ImportIndex, &SymbolIndex) {
+        match side {
+            Side::Base => (self.base, self.base_symbols),
+            Side::Target => (self.target, self.target_symbols),
+        }
+    }
+}
+
+/// The files cross-file resolution may parse, for one comparison.
+///
+/// A file can only call into a changed module if it imports that module, and
+/// the import index already names those files, so the set is the changed files
+/// themselves, their direct importers on either side, and the modules they
+/// import. Parsing a whole revision at full fidelity costs 676 ms on a Vue
+/// revision before the function collector runs; this bound is a property of
+/// how code is written rather than of how the tool is configured, and it is
+/// what makes function-level impact affordable at all.
+///
+/// Direct importers only. Through a package's barrel module almost every file
+/// reaches almost every other — one Vue utility is reached by 166 modules
+/// within two hops — so a caller list built from indirect importers is not a
+/// caller list.
+#[must_use]
+pub fn admitted_files(
+    result: &AnalysisResult,
+    base: &ImportIndex,
+    target: &ImportIndex,
+) -> BTreeSet<String> {
+    let mut admitted = BTreeSet::new();
+    for file in &result.files {
+        for path in [file.base_path.as_deref(), file.target_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            admitted.insert(path.to_owned());
+            for index in [base, target] {
+                admitted.extend(index.importers(path).iter().cloned());
+                admitted.extend(index.dependencies(path).iter().cloned());
+            }
+        }
+    }
+    admitted
+}
 
 /// What a graph request asks for, once the caller has validated it.
 ///
@@ -59,16 +119,13 @@ pub struct Request<'a> {
 
 /// Build the graph one request describes.
 #[must_use]
-pub fn build(
-    result: &AnalysisResult,
-    base: &ImportIndex,
-    target: &ImportIndex,
-    request: &Request<'_>,
-) -> Graph {
+pub fn build(result: &AnalysisResult, revisions: &Revisions<'_>, request: &Request<'_>) -> Graph {
     if let Some(function_id) = request.function_root {
-        return function_graph(result, function_id, request);
+        return function_graph(result, revisions, function_id, request);
     }
 
+    let base = revisions.base;
+    let target = revisions.target;
     let statuses = changed_statuses(result);
     let roots = root_paths(result, request.roots);
     let mut builder = GraphBuilder::new();
@@ -103,6 +160,9 @@ pub fn build(
     if request.relations.contains(&Relation::TestedBy) {
         add_test_edges(&mut builder, base, target, &reached, &statuses);
     }
+    if request.relations.contains(&Relation::ReExports) {
+        add_re_export_edges(&mut builder, revisions, &reached);
+    }
 
     builder.apply_view(request.view);
     builder.finish(request.limits)
@@ -110,19 +170,31 @@ pub fn build(
 
 /// Build the graph a function root describes.
 ///
-/// The graph is the function, the local calls it takes part in on either side
-/// of the change, and the module that declares it. Local means what
-/// [`CallSite`] records: a call whose callee is a plain identifier declared in
-/// the same file. Each side is resolved against the names that side declares,
-/// so a call only one revision wrote is one edge with one status, and the walk
+/// The graph is the function, the calls it takes part in on either side of the
+/// change, and the module that declares it. A call resolves in one of three
+/// ways, and in no other: against a name declared in the caller's own file,
+/// against a name the caller imports from a module that exports it, or against
+/// a name reached through re-exports. Each side is resolved separately, so a
+/// call only one revision wrote is one edge with one status, and the walk
 /// follows both revisions' edges, so a removed call is as visible as an added
 /// one.
+///
+/// Callers are discovered from the direct importers of the root's file, in
+/// both revisions, because a file can only call into a module it imports and a
+/// caller the change removed exists only in the base. Indirect importers are
+/// not parsed: through a barrel module almost every file reaches almost every
+/// other, and a caller list built that way is not a caller list.
 ///
 /// The module's own `imports` and `tested_by` relationships are deliberately
 /// not walked. They are the file-rooted answer; mixing them in would put two
 /// notions of "near the root" in one graph, and a caller who wants the module's
 /// relationships asks for a file root.
-fn function_graph(result: &AnalysisResult, function_id: &str, request: &Request<'_>) -> Graph {
+fn function_graph(
+    result: &AnalysisResult,
+    revisions: &Revisions<'_>,
+    function_id: &str,
+    request: &Request<'_>,
+) -> Graph {
     let Some((path, file, root)) = locate_function(result, function_id) else {
         // The caller validates the identity against the analysis before the
         // request reaches here, so a root that cannot be placed is an empty
@@ -134,16 +206,40 @@ fn function_graph(result: &AnalysisResult, function_id: &str, request: &Request<
     // The published identity of every record, computed once: a file can hold
     // thousands of call sites, and formatting an identity per site would repeat
     // work the analysis already did.
-    let mut node_ids: BTreeMap<&str, String> = BTreeMap::new();
-    let mut by_id: BTreeMap<String, &FunctionResult> = BTreeMap::new();
+    let mut ids: BTreeMap<&str, String> = BTreeMap::new();
+    let mut places: Places<'_> = BTreeMap::new();
     for function in functions {
         let id = function_node_id(file, function);
-        node_ids.insert(function.id.as_str(), id.clone());
-        by_id.insert(id, function);
+        ids.insert(function.id.as_str(), id.clone());
+        places.insert(
+            id,
+            Placed::Analyzed {
+                file,
+                path: path.clone(),
+                function,
+            },
+        );
     }
-    let base_names = declared_names(functions, |function| function.base_range.is_some());
-    let target_names = declared_names(functions, |function| function.target_range.is_some());
-    let calls = local_calls(functions, &node_ids, &base_names, &target_names);
+    let local = &places.keys().cloned().collect::<BTreeSet<_>>();
+    let locals = Locals {
+        ids,
+        base: declared_names(functions, |function| function.base_range.is_some()),
+        target: declared_names(functions, |function| function.target_range.is_some()),
+    };
+    let mut calls = local_calls(functions, &path, &locals);
+
+    let changed = changed_files(result);
+    add_cross_file_callees(
+        &mut calls,
+        &mut places,
+        revisions,
+        &changed,
+        &path,
+        functions,
+        &locals,
+    );
+    add_cross_file_callers(&mut calls, &mut places, revisions, &changed, file, &path);
+
     let (outgoing, incoming) = call_adjacency(&calls);
     let root_id = function_node_id(file, root);
 
@@ -163,13 +259,13 @@ fn function_graph(result: &AnalysisResult, function_id: &str, request: &Request<
         BTreeMap::from([(root_id, 0)])
     };
     for (id, depth) in &reached {
-        if let Some(function) = by_id.get(id) {
-            builder.add_node(function_node(file, &path, function, *depth));
+        if let Some(place) = places.get(id) {
+            builder.add_node(place.node(*depth));
         }
     }
 
     if request.relations.contains(&Relation::Calls) {
-        add_call_edges(&mut builder, &calls, &reached, &path);
+        add_call_edges(&mut builder, &calls, &reached);
     }
     if request.relations.contains(&Relation::Contains) {
         add_contains_edges(
@@ -177,7 +273,8 @@ fn function_graph(result: &AnalysisResult, function_id: &str, request: &Request<
             &path,
             &changed_statuses(result),
             &reached,
-            &by_id,
+            &places,
+            local,
         );
     }
 
@@ -277,21 +374,60 @@ fn declared_name(qualified_name: &str) -> &str {
     qualified_name.rsplit('.').next().unwrap_or(qualified_name)
 }
 
-/// One call relationship inside the file, and the sides it was seen on.
+/// One call relationship, and the sides it was seen on.
 ///
 /// Both sides are merged into one entry so that a relationship the two
 /// revisions share is one edge with one status, and the earliest line each side
 /// recorded is kept as the evidence for it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CallEdge {
     in_base: bool,
     in_target: bool,
     base_line: Option<u32>,
     target_line: Option<u32>,
+    /// File the call is written in, which is always the caller's own.
+    site: String,
+    /// How the callee was resolved.
+    ///
+    /// When the two revisions resolved one relationship differently — a name
+    /// imported directly in one and through a barrel module in the other — the
+    /// less confident resolution is kept, because an edge is only as
+    /// trustworthy as the weaker of the two claims behind it.
+    resolution: Resolution,
 }
 
-/// Every local call relationship of one file, keyed by caller and callee node
-/// identity.
+impl CallEdge {
+    fn new(site: &str, resolution: Resolution) -> Self {
+        Self {
+            in_base: false,
+            in_target: false,
+            base_line: None,
+            target_line: None,
+            site: site.to_owned(),
+            resolution,
+        }
+    }
+
+    /// Record one side's sighting of this relationship.
+    fn saw(&mut self, side: Side, line: u32, resolution: Resolution) {
+        match side {
+            Side::Base => {
+                self.in_base = true;
+                earliest(&mut self.base_line, line);
+            }
+            Side::Target => {
+                self.in_target = true;
+                earliest(&mut self.target_line, line);
+            }
+        }
+        if resolution.confidence() < self.resolution.confidence() {
+            self.resolution = resolution;
+        }
+    }
+}
+
+/// Every call relationship a function graph holds, keyed by caller and callee
+/// node identity.
 type CallEdges = BTreeMap<(String, String), CallEdge>;
 
 /// One direction of a file's call relationships, as node identities.
@@ -310,49 +446,56 @@ enum Side {
 /// one revision has is still an entry: a removed call is as much a fact of the
 /// comparison as an added one, and a call both revisions wrote is one entry
 /// rather than two.
-fn local_calls<'a>(
-    functions: &'a [FunctionResult],
-    node_ids: &BTreeMap<&'a str, String>,
-    base_names: &BTreeMap<&'a str, Option<&'a FunctionResult>>,
-    target_names: &BTreeMap<&'a str, Option<&'a FunctionResult>>,
-) -> BTreeMap<(String, String), CallEdge> {
-    let mut edges: BTreeMap<(String, String), CallEdge> = BTreeMap::new();
+fn local_calls<'a>(functions: &'a [FunctionResult], path: &str, locals: &Locals<'a>) -> CallEdges {
+    let mut edges: CallEdges = BTreeMap::new();
     for caller in functions {
         resolve_calls(
             caller,
             &caller.calls_before,
-            base_names,
+            path,
+            &locals.base,
             Side::Base,
-            node_ids,
+            &locals.ids,
             &mut edges,
         );
         resolve_calls(
             caller,
             &caller.calls_after,
-            target_names,
+            path,
+            &locals.target,
             Side::Target,
-            node_ids,
+            &locals.ids,
             &mut edges,
         );
     }
     edges
 }
 
-/// Record the calls one side of one function wrote.
+/// Record the calls one side of one function wrote to names its own file
+/// declares.
 ///
 /// A name that side declares twice and a name it declares nowhere both produce
-/// nothing: the first is ambiguity, the second is an import, a local, a global,
-/// or a parameter. This stage resolves a call exactly or not at all, so neither
-/// is guessed at, lowered in confidence, or recorded as a placeholder.
+/// nothing here: the first is ambiguity, the second is an import, a local, a
+/// global, or a parameter, and an import is resolved by
+/// [`add_cross_file_callees`] instead. This stage resolves a call exactly or
+/// not at all, so neither is guessed at, lowered in confidence, or recorded as
+/// a placeholder.
+///
+/// A member call is never local: `receiver.name()` says the callee belongs to
+/// something, and only a namespace import says what.
 fn resolve_calls<'a>(
     caller: &FunctionResult,
     calls: &[CallSite],
+    path: &str,
     names: &BTreeMap<&'a str, Option<&'a FunctionResult>>,
     side: Side,
     node_ids: &BTreeMap<&'a str, String>,
-    edges: &mut BTreeMap<(String, String), CallEdge>,
+    edges: &mut CallEdges,
 ) {
     for call in calls {
+        if call.receiver.is_some() {
+            continue;
+        }
         let Some(Some(target)) = names.get(call.name.as_str()) else {
             continue;
         };
@@ -362,18 +505,430 @@ fn resolve_calls<'a>(
         ) else {
             continue;
         };
-        let entry = edges.entry((from.clone(), to.clone())).or_default();
-        match side {
-            Side::Base => {
-                entry.in_base = true;
-                earliest(&mut entry.base_line, call.line);
-            }
-            Side::Target => {
-                entry.in_target = true;
-                earliest(&mut entry.target_line, call.line);
+        edges
+            .entry((from.clone(), to.clone()))
+            .or_insert_with(|| CallEdge::new(path, Resolution::DirectLocalSymbol))
+            .saw(side, call.line, Resolution::DirectLocalSymbol);
+    }
+}
+
+/// Whether one side of one file declares the name a call writes.
+///
+/// A call that resolves locally is not looked up across files: the file's own
+/// declaration is the definition, and TypeScript would not let an import share
+/// the name.
+fn declares(names: &BTreeMap<&str, Option<&FunctionResult>>, call: &CallSite) -> bool {
+    call.receiver.is_none() && matches!(names.get(call.name.as_str()), Some(Some(_)))
+}
+
+/// The definition one call site names in another module, when it names one.
+///
+/// The three shapes that resolve are a named import, a default import, and a
+/// call on a namespace import. A bare call on a namespace (`ns()`), a member
+/// call on anything else, and a name the file does not import resolve to
+/// nothing: this stage reports a call it can prove or none at all.
+fn cross_file_callee(
+    revisions: &Revisions<'_>,
+    side: Side,
+    from: &str,
+    call: &CallSite,
+) -> Option<(ExportedDefinition, Resolution)> {
+    let (imports, symbols) = revisions.side(side);
+    let bindings = imports.bindings(from);
+    let (binding, exported) = if let Some(receiver) = &call.receiver {
+        let binding = bindings.get(receiver)?;
+        // `ns.name()` resolves exactly, because the receiver is a module whose
+        // exported names are known.
+        if binding.imported != ImportedName::Namespace {
+            return None;
+        }
+        (binding, call.name.clone())
+    } else {
+        let binding = bindings.get(&call.name)?;
+        let exported = match &binding.imported {
+            ImportedName::Named(name) => name.clone(),
+            ImportedName::Default => "default".to_owned(),
+            // Calling a namespace object is not a call into any one of the
+            // names it holds.
+            ImportedName::Namespace => return None,
+        };
+        (binding, exported)
+    };
+    let module = imports.resolve_specifier(from, &binding.specifier)?;
+    let definition = symbols.definition(imports, module, &exported)?;
+    // A definition reached through re-exports crossed one resolution per hop,
+    // each of which could be wrong.
+    let resolution = if definition.hops == 0 {
+        Resolution::ImportedSymbol
+    } else {
+        Resolution::ReExportedSymbol
+    };
+    Some((definition, resolution))
+}
+
+/// A function node the graph can place, by identity.
+///
+/// A function in a file the diff contains is named by the record the analysis
+/// produced, so a node here and a detail answer's node for one function are
+/// the same string with the same status. A function in a file the diff does
+/// not contain has no such record, and is named from the definition the symbol
+/// index read.
+enum Placed<'a> {
+    Analyzed {
+        file: &'a FileResult,
+        path: String,
+        function: &'a FunctionResult,
+    },
+    External(External),
+}
+
+/// Every function node the graph may hold, keyed by node identity.
+type Places<'a> = BTreeMap<String, Placed<'a>>;
+
+/// A function definition read from a revision rather than from the analysis.
+struct External {
+    id: String,
+    path: String,
+    label: String,
+    range_start: (u32, u32),
+    in_base: bool,
+    in_target: bool,
+}
+
+impl Placed<'_> {
+    fn node(&self, depth: u32) -> Node {
+        match self {
+            Self::Analyzed {
+                file,
+                path,
+                function,
+            } => function_node(file, path, function, depth),
+            Self::External(external) => Node {
+                id: external.id.clone(),
+                key: String::new(),
+                label: external.label.clone(),
+                kind: NodeKind::Function,
+                path: external.path.clone(),
+                range_start: external.range_start,
+                // Membership is all an unchanged file can say, and all it
+                // needs to: a caller the change removed is in the base alone.
+                status: NodeStatus::from_membership(external.in_base, external.in_target),
+                depth,
+            },
+        }
+    }
+}
+
+/// The files the comparison contains, by the path the graph names them under.
+fn changed_files(result: &AnalysisResult) -> BTreeMap<&str, &FileResult> {
+    let mut changed = BTreeMap::new();
+    for file in &result.files {
+        for path in [file.target_path.as_deref(), file.base_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let _existing = changed.entry(path).or_insert(file);
+        }
+    }
+    changed
+}
+
+/// Name the node one definition belongs to, registering it if it is new.
+///
+/// A definition in a changed file is matched back to the analysis' record for
+/// it, by the range that side reported, so the graph and every other answer
+/// name one function identically. A definition anywhere else is identified the
+/// same way [`query::function_id`] identifies one — path, symbol, side, and
+/// position — with the side taken from the revision that still has it, so a
+/// function both revisions share is one node rather than two.
+fn place_function<'a>(
+    places: &mut Places<'a>,
+    revisions: &Revisions<'_>,
+    changed: &BTreeMap<&'a str, &'a FileResult>,
+    path: &str,
+    range: &SourceRange,
+) -> Option<String> {
+    if let Some(file) = changed.get(path) {
+        let function = file.functions.iter().find(|function| {
+            function.base_range.as_ref() == Some(range)
+                || function.target_range.as_ref() == Some(range)
+        })?;
+        let id = function_node_id(file, function);
+        places.entry(id.clone()).or_insert(Placed::Analyzed {
+            file,
+            path: path.to_owned(),
+            function,
+        });
+        return Some(id);
+    }
+
+    let in_base = holds(revisions.base_symbols, path, range);
+    let in_target = holds(revisions.target_symbols, path, range);
+    let function = revisions
+        .target_symbols
+        .file(path)
+        .into_iter()
+        .chain(revisions.base_symbols.file(path))
+        .flat_map(|file| file.functions.iter())
+        .find(|function| &function.range == range)?;
+    let side = if in_target { "target" } else { "base" };
+    let id = Node::function_id(&format!(
+        "{path}#{}@{side}:{}:{}",
+        symbol_id(function.kind, &function.qualified_name),
+        range.start_line,
+        range.start_column
+    ));
+    places
+        .entry(id.clone())
+        .or_insert(Placed::External(External {
+            id: id.clone(),
+            path: path.to_owned(),
+            label: function.qualified_name.clone(),
+            range_start: (range.start_line, range.start_column),
+            in_base,
+            in_target,
+        }));
+    Some(id)
+}
+
+/// Whether one revision holds a function at this path and range.
+fn holds(symbols: &SymbolIndex, path: &str, range: &SourceRange) -> bool {
+    symbols
+        .file(path)
+        .is_some_and(|file| file.functions.iter().any(|f| &f.range == range))
+}
+
+/// What the root's own file declares: the node identity of every record, and
+/// the definitions each side has by the name a call would write.
+///
+/// The three move together because every local resolution needs all three, and
+/// each is derived once per graph rather than per call site.
+struct Locals<'a> {
+    ids: BTreeMap<&'a str, String>,
+    base: BTreeMap<&'a str, Option<&'a FunctionResult>>,
+    target: BTreeMap<&'a str, Option<&'a FunctionResult>>,
+}
+
+/// Add an edge for every call the root's file makes into another module.
+fn add_cross_file_callees<'a>(
+    calls: &mut CallEdges,
+    places: &mut Places<'a>,
+    revisions: &Revisions<'_>,
+    changed: &BTreeMap<&'a str, &'a FileResult>,
+    path: &str,
+    functions: &'a [FunctionResult],
+    locals: &Locals<'_>,
+) {
+    let node_ids = &locals.ids;
+    let (base_names, target_names) = (&locals.base, &locals.target);
+    for caller in functions {
+        let Some(from) = node_ids.get(caller.id.as_str()).cloned() else {
+            continue;
+        };
+        for (side, sites, declared) in [
+            (Side::Base, &caller.calls_before, base_names),
+            (Side::Target, &caller.calls_after, target_names),
+        ] {
+            for call in sites {
+                if declares(declared, call) {
+                    continue;
+                }
+                let Some((definition, resolution)) = cross_file_callee(revisions, side, path, call)
+                else {
+                    continue;
+                };
+                let Some(to) = place_function(
+                    places,
+                    revisions,
+                    changed,
+                    &definition.path,
+                    &definition.range,
+                ) else {
+                    continue;
+                };
+                calls
+                    .entry((from.clone(), to))
+                    .or_insert_with(|| CallEdge::new(path, resolution))
+                    .saw(side, call.line, resolution);
             }
         }
     }
+}
+
+/// Add an edge for every call into the root's file from a module that imports
+/// it.
+///
+/// The importers come from each revision's import graph, so a caller only the
+/// base has is discovered from the base, which is what makes a removed caller
+/// visible. Their bodies come from the analysis when the diff contains them and
+/// from the revision's symbol index otherwise, which is the only place files
+/// outside the diff are read at all.
+fn add_cross_file_callers<'a>(
+    calls: &mut CallEdges,
+    places: &mut Places<'a>,
+    revisions: &'a Revisions<'a>,
+    changed: &BTreeMap<&'a str, &'a FileResult>,
+    file: &'a FileResult,
+    path: &'a str,
+) {
+    let functions = file.functions.as_slice();
+    for side in [Side::Base, Side::Target] {
+        let (imports, _) = revisions.side(side);
+        for importer in imports.importers(path) {
+            for caller in callers_of(revisions, changed, importer, side) {
+                for call in caller.calls {
+                    let Some((definition, resolution)) =
+                        cross_file_callee(revisions, side, importer, call)
+                    else {
+                        continue;
+                    };
+                    if definition.path != path {
+                        continue;
+                    }
+                    let Some(to) = root_file_function(file, functions, &definition, side) else {
+                        continue;
+                    };
+                    let Some(from) =
+                        place_function(places, revisions, changed, caller.path, caller.range)
+                    else {
+                        continue;
+                    };
+                    calls
+                        .entry((from, to))
+                        .or_insert_with(|| CallEdge::new(importer, resolution))
+                        .saw(side, call.line, resolution);
+                }
+            }
+        }
+    }
+}
+
+/// One function that may call into the root's file, wherever it was read from.
+///
+/// A caller is a position and a list of call sites; whether the analysis or a
+/// revision's symbol index produced it matters only when the node is named,
+/// which [`place_function`] decides from the path alone.
+struct Caller<'a> {
+    path: &'a str,
+    range: &'a SourceRange,
+    calls: &'a [CallSite],
+}
+
+/// The functions one importing file declares on one side.
+///
+/// The analysis is preferred when the diff contains the file, because its
+/// records are what every other answer names that file's functions by. Only a
+/// file the diff does not contain is read from the symbol index, and only
+/// because it imports something that changed.
+fn callers_of<'a>(
+    revisions: &'a Revisions<'a>,
+    changed: &BTreeMap<&'a str, &'a FileResult>,
+    importer: &'a str,
+    side: Side,
+) -> Vec<Caller<'a>> {
+    if let Some(file) = changed.get(importer) {
+        return file
+            .functions
+            .iter()
+            .filter_map(|function| {
+                let (range, calls) = match side {
+                    Side::Base => (function.base_range.as_ref()?, &function.calls_before),
+                    Side::Target => (function.target_range.as_ref()?, &function.calls_after),
+                };
+                Some(Caller {
+                    path: importer,
+                    range,
+                    calls,
+                })
+            })
+            .collect();
+    }
+
+    let (_, symbols) = revisions.side(side);
+    symbols
+        .file(importer)
+        .into_iter()
+        .flat_map(|file| file.functions.iter())
+        .map(|function| Caller {
+            path: importer,
+            range: &function.range,
+            calls: &function.calls,
+        })
+        .collect()
+}
+
+/// The root file's function a definition points at, by the range that side
+/// reported.
+fn root_file_function(
+    file: &FileResult,
+    functions: &[FunctionResult],
+    definition: &ExportedDefinition,
+    side: Side,
+) -> Option<String> {
+    let function = functions.iter().find(|function| {
+        let range = match side {
+            Side::Base => function.base_range.as_ref(),
+            Side::Target => function.target_range.as_ref(),
+        };
+        range == Some(&definition.range)
+    })?;
+    Some(function_node_id(file, function))
+}
+
+/// Add a `re_exports` edge for every module a reached module forwards from.
+///
+/// A re-export is a structural relationship of its own and one that breaks
+/// callers when it goes away: a barrel module that stops forwarding a name
+/// breaks every importer of that name. Both endpoints must be reached, for the
+/// same reason an import edge needs both.
+///
+/// The evidence is the statement's own line, which is the `export ... from`
+/// the import edge was built from as well.
+fn add_re_export_edges(builder: &mut GraphBuilder, revisions: &Revisions<'_>, reached: &Reached) {
+    for id in reached.keys() {
+        let path = path_of(id);
+        let mut forwarded: BTreeSet<&str> = BTreeSet::new();
+        for side in [Side::Base, Side::Target] {
+            let (imports, symbols) = revisions.side(side);
+            let Some(file) = symbols.file(path) else {
+                continue;
+            };
+            for specifier in &file.re_exported_modules {
+                if let Some(target) = imports.resolve_specifier(path, specifier) {
+                    forwarded.insert(target);
+                }
+            }
+        }
+        for target in forwarded {
+            let to = Node::module_id(target);
+            if !reached.contains_key(&to) {
+                continue;
+            }
+            let in_base = forwards(revisions, Side::Base, path, target);
+            let in_target = forwards(revisions, Side::Target, path, target);
+            let Some(status) = EdgeStatus::from_membership(in_base, in_target) else {
+                continue;
+            };
+            builder.add_edge(Edge {
+                from: id.clone(),
+                to,
+                relation: Relation::ReExports,
+                status,
+                resolution: Resolution::ExportClause,
+                evidence: import_evidence(path, target, status, revisions.base, revisions.target),
+            });
+        }
+    }
+}
+
+/// Whether one side forwards names from `target` out of `path`.
+fn forwards(revisions: &Revisions<'_>, side: Side, path: &str, target: &str) -> bool {
+    let (imports, symbols) = revisions.side(side);
+    symbols.file(path).is_some_and(|file| {
+        file.re_exported_modules
+            .iter()
+            .any(|specifier| imports.resolve_specifier(path, specifier) == Some(target))
+    })
 }
 
 /// Keep the earliest line a side recorded for one relationship.
@@ -440,12 +995,7 @@ fn call_neighbors(
 /// both: an edge to a function outside the walk would show a relationship the
 /// request asked not to follow. A cycle's closing edge is among the reached
 /// pairs, so it survives while the walk still terminates.
-fn add_call_edges(
-    builder: &mut GraphBuilder,
-    calls: &BTreeMap<(String, String), CallEdge>,
-    reached: &Reached,
-    path: &str,
-) {
+fn add_call_edges(builder: &mut GraphBuilder, calls: &CallEdges, reached: &Reached) {
     for ((from, to), call) in calls {
         if !reached.contains_key(from) || !reached.contains_key(to) {
             continue;
@@ -465,9 +1015,11 @@ fn add_call_edges(
             to: to.clone(),
             relation: Relation::Calls,
             status,
-            resolution: Resolution::DirectLocalSymbol,
+            resolution: call.resolution,
+            // The site is the caller's file, which is not the root's file for
+            // a call that reaches in from another module.
             evidence: line.map(|line| Evidence {
-                file: path.to_owned(),
+                file: call.site.clone(),
                 line,
             }),
         });
@@ -486,16 +1038,25 @@ fn add_call_edges(
 /// No evidence is attached. The site of a containment is the declaration the
 /// function node already carries a position for, so an edge repeating it would
 /// say nothing new.
+///
+/// Only the root module's own functions are attached. A caller reached in
+/// another file is declared by a module this graph does not describe, and
+/// pulling that module in would answer the file-rooted question inside the
+/// function-rooted one.
 fn add_contains_edges(
     builder: &mut GraphBuilder,
     path: &str,
     statuses: &BTreeMap<String, NodeStatus>,
     reached: &Reached,
-    by_id: &BTreeMap<String, &FunctionResult>,
+    places: &Places<'_>,
+    local: &BTreeSet<String>,
 ) {
     builder.add_node(module_node(path, statuses, 1));
     for id in reached.keys() {
-        let Some(function) = by_id.get(id) else {
+        if !local.contains(id) {
+            continue;
+        }
+        let Some(Placed::Analyzed { function, .. }) = places.get(id) else {
             continue;
         };
         let Some(status) = EdgeStatus::from_membership(
@@ -747,7 +1308,12 @@ fn resolution_of(link: impact::TestLink) -> Resolution {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, build};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::LazyLock,
+    };
+
+    use super::{Request, Revisions, build};
     use crate::{
         FileStatus,
         analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
@@ -755,14 +1321,33 @@ mod tests {
             DEFAULT_DEPTH, Direction, Edge, EdgeStatus, Evidence, Graph, Limits, Node, NodeKind,
             NodeStatus, Relation, Resolution, View,
         },
-        imports::ImportIndex,
-        languages::{CallSite, FunctionKind, SourceRange},
+        imports::{FileSymbols, ImportIndex, SymbolIndex},
+        languages::{
+            CallSite, ExportedSymbol, FunctionDefinition, FunctionKind, ImportedName, Language,
+            SourceRange,
+        },
+        metrics::FunctionMetrics,
         query,
         result::{
             AnalysisResult, AnalysisSummary, FileResult, FunctionResult, RevisionResult,
             SCHEMA_VERSION,
         },
     };
+
+    /// A revision that was never parsed for symbols.
+    ///
+    /// Module-rooted graphs and local call graphs resolve nothing across
+    /// files, so their tests say so by handing over an index covering no file.
+    static NO_SYMBOLS: LazyLock<SymbolIndex> = LazyLock::new(SymbolIndex::default);
+
+    fn revisions<'a>(base: &'a ImportIndex, target: &'a ImportIndex) -> Revisions<'a> {
+        Revisions {
+            base,
+            target,
+            base_symbols: &NO_SYMBOLS,
+            target_symbols: &NO_SYMBOLS,
+        }
+    }
 
     fn analysis(files: Vec<FileResult>) -> AnalysisResult {
         AnalysisResult {
@@ -827,6 +1412,7 @@ mod tests {
             .iter()
             .map(|(name, line)| CallSite {
                 name: (*name).to_owned(),
+                receiver: None,
                 line: *line,
             })
             .collect()
@@ -971,8 +1557,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &base,
-            &target,
+            &revisions(&base, &target),
             &request(&roots, Relation::SUPPORTED),
         );
 
@@ -1004,8 +1589,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &request(&roots, Relation::SUPPORTED),
         );
 
@@ -1033,12 +1617,12 @@ mod tests {
 
         let mut upstream = request(&roots, Relation::SUPPORTED);
         upstream.direction = Direction::Upstream;
-        let graph = build(&result, &index, &index, &upstream);
+        let graph = build(&result, &revisions(&index, &index), &upstream);
         assert_eq!(node_paths(&graph), vec!["src/app.ts", "src/core.ts"]);
 
         let mut downstream = request(&roots, Relation::SUPPORTED);
         downstream.direction = Direction::Downstream;
-        let graph = build(&result, &index, &index, &downstream);
+        let graph = build(&result, &revisions(&index, &index), &downstream);
         assert_eq!(node_paths(&graph), vec!["src/core.ts", "src/leaf.ts"]);
     }
 
@@ -1051,12 +1635,12 @@ mod tests {
 
         let mut one_hop = request(&roots, Relation::SUPPORTED);
         one_hop.direction = Direction::Downstream;
-        let graph = build(&result, &index, &index, &one_hop);
+        let graph = build(&result, &revisions(&index, &index), &one_hop);
         assert_eq!(node_paths(&graph), vec!["src/a.ts", "src/b.ts"]);
 
         let mut two_hops = one_hop;
         two_hops.depth = 2;
-        let graph = build(&result, &index, &index, &two_hops);
+        let graph = build(&result, &revisions(&index, &index), &two_hops);
         assert_eq!(node_paths(&graph), vec!["src/a.ts", "src/b.ts", "src/c.ts"]);
     }
 
@@ -1069,8 +1653,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &request(&roots, Relation::SUPPORTED),
         );
 
@@ -1090,8 +1673,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &request(&roots, &[Relation::TestedBy]),
         );
 
@@ -1129,8 +1711,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &request(&roots, &[Relation::Imports]),
         );
 
@@ -1155,7 +1736,11 @@ mod tests {
             changed_file(None, Some("src/leaf.ts"), FileStatus::Added),
         ]);
 
-        let graph = build(&result, &index, &index, &request(&[], Relation::SUPPORTED));
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &request(&[], Relation::SUPPORTED),
+        );
 
         assert_eq!(node_paths(&graph), vec!["src/leaf.ts", "src/renamed.ts"]);
         assert_eq!(
@@ -1214,8 +1799,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1286,8 +1870,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1322,8 +1905,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1371,8 +1953,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1414,8 +1995,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1467,8 +2047,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
         );
 
@@ -1543,20 +2122,20 @@ mod tests {
 
         let mut downstream = function_request(&root_id, Relation::SUPPORTED, 1);
         downstream.direction = Direction::Downstream;
-        let graph = build(&result, &index, &index, &downstream);
+        let graph = build(&result, &revisions(&index, &index), &downstream);
         assert_eq!(labels(&graph), vec!["a.ts", "root", "helper"]);
         assert!(call_edge(&graph, &root_id, &helper_id).is_some());
         assert!(call_edge(&graph, &caller_id, &root_id).is_none());
 
         let mut two_hops = downstream;
         two_hops.depth = 2;
-        let graph = build(&result, &index, &index, &two_hops);
+        let graph = build(&result, &revisions(&index, &index), &two_hops);
         assert_eq!(labels(&graph), vec!["a.ts", "root", "helper", "leaf"]);
         assert!(call_edge(&graph, &helper_id, &leaf_id).is_some());
 
         let mut upstream = function_request(&root_id, Relation::SUPPORTED, 1);
         upstream.direction = Direction::Upstream;
-        let graph = build(&result, &index, &index, &upstream);
+        let graph = build(&result, &revisions(&index, &index), &upstream);
         assert_eq!(labels(&graph), vec!["a.ts", "caller", "root"]);
         assert!(call_edge(&graph, &caller_id, &root_id).is_some());
         assert!(call_edge(&graph, &root_id, &helper_id).is_none());
@@ -1572,8 +2151,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(
                 &root_id,
                 &[Relation::Calls, Relation::Contains],
@@ -1589,8 +2167,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(&root_id, &[Relation::Calls], DEFAULT_DEPTH),
         );
         assert!(
@@ -1616,8 +2193,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &request(&roots, Relation::SUPPORTED),
         );
 
@@ -1640,8 +2216,7 @@ mod tests {
 
         let graph = build(
             &result,
-            &index,
-            &index,
+            &revisions(&index, &index),
             &function_request(
                 "src/a.ts#fn:absent@target:1:0",
                 Relation::SUPPORTED,
@@ -1651,5 +2226,549 @@ mod tests {
 
         assert!(graph.nodes().is_empty());
         assert!(graph.edges().is_empty());
+    }
+
+    // ------------------------------------------------- cross-file calls ---
+
+    /// A definition as a revision's symbol index records it, with the calls
+    /// its body writes.
+    fn definition(name: &str, line: u32, sites: Vec<CallSite>) -> FunctionDefinition {
+        FunctionDefinition {
+            language: Language::TypeScript,
+            kind: FunctionKind::Function,
+            qualified_name: name.to_owned(),
+            range: range(line),
+            metrics: FunctionMetrics {
+                physical_loc: 1,
+                source_loc: 1,
+                cyclomatic_complexity: 1,
+                cognitive_complexity: 0,
+            },
+            calls: sites,
+            body_hash: 0,
+        }
+    }
+
+    fn site(name: &str, receiver: Option<&str>, line: u32) -> CallSite {
+        CallSite {
+            name: name.to_owned(),
+            receiver: receiver.map(str::to_owned),
+            line,
+        }
+    }
+
+    /// A file that declares one exported function, and may call others.
+    fn declares(name: &str, line: u32, sites: Vec<CallSite>) -> FileSymbols {
+        FileSymbols {
+            exports: BTreeMap::from([(
+                name.to_owned(),
+                ExportedSymbol {
+                    local: name.to_owned(),
+                    from: None,
+                    function: Some(range(line)),
+                    line,
+                },
+            )]),
+            re_exported_modules: BTreeSet::new(),
+            functions: vec![definition(name, line, sites)],
+        }
+    }
+
+    /// A barrel module forwarding one name from another.
+    fn barrel(exported: &str, local: &str, specifier: &str) -> FileSymbols {
+        FileSymbols {
+            exports: BTreeMap::from([(
+                exported.to_owned(),
+                ExportedSymbol {
+                    local: local.to_owned(),
+                    from: Some(specifier.to_owned()),
+                    function: None,
+                    line: 1,
+                },
+            )]),
+            re_exported_modules: BTreeSet::from([specifier.to_owned()]),
+            functions: Vec::new(),
+        }
+    }
+
+    /// The changed file every cross-file test is rooted in: `src/a.ts`
+    /// declaring `root`, which writes the calls given.
+    fn rooted(sites_before: &[CallSite], sites_after: &[CallSite]) -> FileResult {
+        let mut function = function(
+            "function-1",
+            "root",
+            FunctionChangeStatus::Modified,
+            Some(1),
+            Some(1),
+            &[],
+            &[],
+        );
+        function.calls_before = sites_before.to_vec();
+        function.calls_after = sites_after.to_vec();
+        modified_with("src/a.ts", vec![function])
+    }
+
+    /// The symbol index of a revision where `src/a.ts` declares `root`.
+    fn with_root(files: &[(&str, FileSymbols)]) -> SymbolIndex {
+        let mut symbols = SymbolIndex::default();
+        symbols.insert("src/a.ts", declares("root", 1, Vec::new()));
+        for (path, file) in files {
+            symbols.insert(path, file.clone());
+        }
+        symbols
+    }
+
+    /// The identity an external definition is addressed by.
+    fn external_id(path: &str, name: &str, side: &str, line: u32) -> String {
+        format!("{path}#fn:{name}@{side}:{line}:0")
+    }
+
+    #[test]
+    fn a_named_import_called_directly_resolves_exactly() {
+        let file = rooted(&[], &[site("strip", None, 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "strip",
+            ImportedName::Named("stripComments".to_owned()),
+            "./parse",
+            "src/parse.ts",
+            2,
+        );
+        let symbols = with_root(&[("src/parse.ts", declares("stripComments", 12, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let callee = external_id("src/parse.ts", "stripComments", "target", 12);
+        let edge = call_edge(&graph, &root_id, &callee).expect("the imported call resolves");
+        assert_eq!(edge.resolution, Resolution::ImportedSymbol);
+        assert!((edge.confidence() - 1.0).abs() < f64::EPSILON);
+        // The call is only in the target, and its site is the caller's file.
+        assert_eq!(edge.status, EdgeStatus::Added);
+        assert_eq!(
+            edge.evidence
+                .as_ref()
+                .map(|evidence| evidence.file.as_str()),
+            Some("src/a.ts")
+        );
+
+        let node = function_node(&graph, &callee).expect("the callee is a node");
+        assert_eq!(node.label, "stripComments");
+        assert_eq!(node.path, "src/parse.ts");
+        // A file the diff does not contain is unchanged, which is all
+        // membership can say about it.
+        assert_eq!(node.status, NodeStatus::Unchanged);
+    }
+
+    #[test]
+    fn a_renamed_import_resolves_to_the_name_the_module_exports() {
+        let file = rooted(&[], &[site("b", None, 4)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "b",
+            ImportedName::Named("a".to_owned()),
+            "./x",
+            "src/x.ts",
+            1,
+        );
+        let symbols = with_root(&[("src/x.ts", declares("a", 3, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let callee = external_id("src/x.ts", "a", "target", 3);
+        assert!(call_edge(&graph, &root_id, &callee).is_some());
+        assert_eq!(
+            function_node(&graph, &callee).map(|node| node.label.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_default_import_resolves_to_the_default_export() {
+        let file = rooted(&[], &[site("compile", None, 6)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "compile",
+            ImportedName::Default,
+            "./compiler",
+            "src/compiler.ts",
+            1,
+        );
+        let mut compiler = declares("compileStyle", 9, Vec::new());
+        compiler.exports = BTreeMap::from([(
+            "default".to_owned(),
+            ExportedSymbol {
+                local: "compileStyle".to_owned(),
+                from: None,
+                function: Some(range(9)),
+                line: 9,
+            },
+        )]);
+        let symbols = with_root(&[("src/compiler.ts", compiler)]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let callee = external_id("src/compiler.ts", "compileStyle", "target", 9);
+        assert!(call_edge(&graph, &root_id, &callee).is_some());
+    }
+
+    #[test]
+    fn a_namespace_import_resolves_only_through_a_named_property() {
+        let file = rooted(
+            &[],
+            &[site("parse", Some("ns"), 5), site("run", Some("other"), 6)],
+        );
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "ns",
+            ImportedName::Namespace,
+            "./parse",
+            "src/parse.ts",
+            1,
+        );
+        let symbols = with_root(&[("src/parse.ts", declares("parse", 4, Vec::new()))]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        // `ns.parse()` names a module whose exports are known, so it resolves.
+        let callee = external_id("src/parse.ts", "parse", "target", 4);
+        assert!(call_edge(&graph, &root_id, &callee).is_some());
+        // `other.run()` names a receiver that is not an import, so it resolves
+        // to nothing rather than to a guess.
+        assert_eq!(graph.edges().len(), 2);
+    }
+
+    #[test]
+    fn a_re_export_chain_resolves_less_confidently_than_a_direct_import() {
+        let file = rooted(&[], &[site("strip", None, 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "strip",
+            ImportedName::Named("stripComments".to_owned()),
+            "./index",
+            "src/index.ts",
+            1,
+        );
+        index.forward("src/index.ts", "./parse", "src/parse.ts", 1);
+        let symbols = with_root(&[
+            (
+                "src/index.ts",
+                barrel("stripComments", "stripComments", "./parse"),
+            ),
+            ("src/parse.ts", declares("stripComments", 30, Vec::new())),
+        ]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let callee = external_id("src/parse.ts", "stripComments", "target", 30);
+        let edge = call_edge(&graph, &root_id, &callee).expect("the chain resolves");
+        assert_eq!(edge.resolution, Resolution::ReExportedSymbol);
+        assert!((edge.confidence() - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_name_reached_only_through_a_whole_module_re_export_produces_no_edge() {
+        let file = rooted(&[], &[site("strip", None, 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/a.ts",
+            "strip",
+            ImportedName::Named("stripComments".to_owned()),
+            "./index",
+            "src/index.ts",
+            1,
+        );
+        index.forward("src/index.ts", "./parse", "src/parse.ts", 1);
+        let star = FileSymbols {
+            exports: BTreeMap::new(),
+            re_exported_modules: BTreeSet::from(["./parse".to_owned()]),
+            functions: Vec::new(),
+        };
+        let symbols = with_root(&[
+            ("src/index.ts", star),
+            ("src/parse.ts", declares("stripComments", 30, Vec::new())),
+        ]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        // `export *` forwards names from a file the scan of the barrel never
+        // read, so the call stays unresolved rather than being guessed at.
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.relation != Relation::Calls)
+        );
+    }
+
+    #[test]
+    fn a_specifier_this_revision_does_not_have_produces_no_edge() {
+        let file = rooted(&[], &[site("debounce", None, 7)]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        // An installed package: the binding exists, the specifier names no
+        // file in this revision.
+        index.bind_external(
+            "src/a.ts",
+            "debounce",
+            ImportedName::Named("debounce".to_owned()),
+            "lodash",
+            1,
+        );
+        let symbols = with_root(&[]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.relation != Relation::Calls)
+        );
+    }
+
+    #[test]
+    fn a_caller_the_change_removed_is_a_removed_edge() {
+        let file = rooted(&[], &[]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut base = ImportIndex::default();
+        base.bind(
+            "src/caller.ts",
+            "root",
+            ImportedName::Named("root".to_owned()),
+            "./a",
+            "src/a.ts",
+            1,
+        );
+        let target = ImportIndex::default();
+        let base_symbols = with_root(&[(
+            "src/caller.ts",
+            declares("caller", 5, vec![site("root", None, 6)]),
+        )]);
+        let target_symbols = with_root(&[]);
+        let revisions = Revisions {
+            base: &base,
+            target: &target,
+            base_symbols: &base_symbols,
+            target_symbols: &target_symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        let caller = external_id("src/caller.ts", "caller", "base", 5);
+        let edge = call_edge(&graph, &caller, &root_id).expect("the removed caller is an edge");
+        assert_eq!(edge.status, EdgeStatus::Removed);
+        assert_eq!(
+            edge.evidence
+                .as_ref()
+                .map(|evidence| evidence.file.as_str()),
+            Some("src/caller.ts")
+        );
+        let node = function_node(&graph, &caller).expect("the caller is a node");
+        assert_eq!(node.status, NodeStatus::Removed);
+    }
+
+    #[test]
+    fn only_direct_importers_are_read_for_callers() {
+        let file = rooted(&[], &[]);
+        let root_id = published_id(&file, 0);
+        let result = analysis(vec![file]);
+        let mut index = ImportIndex::default();
+        index.bind(
+            "src/direct.ts",
+            "root",
+            ImportedName::Named("root".to_owned()),
+            "./a",
+            "src/a.ts",
+            1,
+        );
+        // An indirect importer that writes the same call: it imports the
+        // direct importer, not the changed file.
+        index.bind(
+            "src/indirect.ts",
+            "root",
+            ImportedName::Named("root".to_owned()),
+            "./direct",
+            "src/direct.ts",
+            1,
+        );
+        let symbols = with_root(&[
+            (
+                "src/direct.ts",
+                declares("direct", 5, vec![site("root", None, 6)]),
+            ),
+            (
+                "src/indirect.ts",
+                declares("indirect", 5, vec![site("root", None, 6)]),
+            ),
+        ]);
+        let revisions = Revisions {
+            base: &index,
+            target: &index,
+            base_symbols: &symbols,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &function_request(&root_id, Relation::SUPPORTED, DEFAULT_DEPTH),
+        );
+
+        assert!(
+            call_edge(
+                &graph,
+                &external_id("src/direct.ts", "direct", "target", 5),
+                &root_id
+            )
+            .is_some()
+        );
+        // Through a barrel module almost every file reaches almost every
+        // other, so a caller list built from indirect importers is not a
+        // caller list.
+        assert!(
+            function_node(
+                &graph,
+                &external_id("src/indirect.ts", "indirect", "target", 5)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_module_that_forwards_another_reports_a_re_exports_edge() {
+        let result = analysis(vec![modified("src/index.ts")]);
+        let mut index = ImportIndex::default();
+        index.forward("src/index.ts", "./parse", "src/parse.ts", 3);
+        let symbols = {
+            let mut symbols = SymbolIndex::default();
+            symbols.insert(
+                "src/index.ts",
+                barrel("stripComments", "stripComments", "./parse"),
+            );
+            symbols.insert("src/parse.ts", declares("stripComments", 30, Vec::new()));
+            symbols
+        };
+        let empty = SymbolIndex::default();
+        let base = ImportIndex::default();
+        let revisions = Revisions {
+            base: &base,
+            target: &index,
+            base_symbols: &empty,
+            target_symbols: &symbols,
+        };
+
+        let graph = build(
+            &result,
+            &revisions,
+            &request(&paths_of(&["src/index.ts"]), Relation::SUPPORTED),
+        );
+
+        let edge = graph
+            .edges()
+            .iter()
+            .find(|edge| edge.relation == Relation::ReExports)
+            .expect("the forwarding is an edge");
+        assert_eq!(edge.from, Node::module_id("src/index.ts"));
+        assert_eq!(edge.to, Node::module_id("src/parse.ts"));
+        assert_eq!(edge.resolution, Resolution::ExportClause);
+        // Only the target revision forwards it, so the relationship is added.
+        assert_eq!(edge.status, EdgeStatus::Added);
+        assert_eq!(
+            edge.evidence.as_ref().map(|evidence| evidence.line),
+            Some(3)
+        );
     }
 }

@@ -33,19 +33,26 @@ pub struct SourceRange {
 
 /// One call written inside a function body, as the collector saw it.
 ///
-/// Only a plain identifier callee is recorded. A call to a name declared in the
-/// same file needs no import resolution and no type information, so its target
-/// is knowable exactly; a member callee (`a.b()`), a computed one (`a[b]()`),
-/// or a call on a call needs information no stage has yet, and a name guessed
-/// from one of them would become an edge that may not exist.
+/// A plain identifier callee is a call to a name the file has: a declaration
+/// of its own, or something it imports. A member callee is recorded only in
+/// the `receiver.name()` shape, because a receiver that is a namespace import
+/// names a module whose exports are known; a computed callee (`a[b]()`), a
+/// call on a call, and a deeper chain need information no stage has, and a
+/// name guessed from one of them would become an edge that may not exist.
 ///
 /// The file is not recorded per call: a call site belongs to the function whose
 /// body contains it, and that function's own path is the file. Storing it again
 /// per call would repeat one path across thousands of sites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
-    /// Callee text, exactly as written, for a plain identifier callee.
+    /// Callee text as written, or the property name for a member callee.
     pub name: String,
+    /// The receiver a member callee was written on, if it was one.
+    ///
+    /// `None` is a bare `name()`, which resolves against the file's own
+    /// declarations and its imports. `Some` is `receiver.name()`, which
+    /// resolves only when the receiver is a namespace import.
+    pub receiver: Option<String>,
     /// 1-based line the call expression starts on.
     pub line: u32,
 }

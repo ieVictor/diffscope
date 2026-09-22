@@ -594,7 +594,7 @@ fn canonical_query_echoes_applied_parameters_and_defaults() {
             "file": null,
             "function_id": null,
             "direction": "both",
-            "relations": ["imports", "tested_by", "calls", "contains"],
+            "relations": ["imports", "tested_by", "calls", "contains", "re_exports"],
             "depth": 1,
             "view": "delta",
             "max_nodes": 30,
@@ -1042,7 +1042,7 @@ fn a_function_root_answers_with_calls_and_containment() {
     assert_eq!(applied["function_id"], json!(process_id));
     assert_eq!(
         applied["relations"],
-        json!(["imports", "tested_by", "calls", "contains"])
+        json!(["imports", "tested_by", "calls", "contains", "re_exports"])
     );
 
     assert_eq!(answer["root"]["kind"], json!("function"));
