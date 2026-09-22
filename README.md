@@ -244,19 +244,21 @@ flowchart LR
     class n4 added
 ```
 
+Large graphs preserve their shape before budgets remove detail: related tests, generated or vendored files, lockfiles, and remaining caller/dependency overflow become `group` nodes; cycles of two or more nodes render inside Mermaid `subgraph` blocks. JSON graph answers always include `data.completeness` with `scan_truncated_files`, `unresolved_specifiers`, `unresolved_calls`, and `relations_supported`, so zero is distinguishable from an absent completeness contract. A `possible_call` Mermaid edge is dashed and labelled `~0.5`.
+
 | Option | Meaning |
 | --- | --- |
 | `--file <PATH>` | Root the graph at one changed file. With no root, the graph is centered on the changed set. |
 | `--function <FUNCTION_ID>` | Root the graph at one function, by the `function_id` a listing reports. Mutually exclusive with `--file`. |
 | `--direction <upstream\|downstream\|both>` | Which way to walk. Default `both`. |
-| `--relations <NAMES>` | Comma-separated relations. Defaults to all supported: `imports`, `tested_by`, `calls`, `contains`, `re_exports`. |
+| `--relations <NAMES>` | Comma-separated supported relations. By default: `imports`, `tested_by`, `calls`, `contains`, `re_exports`. Add `possible_call` explicitly to include low-confidence property-name matches. |
 | `--depth <N>` | Hops from the root. Default `1`, clamped to 1–3. |
 | `--view <delta\|base\|target>` | Which revision's relationships to show. Default `delta`. |
 | `--max-nodes <N>` | Node budget. Default `30`, clamped to 3–100. |
 | `--max-edges <N>` | Edge budget. Default `60`, clamped to 3–200. |
 | `--format <text\|diff\|mermaid\|json>` | Output form. Default `text`: the comparison, the root, the dependency diff, and whether a diagram is recommended. `diff` and `mermaid` print that rendering alone, so the output can be piped, and `json` prints the same answer the query API returns. |
 
-A relation outside `imports`, `tested_by`, `calls`, `contains`, and `re_exports`, a root the comparison does not contain, and naming both `--file` and `--function` are rejected with an error naming what is accepted, rather than answered with a misleadingly empty graph. A call resolves against a name the caller's file declares, against a named or default import that leads to an exported function, or against `ns.name()` where `ns` is a namespace import; a re-export chain resolves at lower confidence. Everything else produces no `calls` edge in this version: a computed or chained callee, a member call on anything but a namespace import, a specifier that names no file in the revision, a name reached only through `export *`, and an ambiguous name. Callers in other files come from the changed file's direct importers, so a caller that reaches it only through a barrel module is not reported.
+A relation outside `imports`, `tested_by`, `calls`, `contains`, `re_exports`, and `possible_call`, a root the comparison does not contain, and naming both `--file` and `--function` are rejected with an error naming what is accepted, rather than answered with a misleadingly empty graph. `calls` is exact: it resolves a name the caller's file declares, a named or default import that leads to an exported function, or `ns.name()` where `ns` is a namespace import; a re-export chain resolves at lower confidence. `possible_call` is separate and opt-in: it reports a property or computed call only when its property name matches exactly one function visible to the caller, at confidence `0.5`; it never becomes a `calls` edge. Unresolved cases include callbacks, dependency injection, dynamic property keys, runtime `import()`, type-only overload selection, ambiguous names, and calls outside the files the graph reads.
 
 The reusable Rust entry point is `diffscope::analyze(&AnalysisRequest)`. Renderers in `diffscope::output` consume the returned `AnalysisResult` and do not perform analysis.
 
@@ -278,7 +280,7 @@ Every tool requires:
 - `repository` — a path to the repository or to any path inside its work tree. Relative paths resolve against the server process's working directory.
 - `base` and `target` — committed Git revisions, resolved by the repository's own ref rules. The working tree and index are never inputs.
 
-The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. `get_impact_graph` takes the shape of the walk instead: `file` or `function_id` (mutually exclusive roots; with neither, the graph is centered on the changed set), `direction` (`upstream`, `downstream`, or `both`), `relations` (any subset of `imports`, `tested_by`, `calls`, `contains`, and `re_exports`), `depth` (default 1, clamped to 1–3), `view` (`delta`, `base`, or `target`), `max_nodes` (default 30, clamped to 3–100), `max_edges` (default 60, clamped to 3–200), and `render` (any subset of `diff` and `mermaid`). A tool returns the same envelope as the JSONL protocol — the analysis identity, the applied query with its defaults, the answer, and, for the two list tools, a page — as both a text block and structured content. Passing a page's `next_cursor` back unchanged continues the list.
+The filter parameters are the ones the query API defines: `classification`, `minimum_risk`, `min_complexity_delta`, `status`, `file`, `include_unchanged`, `limit` (default 50, maximum 200), and `cursor`. `get_impact_graph` takes the shape of the walk instead: `file` or `function_id` (mutually exclusive roots; with neither, the graph is centered on the changed set), `direction` (`upstream`, `downstream`, or `both`), `relations` (the supported `imports`, `tested_by`, `calls`, `contains`, `re_exports`, and `possible_call`; the default excludes `possible_call`), `depth` (default 1, clamped to 1–3), `view` (`delta`, `base`, or `target`), `max_nodes` (default 30, clamped to 3–100), `max_edges` (default 60, clamped to 3–200), and `render` (any subset of `diff` and `mermaid`). A tool returns the same envelope as the JSONL protocol.
 
 Failures are visible in the tool result rather than lost: an unknown `function_id` returns an error naming the closest known ids, and a cursor that belongs to another analysis is rejected instead of silently answering from the wrong list. The process keeps a small number of recent analyses, so the usual summary, then list, then detail sequence analyzes the comparison once.
 
