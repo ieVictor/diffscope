@@ -798,4 +798,72 @@ mod tests {
         assert_eq!(dependency_diff(&graph), dependency_diff(&graph));
         assert_eq!(mermaid(&graph), mermaid(&graph));
     }
+
+    #[test]
+    fn a_cycle_is_drawn_as_one_box_and_a_self_relationship_is_not() {
+        let graph = graph_of(
+            &[
+                ("src/a.ts", NodeStatus::Modified),
+                ("src/b.ts", NodeStatus::Unchanged),
+                ("src/entry.ts", NodeStatus::Unchanged),
+            ],
+            &[
+                edge(
+                    "src/a.ts",
+                    "src/b.ts",
+                    EdgeStatus::Unchanged,
+                    Relation::Imports,
+                    Resolution::ResolvedSpecifier,
+                ),
+                edge(
+                    "src/b.ts",
+                    "src/a.ts",
+                    EdgeStatus::Added,
+                    Relation::Imports,
+                    Resolution::ResolvedSpecifier,
+                ),
+                edge(
+                    "src/entry.ts",
+                    "src/a.ts",
+                    EdgeStatus::Unchanged,
+                    Relation::Imports,
+                    Resolution::ResolvedSpecifier,
+                ),
+            ],
+        );
+
+        // The loop's members are declared inside the box; every arrow after it
+        // refers to them by the keys the graph assigned.
+        assert_eq!(
+            mermaid(&graph),
+            format!(
+                "{}{}{}",
+                header(),
+                concat!(
+                    "    subgraph c0[\"cycle · 2 nodes\"]\n",
+                    "        n0[\"a.ts · modified\"]\n",
+                    "        n1[\"b.ts\"]\n",
+                    "    end\n",
+                    "    n0 --> n1\n",
+                    "    n1 --> n0\n",
+                    "    n2[\"entry.ts\"] --> n0\n",
+                ),
+                "    class n0 modified\n    class n1 unchanged\n    class n2 unchanged\n"
+            )
+        );
+
+        // One relationship that leaves a node and returns to it already reads
+        // as a loop, so no box is drawn around the single box it runs through.
+        let itself = graph_of(
+            &[("src/a.ts", NodeStatus::Modified)],
+            &[edge(
+                "src/a.ts",
+                "src/a.ts",
+                EdgeStatus::Added,
+                Relation::Imports,
+                Resolution::ResolvedSpecifier,
+            )],
+        );
+        assert!(!mermaid(&itself).contains("subgraph"));
+    }
 }
