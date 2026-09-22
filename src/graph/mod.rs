@@ -253,6 +253,7 @@ impl Relation {
         Self::Calls,
         Self::Contains,
         Self::ReExports,
+        Self::PossibleCall,
     ];
 
     #[must_use]
@@ -292,6 +293,27 @@ impl Relation {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// Whether a request that names no relation walks this one.
+    ///
+    /// Every resolved relation but [`Relation::PossibleCall`], which reports
+    /// that a relationship may exist rather than that one does. A default
+    /// answer carries what the two revisions prove, so a caller that wants
+    /// guesses among them asks for them by name.
+    #[must_use]
+    pub const fn walked_by_default(self) -> bool {
+        !matches!(self, Self::PossibleCall)
+    }
+
+    /// The relations a request that names none walks.
+    #[must_use]
+    pub fn by_default() -> Vec<Self> {
+        Self::SUPPORTED
+            .iter()
+            .copied()
+            .filter(|relation| relation.walked_by_default())
+            .collect()
+    }
 }
 
 /// How an edge was resolved, and therefore how much it can be trusted.
@@ -316,6 +338,9 @@ pub enum Resolution {
     ExportClause,
     /// A call whose callee resolves through one or more re-export hops.
     ReExportedSymbol,
+    /// A call written as a property or a computed access, whose property name
+    /// matches exactly one function the caller's file can see.
+    PropertyNameMatch,
 }
 
 impl Resolution {
@@ -330,6 +355,7 @@ impl Resolution {
             Self::ImportedSymbol => "imported_symbol",
             Self::ExportClause => "export_clause",
             Self::ReExportedSymbol => "re_exported_symbol",
+            Self::PropertyNameMatch => "property_name_match",
         }
     }
 
@@ -344,10 +370,16 @@ impl Resolution {
     /// [`crate::query::impact::TestLink`] already publishes, so a test reported
     /// at `0.9` by a detail answer cannot appear here at some other number.
     ///
-    /// A re-exported symbol is the one call resolution below 1.0: each hop is
-    /// a separate specifier resolution that could be wrong, and a barrel
-    /// module's `export *` forwards names from a file the scan has not read,
-    /// so a chain is believed slightly less than the name it ends at.
+    /// A re-exported symbol is the one *exact* call resolution below 1.0:
+    /// each hop is a separate specifier resolution that could be wrong, and a
+    /// barrel module's `export *` forwards names from a file the scan has not
+    /// read, so a chain is believed slightly less than the name it ends at.
+    ///
+    /// A property name match is the one resolution that proves nothing. The
+    /// name is written where the code says a property, and the function it
+    /// matches is the only one of that name the caller's file can see; that
+    /// the two are the same thing is a guess a reader has to check, so it is
+    /// reported at `0.5` and under a relation of its own.
     #[must_use]
     pub fn confidence(self) -> f64 {
         match self {
@@ -358,6 +390,7 @@ impl Resolution {
             | Self::ExportClause => 1.0,
             Self::TestImportsModule | Self::ReExportedSymbol => 0.9,
             Self::TestNameMatchesModule => 0.8,
+            Self::PropertyNameMatch => 0.5,
         }
     }
 }
@@ -721,6 +754,11 @@ impl Graph {
     /// a cycle only one of them closes is a cycle the change introduced or
     /// removed.
     ///
+    /// A `possible_call` is not followed. A loop is a claim that the code
+    /// comes back to where it started, and an edge that only may exist cannot
+    /// support one; a guess that closed a loop would otherwise draw a box
+    /// around it and report a cycle the change may never have introduced.
+    ///
     /// Both the cycles and each cycle's members come out in the graph's own
     /// node order — a cycle sits where its first member does — so the result
     /// is a function of the ordered graph and never of how a map was walked.
@@ -730,7 +768,11 @@ impl Graph {
     #[must_use]
     pub fn cycles_in(&self, view: View) -> Vec<Cycle> {
         let mut outgoing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for edge in self.edges.iter().filter(|edge| view.includes(edge.status)) {
+        for edge in self
+            .edges
+            .iter()
+            .filter(|edge| view.includes(edge.status) && edge.relation != Relation::PossibleCall)
+        {
             outgoing
                 .entry(edge.from.as_str())
                 .or_default()
@@ -1218,11 +1260,27 @@ mod tests {
         assert_eq!(Relation::parse("calls"), Some(Relation::Calls));
         assert_eq!(Relation::parse("contains"), Some(Relation::Contains));
         assert_eq!(Relation::parse("re_exports"), Some(Relation::ReExports));
-        assert_eq!(Relation::parse("possible_call"), None);
+        assert_eq!(
+            Relation::parse("possible_call"),
+            Some(Relation::PossibleCall)
+        );
         assert_eq!(Relation::parse("depends_on"), None);
         assert_eq!(
             Relation::accepted(),
-            "imports, tested_by, calls, contains, re_exports"
+            "imports, tested_by, calls, contains, re_exports, possible_call"
+        );
+        // The heuristic relation is resolved, and asked for by name: a
+        // default walk carries what the revisions prove.
+        assert!(!Relation::PossibleCall.walked_by_default());
+        assert_eq!(
+            Relation::by_default(),
+            vec![
+                Relation::Imports,
+                Relation::TestedBy,
+                Relation::Calls,
+                Relation::Contains,
+                Relation::ReExports
+            ]
         );
     }
 

@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::graph::{Cycle, EdgeStatus, Graph, View};
+use crate::graph::{Cycle, Edge, EdgeStatus, Graph, Relation, View};
 use crate::query::change_area;
 
 /// Relationships on one side of the root that make that side worth showing.
@@ -89,7 +89,7 @@ pub fn evaluate(graph: &Graph) -> Recommendation {
     let mut changed_inbound = 0_u32;
     let mut changed_outbound = 0_u32;
     let mut changed = 0_u32;
-    for edge in graph.edges() {
+    for edge in measured(graph) {
         let touched = edge.status != EdgeStatus::Unchanged;
         if touched {
             changed += 1;
@@ -163,6 +163,20 @@ pub fn evaluate(graph: &Graph) -> Recommendation {
     }
 }
 
+/// The relationships a signal may count.
+///
+/// Every edge but a `possible_call`: that relation says a relationship may
+/// exist, and a diagram recommended because five guesses point at the root
+/// would be a recommendation resting on nothing the revisions prove. A
+/// caller that asked for guesses still sees them in the graph; they just do
+/// not decide whether the graph is worth drawing.
+fn measured(graph: &Graph) -> impl Iterator<Item = &Edge> {
+    graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.relation != Relation::PossibleCall)
+}
+
 /// One criterion's outcome.
 ///
 /// Building every signal in one place keeps the criteria identical in shape, so
@@ -211,7 +225,7 @@ fn linear_and_small(graph: &Graph) -> Option<Signal> {
 fn branches(graph: &Graph) -> bool {
     let mut inbound: BTreeMap<&str, u32> = BTreeMap::new();
     let mut outbound: BTreeMap<&str, u32> = BTreeMap::new();
-    for edge in graph.edges() {
+    for edge in measured(graph) {
         *outbound.entry(edge.from.as_str()).or_default() += 1;
         *inbound.entry(edge.to.as_str()).or_default() += 1;
     }
@@ -231,9 +245,7 @@ fn branches(graph: &Graph) -> bool {
 fn changed_levels(graph: &Graph) -> u32 {
     let depth_of = |id: &str| graph.node(id).map_or(0, |node| node.depth);
     count(
-        graph
-            .edges()
-            .iter()
+        measured(graph)
             .filter(|edge| edge.status != EdgeStatus::Unchanged)
             .map(|edge| depth_of(&edge.from).max(depth_of(&edge.to)))
             .collect::<BTreeSet<_>>()
