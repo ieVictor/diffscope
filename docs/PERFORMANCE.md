@@ -171,6 +171,20 @@ Rendering is negligible. The dependency diff has no edges to write on these tier
 
 The baseline table's `Import graph` column records 12.77 ms for the large tier from an earlier session; this session measured 15.32 ms and 15.69 ms on the same corpus. The difference is not attributed to a cause here, and the same-session figures above are the ones the comparison uses. A Vue-scale base-index figure is not recorded: those corpora are not recreated in this session, and the cost of indexing one revision is not estimated from the 412 ms target index above.
 
+### Cross-file symbol resolution
+
+Resolving calls across files parses files the diff does not contain, at full fidelity, which nothing before it did. The set is bounded to the changed files, their direct importers on either side, and the modules they import; that bound is reported per tier by the benchmark itself, so a corpus where it fails would be visible rather than assumed away. Measured in the same session as the table above, with a 1 s warm-up and 3 s measurement window:
+
+| Tier | Changed files | Admitted files | Base index | Symbol index | Graph build |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small | 10 | 10 | 3.13 ms | 3.84 ms | 50.4 us |
+| medium | 80 | 80 | 5.52 ms | 10.14 ms | 2.69 ms |
+| large | 240 | 240 | 11.10 ms | 24.96 ms | 24.65 ms |
+
+The symbol index costs roughly twice the import index of the same revision on the large tier, which is the expected shape: it parses whole files and runs the function collector where the import index parses a bounded prefix and collects nothing. It is built once per commit and cached beside the import index, so this is a first-query cost, and a later comparison that admits files the first did not extends the cached index rather than rebuilding it.
+
+These tiers understate the bound rather than test it. The generated files import nothing, so the admitted set is exactly the changed set and no caller is ever discovered; the numbers measure parsing cost per file, not importer fan-out. A Vue-scale figure for the admitted set is not recorded here, because those corpora are not recreated in this session and the size of an importer fan-out is not estimated from a corpus that has none. What is known from the real-world corpora already recorded is the shape of the bound: the risk model reports a changed module's direct importers, and the documented thresholds treat 20 direct importers as the high band.
+
 ## Real-world corpus
 
 Generated tiers isolate per-file behavior but do not resemble real diffs: the large tier averages 268 bytes per changed file, while real TypeScript diffs average roughly 16 KiB. Real-repository measurements therefore accompany the generated tiers. These corpora are not committed; recreate them by cloning the repositories and using the pinned revisions.
