@@ -158,13 +158,14 @@ The graph is anchored to one comparison. A module map of a project, or of an unc
 | --- | --- | --- |
 | `imports` | An importer to a module it imports. | A specifier in the importer's import region resolved to a path in that revision. |
 | `tested_by` | A test file to the module it covers. | The test imports the module directly, or its name matches the module's. |
-| `calls` | A function to a function it calls. | The callee is a name the caller's file declares, or one it imports from a module that exports a function under that name. |
+| `calls` | A function to a function it calls. | Exact local, imported, namespace-import, or re-exported-symbol resolution. |
 | `contains` | A module to a function it declares. | The function's definition is in that module, on one revision side or both. |
 | `re_exports` | A module to a module it forwards names from. | An `export ... from` clause whose specifier resolved to a path in that revision. |
+| `possible_call` | A function to one possible callee. | A property or computed call whose property name matches exactly one function visible to the caller. |
 
-The relation vocabulary is larger than the set DiffScope resolves. A relation outside `imports`, `tested_by`, `calls`, `contains`, and `re_exports` is rejected as `invalid_params` naming the accepted set rather than answered with an empty edge set, because "no such relationship" and "never looked for one" are different statements and only the first would be true.
+The supported relations are `imports`, `tested_by`, `calls`, `contains`, `re_exports`, and `possible_call`; a relation outside that set is rejected as `invalid_params` naming the accepted set rather than answered with an empty edge set. A request that omits `relations` walks every supported relation except `possible_call`. A caller includes that heuristic only by naming `possible_call` explicitly.
 
-A `calls` edge is resolved exactly or not at all. Three shapes resolve: a callee the caller's own file declares; a callee bound by a named or default import whose specifier resolves to a module exporting a function under that name; and `ns.name()` where `ns` is a namespace import, because the receiver then names a module whose exported names are known. A re-export chain is followed for a bounded number of hops, and a definition found through one is reported at lower confidence than one the imported module exports itself. Everything else produces no edge: a computed callee (`a[b]()`), a call on a call, a member call on anything but a namespace import, a name the file neither declares nor imports, a specifier that names no file in the revision — almost always an installed package — and a name reached only through `export *`, whose forwarded names live in a file the analysis never read. A name declared more than once in the caller's file is ambiguous and also produces no edge rather than a guess, the same way `ambiguous_function_match` withholds a pairing. Absence therefore means "this version did not resolve it", which the answer states by reporting the relations it supports. No scope tree is modelled: the name map is built from declarations at any depth, so a local binding that shadows a module-level function makes that name ambiguous rather than misresolved.
+A `calls` edge is resolved exactly or not at all. Three shapes resolve: a callee the caller's own file declares; a callee bound by a named or default import whose specifier resolves to a module exporting a function under that name; and `ns.name()` where `ns` is a namespace import, because the receiver then names a module whose exported names are known. A re-export chain is followed for a bounded number of hops and has lower confidence. `possible_call` is not a `calls` edge: it is a `property_name_match` at confidence `0.5`, and only when one visible candidate matches exactly. Callbacks, dependency injection, dynamically selected properties with non-literal keys, runtime `import()`, and overloads distinguishable only by types remain unresolved; so do ambiguous names and calls outside the bounded symbol-resolution scope.
 
 Callers in other files are discovered from the **direct importers** of the changed file, in both revisions. A file can only call into a module it imports, and the import index already names those files, so that set bounds what is parsed beyond the diff. Indirect importers are not read, for the same reason `related_tests` offers only direct importers: through a package's barrel module almost every file reaches almost every other, and a caller list built that way is not a caller list. A caller that reaches a changed function only through a barrel module is therefore not reported, and the reach that hides it is still reported as a number by `nearby_importers`.
 
@@ -188,6 +189,8 @@ A function node takes the status the comparison gave the function, so `added`, `
 
 A function the diff does not contain — a caller or callee in an unchanged file — has no record to take a status from, so it takes the status its membership decides: `unchanged` when both revisions hold the definition, `added` when only the target does, `removed` when only the base does. Its identity has the same shape, naming the side the definition still exists on, so a function both revisions share is one node rather than two. A `contains` edge is attached only for the root module's own functions: the module that declares a caller in another file is the file-rooted question, not this one.
 
+A `group` node is a synthetic node that stands for several collapsed module nodes. It carries `group: {"size": <count>, "role": <role>}` in addition to the ordinary node fields; its label is the count and role, followed by the shared change area when there is one. Grouping happens before delivery truncation, in this deterministic order: related tests; generated, vendored, and lockfile nodes; then remaining over-budget callers and dependencies separately. A group node ranks ahead of a node it replaces, but `truncated`, `omitted`, and `reasons` still report any delivered-graph budget loss.
+
 That is why both revisions are indexed. A graph built from the target alone can show what exists now; it cannot prove that anything was removed, and a delta that cannot show a removal is not a delta.
 
 ### Resolutions and confidence
@@ -204,17 +207,18 @@ Confidence is fixed by how an edge was resolved, never a free-form number, so tw
 | `calls` | `imported_symbol` | 1.0 | The callee is a named, default, or namespace import resolving to a function the imported module exports itself. |
 | `re_exports` | `export_clause` | 1.0 | An export clause forwards names from a module the specifier resolved to. |
 | `calls` | `re_exported_symbol` | 0.9 | The callee resolves through one or more re-export hops. |
+| `possible_call` | `property_name_match` | 0.5 | A property or computed call's name matches exactly one function visible to the caller. |
 
-The two `tested_by` values are the ones [Related tests](#related-tests) publishes, so a test reported at `0.9` by `get_function_change` cannot appear in a graph at another number. A re-exported symbol is the one call resolution below certainty, and for a stated reason: each hop is a separate specifier resolution that could be wrong, and a barrel module forwards names from files the scan of that module never read. When the two revisions resolved one relationship differently — a name imported directly in one and through a barrel in the other — the edge carries the less confident of the two, because it is only as trustworthy as the weaker claim behind it.
+The two `tested_by` values are the ones [Related tests](#related-tests) publishes, so a test reported at `0.9` by `get_function_change` cannot appear in a graph at another number. A re-exported symbol is the one exact call resolution below certainty, and for a stated reason: each hop is a separate specifier resolution that could be wrong. `property_name_match` proves only that the name is unique in scope, not that the receiver contains that function, so it is distinct from `calls`.
 
-An `imports` edge carries `evidence`: the importing file and the line its import statement sits on, read from the revision that has the edge — the target for an added or unchanged edge, the base for a removed one. A `calls` edge carries the same shape of evidence: the **caller's** file, which is not the callee's for a call that reaches in from another module, and the line of the call expression, read from the revision that has the call. A `re_exports` edge points at the `export ... from` statement that produced it. A `tested_by` edge carries none: a name match has no site to point at, and the site of a direct import is the test file's own `imports` edge. A `contains` edge carries none either: it restates which module a function node came from rather than pointing at a site of its own.
+An `imports`, `calls`, `possible_call`, or `re_exports` edge carries `evidence`: the source file and line in the revision that has the edge. A `tested_by` edge carries none: a name match has no site to point at, and the site of a direct import is the test file's own `imports` edge. A `contains` edge carries none either: it restates which module a function node came from rather than pointing at a relationship site.
 
 ### Traversal
 
 - A walk starts at a root: one changed file, one function, or the changed set. With no root, every changed file becomes a root and the walk proceeds from all of them. `file` and `function_id` are mutually exclusive — a graph has one center — so naming both is rejected as `invalid_params`, and so is either root that the analysis does not contain. A function root is placed at the node of the function it names, and the walk follows `calls` in both directions and `contains` upward to the module that declares the function, so a function graph still shows which module the change sits in.
 - `direction` decides which way edges are followed: `upstream` follows them backwards — what reaches the root — `downstream` follows them forwards, and `both` (the default) does both.
 - `depth` is hops from the root: `1` by default, clamped to 1–3. One hop of importers and one of imports is what a reviewer reads; a deeper walk is available by request, because depth grows a graph far faster than it grows what the graph says.
-- The walk is breadth-first and records the fewest hops by which each node was reached, matching `ImportIndex::reachable_importers`. A node already seen is not re-queued, but the edge that closed a cycle is kept: a cycle introduced by a change is one of the more interesting things a graph can report.
+- The walk is breadth-first and records the fewest hops by which each node was reached, matching `ImportIndex::reachable_importers`. A node already seen is not re-queued, but the edge that closed a cycle is kept. Strongly connected node sets are reported as cycles; Mermaid places a cycle of two or more nodes in a `subgraph` labelled, for example, `cycle · 3 nodes`. A cycle is `cycle_introduced` when that exact node set is cyclic in the target view but not the base view.
 - Tests are attached to the modules the walk reached rather than reached by it: every test either revision offers for a module becomes a `tested_by` edge, and the test node sits one hop beyond the module it covers.
 - `view` decides which relationships are shown: `delta` (the default) shows all of them, `base` shows only those present in the base revision, and `target` only those present in the target. A view narrows what is shown; it never rewrites what is true, so an edge shown under `target` still reads `added`.
 - A `file` that is not a changed file in this analysis is rejected as `invalid_params`; the message names the closest known changed paths, the way a detail query names the closest known function ids.
@@ -223,22 +227,30 @@ An `imports` edge carries `evidence`: the importing file and the line its import
 
 Every walk is bounded and every omission is reported. Budgets default to 30 nodes and 60 edges and are request parameters: `max_nodes` is clamped to 3–100 and `max_edges` to 3–200.
 
-When the node budget is reached, nodes are kept in this order:
+Grouping happens before the node budget is applied. Tests collapse first, then generated, vendored, and lockfile nodes, then any remaining overflow becomes one callers group and/or one dependencies group. Groups retain the collapsed set's size and role; they do not make the graph complete or suppress truncation accounting.
+
+After grouping, nodes are kept in this order:
 
 1. the root or roots;
-2. changed nodes — `added`, `removed`, or `modified`;
-3. remaining nodes by hop distance, nearest first;
-4. the graph's node ordering, as a total tiebreak.
+2. group nodes;
+3. changed nodes — `added`, `removed`, or `modified`;
+4. remaining nodes by hop distance, nearest first;
+5. the graph's node ordering, as a total tiebreak.
 
-Hop distance is an input to this order, not a field of the answer: what a caller receives is the bounded graph, and the order is how it was chosen.
-
-Edges are kept when both endpoints were kept, then by the edge ordering. What was dropped is reported rather than hidden:
+Edges are kept when both endpoints were kept, then by the edge ordering. Any remaining loss is reported:
 
 ```json
 {"truncated": true, "omitted": {"nodes": 47, "edges": 83}, "reasons": ["max_nodes"]}
 ```
 
-A count is not a substitute for the nodes, but it is the difference between a small graph and a misleading one: a caller that reads `truncated: true` can raise a budget or narrow the root instead of taking the graph for complete. Counts are reported without collapsing — nothing in the graph stands in for the nodes a budget dropped.
+`completeness` is always present beside `graph`, including when all counts are zero:
+
+```json
+{"scan_truncated_files":0,"unresolved_specifiers":0,"unresolved_calls":0,
+ "relations_supported":["imports","tested_by","calls","contains","re_exports","possible_call"]}
+```
+
+Its scope is captured before view filtering, grouping, and delivery budgets: module graphs count reached module paths; function graphs count the root file and its direct importers. `delta` reports both revision sides, while `base` and `target` report only their selected side. `scan_truncated_files` counts files whose 64 KiB import scan cap was reached, `unresolved_specifiers` counts specifiers naming no file, and `unresolved_calls` counts examined call sites no exact or requested heuristic rule resolved. `relations_supported` is the running version's full supported set, not the request's selected relations.
 
 ### Determinism
 
@@ -262,7 +274,7 @@ The dependency diff is one line per edge, ordered by the edge ordering: a remove
   packages/compiler-sfc/src/compileStyle.ts -> packages/compiler-sfc/src/style/cssVars.ts
 ```
 
-The Mermaid rendering is a `flowchart LR` document with one fixed `classDef` per node status, so a status never looks like two different things in two answers. A node's box shows its basename, with its status appended unless it is `unchanged`; labels are quoted, quotes are dropped, control characters and whitespace runs collapse to single spaces, and the result is truncated to 64 bytes with `...` appended, so a hostile or merely long path cannot break the syntax or produce an unbounded diagram line. A removed edge renders as `-. "removed" .->`, and an edge below full confidence as `-. "~0.9" .->`: one dashed style for both would make "this relationship is gone" and "this relationship may exist" look alike when they are opposites.
+The Mermaid rendering is a `flowchart LR` document with one fixed `classDef` per node status, so a status never looks like two different things in two answers. A node's box shows its basename, with its status appended unless it is `unchanged`; group boxes show their deterministic count-and-role label. Cycles of two or more nodes appear in `subgraph` blocks labelled `cycle · <n> nodes`. Labels are quoted, quotes are dropped, control characters and whitespace runs collapse to single spaces, and the result is truncated to 64 bytes with `...` appended, so a hostile or merely long path cannot break the syntax or produce an unbounded diagram line. A removed edge renders as `-. "removed" .->`, and an edge below full confidence as `-. "~0.5" .->`: one dashed style for both would make "this relationship is gone" and "this relationship may exist" look alike when they are opposites.
 
 ### Visualization recommendation
 
@@ -277,6 +289,7 @@ A diagram is recommended when at least one positive signal applies and no negati
 | `converges_and_branches` | Two or more relationships point at the root and two or more leave it. |
 | `crosses_areas` | The graph spans two or more change areas. |
 | `cycle` | The graph contains a cycle: a node lies on a walk that leaves it and returns. |
+| `cycle_introduced` | A cycle exists in the target and not the base. |
 | `changed_on_both_sides` | At least one relationship changed on each side of the root. |
 | `multiple_levels` | The relationships the comparison changed appear at two or more distinct hop levels from the root. |
 | `linear_and_small` (negative) | Fewer than four nodes and no branching — no node has more than one relationship entering or leaving it. |

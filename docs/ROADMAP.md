@@ -118,7 +118,7 @@ Add languages one at a time through the established analyzer contract. Each lang
 
 ## Milestone 10: Change-impact graph
 
-Describe the dependency and impact changes a comparison introduces, not only the numbers it contains. It is delivered in stages, each resolving more than the last, and it answers:
+The delivered graph describes the dependency and impact changes a comparison introduces, not only the numbers it contains. M4 adds readable large-graph output, opt-in low-confidence property-name matches, cycle signals, and completeness reporting. It answers:
 
 - Which modules import a changed file, which tests cover it, and which modules re-export it
 - What a changed function calls and what calls it, in its own file and in the files that import it
@@ -126,7 +126,7 @@ Describe the dependency and impact changes a comparison introduces, not only the
 - What a change reaches, walked from a changed file, one function, or the changed set, bounded by direction, depth, and node and edge budgets
 - Whether the topology is materially easier to read as a picture, with a dependency-diff and a Mermaid rendering
 
-The answer is ordered, deterministic, and anchored to one comparison. A relationship resolves exactly or not at all: heuristic resolution and collapsed groups are rejected explicitly rather than approximated, and the files read beyond the diff are bounded by the import graph.
+The answer is ordered, deterministic, and anchored to one comparison. Exact relationships remain exact; an explicitly requested `possible_call` reports a separate, low-confidence property-name match, never a `calls` edge. Readability grouping collapses tests, classified files, and remaining directional overflow before truncation, while completeness fields state what the examined scope could not represent or resolve. Files read beyond the diff remain bounded by the import graph.
 
 **Exit condition:** A comparison's module- and function-level relationship changes are answerable from the CLI, the JSONL protocol, and the MCP server; the three agree byte for byte; repeated queries are byte identical; every unsupported input is rejected with a message naming what is accepted; and the cost of each index built beyond the analysis is measured rather than estimated.
 
