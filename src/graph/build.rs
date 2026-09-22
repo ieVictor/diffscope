@@ -1819,6 +1819,46 @@ mod tests {
     }
 
     #[test]
+    fn a_built_cycle_renders_inside_a_subgraph_identically_across_builds() {
+        let index = ImportIndex::from_edges(
+            &[
+                ("src/a.ts", "src/b.ts"),
+                ("src/b.ts", "src/c.ts"),
+                ("src/c.ts", "src/a.ts"),
+            ],
+            &[],
+        );
+        let result = analysis(vec![modified("src/a.ts")]);
+        let roots = paths_of(&["src/a.ts"]);
+        let build_graph = || {
+            let mut deep = request(&roots, Relation::SUPPORTED);
+            deep.depth = 2;
+            build(&result, &revisions(&index, &index), &deep)
+        };
+
+        let graph = build_graph();
+        // The walk terminated, and the loop it closed is one cycle over the
+        // three modules it runs through.
+        assert_eq!(node_paths(&graph), vec!["src/a.ts", "src/b.ts", "src/c.ts"]);
+        let cycles = graph.cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].size(), 3);
+
+        let drawn = render::mermaid(&graph);
+        assert!(
+            drawn.contains(concat!(
+                "    subgraph c0[\"cycle · 3 nodes\"]\n",
+                "        n0[\"a.ts · modified\"]\n",
+                "        n1[\"b.ts\"]\n",
+                "        n2[\"c.ts\"]\n",
+                "    end\n",
+            )),
+            "the loop is drawn as one box: {drawn}"
+        );
+        assert_eq!(drawn, render::mermaid(&build_graph()));
+    }
+
+    #[test]
     fn tested_by_edges_carry_the_resolutions_and_confidences_of_their_links() {
         let index = ImportIndex::from_edges(
             &[("src/__tests__/core.spec.ts", "src/core.ts")],

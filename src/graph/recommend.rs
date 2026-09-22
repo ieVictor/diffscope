@@ -665,6 +665,55 @@ mod tests {
     }
 
     #[test]
+    fn a_cycle_only_the_target_closes_is_introduced_and_one_in_both_is_not() {
+        // The base runs a -> b -> c; the change adds the relationship that
+        // turns the chain into a loop.
+        let introduced = graph(
+            &["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+            &[],
+            &[
+                ("src/a.ts", "src/b.ts", EdgeStatus::Unchanged),
+                ("src/b.ts", "src/c.ts", EdgeStatus::Unchanged),
+                ("src/c.ts", "src/a.ts", EdgeStatus::Added),
+                ("src/a.ts", "src/d.ts", EdgeStatus::Unchanged),
+            ],
+        );
+        let rec = evaluate(&introduced);
+        assert!(rec.recommended);
+        assert_eq!(codes(&rec), ["cycle", "cycle_introduced"]);
+        assert_eq!(reason(&rec, "cycle").value, 3);
+        assert_eq!(reason(&rec, "cycle_introduced").value, 1);
+
+        // The same loop, written by both revisions: it is a cycle, and it is
+        // not news.
+        let standing = graph(
+            &["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+            &[],
+            &[
+                ("src/a.ts", "src/b.ts", EdgeStatus::Unchanged),
+                ("src/b.ts", "src/c.ts", EdgeStatus::Unchanged),
+                ("src/c.ts", "src/a.ts", EdgeStatus::Unchanged),
+                ("src/a.ts", "src/d.ts", EdgeStatus::Added),
+            ],
+        );
+        assert_eq!(codes(&evaluate(&standing)), ["cycle"]);
+
+        // A loop the change broke is in the base and not the target, which is
+        // a removal rather than an introduction.
+        let broken = graph(
+            &["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+            &[],
+            &[
+                ("src/a.ts", "src/b.ts", EdgeStatus::Unchanged),
+                ("src/b.ts", "src/c.ts", EdgeStatus::Unchanged),
+                ("src/c.ts", "src/a.ts", EdgeStatus::Removed),
+                ("src/a.ts", "src/d.ts", EdgeStatus::Unchanged),
+            ],
+        );
+        assert_eq!(codes(&evaluate(&broken)), ["cycle"]);
+    }
+
+    #[test]
     fn changed_on_both_sides_needs_a_changed_relationship_entering_and_leaving() {
         let inbound_only = graph(
             &["src/root.ts", "src/a.ts", "src/b.ts"],

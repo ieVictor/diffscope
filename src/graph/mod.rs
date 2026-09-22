@@ -1431,4 +1431,123 @@ mod tests {
         let both = walk(&roots, Direction::Both, 1, neighbors);
         assert_eq!(both.keys().collect::<Vec<_>>(), vec!["a", "b", "c"]);
     }
+
+    #[test]
+    fn a_cycle_is_the_mutually_reachable_set_and_a_one_way_chain_is_none() {
+        // `d` reaches the loop and `b` reaches out of it; neither is on it,
+        // because a loop is what can be returned from.
+        let mut builder = GraphBuilder::new();
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"] {
+            builder.add_node(node(path, NodeStatus::Unchanged, 1));
+        }
+        builder.add_edge(edge("src/a.ts", "src/c.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/c.ts", "src/a.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/a.ts", "src/b.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/d.ts", "src/a.ts", EdgeStatus::Unchanged));
+        let looped = builder.finish(Limits::default());
+
+        let cycles = looped.cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].key, "c0");
+        assert_eq!(
+            cycles[0].members,
+            vec![Node::module_id("src/a.ts"), Node::module_id("src/c.ts")]
+        );
+        assert!(cycles[0].contains(&Node::module_id("src/c.ts")));
+        assert!(!cycles[0].contains(&Node::module_id("src/b.ts")));
+        assert_eq!(cycles[0].size(), 2);
+
+        // The same nodes, every relationship pointing one way: nothing returns.
+        let mut builder = GraphBuilder::new();
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts"] {
+            builder.add_node(node(path, NodeStatus::Unchanged, 1));
+        }
+        builder.add_edge(edge("src/a.ts", "src/b.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/b.ts", "src/c.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/a.ts", "src/c.ts", EdgeStatus::Unchanged));
+        assert!(builder.finish(Limits::default()).cycles().is_empty());
+    }
+
+    #[test]
+    fn two_loops_through_one_node_are_one_cycle_and_a_self_relationship_is_a_loop_of_one() {
+        let mut builder = GraphBuilder::new();
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts"] {
+            builder.add_node(node(path, NodeStatus::Unchanged, 1));
+        }
+        builder.add_edge(edge("src/a.ts", "src/b.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/b.ts", "src/a.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/b.ts", "src/c.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/c.ts", "src/b.ts", EdgeStatus::Unchanged));
+        let shared = builder.finish(Limits::default());
+
+        // A reader treats the three as one unit, so they are one cycle rather
+        // than two that would draw `b` inside two boxes.
+        let cycles = shared.cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].size(), 3);
+
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node("src/a.ts", NodeStatus::Unchanged, 1));
+        builder.add_edge(edge("src/a.ts", "src/a.ts", EdgeStatus::Unchanged));
+        let itself = builder.finish(Limits::default());
+
+        let cycles = itself.cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].members, vec![Node::module_id("src/a.ts")]);
+    }
+
+    #[test]
+    fn a_view_decides_which_revision_closes_a_loop() {
+        let mut builder = GraphBuilder::new();
+        for path in ["src/a.ts", "src/b.ts"] {
+            builder.add_node(node(path, NodeStatus::Modified, 1));
+        }
+        builder.add_edge(edge("src/a.ts", "src/b.ts", EdgeStatus::Unchanged));
+        builder.add_edge(edge("src/b.ts", "src/a.ts", EdgeStatus::Added));
+        let graph = builder.finish(Limits::default());
+
+        assert_eq!(graph.cycles_in(View::Target).len(), 1);
+        assert!(graph.cycles_in(View::Base).is_empty());
+        assert_eq!(graph.cycles_in(View::Delta), graph.cycles());
+    }
+
+    #[test]
+    fn cycles_are_identical_across_two_builds_of_the_same_graph() {
+        let build = || {
+            let mut builder = GraphBuilder::new();
+            for path in ["src/c.ts", "src/a.ts", "src/d.ts", "src/b.ts"] {
+                builder.add_node(node(path, NodeStatus::Unchanged, 1));
+            }
+            for (from, to) in [
+                ("src/c.ts", "src/a.ts"),
+                ("src/a.ts", "src/c.ts"),
+                ("src/d.ts", "src/b.ts"),
+                ("src/b.ts", "src/d.ts"),
+            ] {
+                builder.add_edge(edge(from, to, EdgeStatus::Unchanged));
+            }
+            builder.finish(Limits::default())
+        };
+
+        let cycles = build().cycles();
+        assert_eq!(cycles, build().cycles());
+        // A cycle sits where its first member does, and members follow the
+        // graph's node order rather than the order the edges arrived in.
+        assert_eq!(
+            cycles
+                .iter()
+                .map(|cycle| (cycle.key.as_str(), cycle.members.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "c0",
+                    vec![Node::module_id("src/a.ts"), Node::module_id("src/c.ts")]
+                ),
+                (
+                    "c1",
+                    vec![Node::module_id("src/b.ts"), Node::module_id("src/d.ts")]
+                ),
+            ]
+        );
+    }
 }
