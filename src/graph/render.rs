@@ -186,6 +186,12 @@ fn label(node: &Node) -> String {
 /// has to know the relationship is gone before knowing how sure the resolver
 /// was, and one dashed style for both statements would make "this is gone" and
 /// "this may exist" look alike when they are opposites.
+///
+/// A `re_exports` edge is named, because a module that both imports and
+/// forwards another would otherwise draw the same bare arrow twice and say
+/// nothing about why. The other relations need no name: `imports` is what a
+/// module diagram is read as, and `calls`, `contains`, and `tested_by` join
+/// node kinds that already say which relationship it is.
 fn arrow(edge: &Edge) -> String {
     if edge.status == EdgeStatus::Removed {
         return "-. \"removed\" .->".to_owned();
@@ -193,6 +199,9 @@ fn arrow(edge: &Edge) -> String {
     let confidence = edge.confidence();
     if confidence < 1.0 {
         return format!("-. \"{}\" .->", uncertainty(confidence));
+    }
+    if edge.relation == Relation::ReExports {
+        return "-- \"re_exports\" -->".to_owned();
     }
     "-->".to_owned()
 }
@@ -487,6 +496,51 @@ mod tests {
         assert!(removed_line.contains("-. \"removed\" .->"));
         assert!(uncertain_line.contains("-. \"~0.9\" .->"));
         assert_ne!(removed_line, uncertain_line);
+    }
+
+    #[test]
+    fn a_re_export_is_told_apart_from_the_import_beside_it() {
+        // A barrel module both imports and forwards the module it re-exports,
+        // so two bare arrows between one pair of boxes would say nothing about
+        // why there are two.
+        let graph = graph_of(
+            &[
+                ("src/index.ts", NodeStatus::Modified),
+                ("src/parse.ts", NodeStatus::Unchanged),
+            ],
+            &[
+                edge(
+                    "src/index.ts",
+                    "src/parse.ts",
+                    EdgeStatus::Unchanged,
+                    Relation::Imports,
+                    Resolution::ResolvedSpecifier,
+                ),
+                edge(
+                    "src/index.ts",
+                    "src/parse.ts",
+                    EdgeStatus::Unchanged,
+                    Relation::ReExports,
+                    Resolution::ExportClause,
+                ),
+            ],
+        );
+
+        let arrows = mermaid(&graph)
+            .lines()
+            .filter(|line| line.contains("-->"))
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(arrows.len(), 2, "one arrow per edge");
+        assert!(
+            arrows
+                .iter()
+                .any(|line| line.contains("-- \"re_exports\" -->")),
+            "the forwarding names itself: {arrows:?}"
+        );
+        assert_ne!(arrows[0], arrows[1]);
     }
 
     #[test]
