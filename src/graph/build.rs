@@ -1467,8 +1467,9 @@ mod tests {
         FileStatus,
         analysis::{FunctionChangeStatus, FunctionChurn, MatchConfidence},
         graph::{
-            DEFAULT_DEPTH, Direction, Edge, EdgeStatus, Evidence, Graph, GroupRole, Limits, Node,
-            NodeKind, NodeStatus, Relation, Resolution, View,
+            DEFAULT_DEPTH, DEFAULT_MAX_EDGES, Direction, Edge, EdgeStatus, Evidence, Graph, Group,
+            GroupRole, Limits, Node, NodeKind, NodeStatus, Relation, Resolution, TruncationReason,
+            View, render,
         },
         imports::{FileSymbols, ImportIndex, SymbolIndex},
         languages::{
@@ -1684,6 +1685,13 @@ mod tests {
         graph.edges().iter().find(|edge| {
             edge.from == group && edge.to == Node::module_id(to) && edge.resolution == resolution
         })
+    }
+
+    /// The group node one role is addressed by, and what it collapses.
+    fn group(graph: &Graph, role: GroupRole) -> Option<&Group> {
+        graph
+            .node(&Node::group_id(role))
+            .and_then(|node| node.group.as_ref())
     }
 
     fn node_paths(graph: &Graph) -> Vec<&str> {
@@ -2918,4 +2926,218 @@ mod tests {
         );
     }
 
+    /// One index in which every path imports `src/core.ts`.
+    fn importers_of_core(importers: &[String]) -> ImportIndex {
+        let edges = importers
+            .iter()
+            .map(|importer| (importer.as_str(), "src/core.ts"))
+            .collect::<Vec<_>>();
+        ImportIndex::from_edges(&edges, &[])
+    }
+
+    fn importer_paths(count: u32, prefix: &str) -> Vec<String> {
+        (0..count)
+            .map(|number| format!("src/{prefix}{number:02}.ts"))
+            .collect()
+    }
+
+    /// A request with a node budget of its own.
+    fn bounded_request<'a>(
+        roots: &'a [String],
+        relations: &'a [Relation],
+        max_nodes: usize,
+    ) -> Request<'a> {
+        Request {
+            limits: Limits {
+                max_nodes,
+                max_edges: DEFAULT_MAX_EDGES,
+            },
+            ..request(roots, relations)
+        }
+    }
+
+    #[test]
+    fn a_budget_replaces_the_overflow_with_one_group_that_counts_it() {
+        let importers = importer_paths(40, "importer");
+        let index = importers_of_core(&importers);
+        let result = analysis(vec![modified("src/core.ts")]);
+        let roots = paths_of(&["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &bounded_request(&roots, Relation::SUPPORTED, 10),
+        );
+
+        // The root and forty importers are forty-one nodes; a budget of ten
+        // admits nine of them and spends its last slot on the group that
+        // stands for the other thirty-two.
+        assert_eq!(graph.nodes().len(), 10);
+        assert_eq!(
+            group(&graph, GroupRole::Callers),
+            Some(&Group {
+                size: 32,
+                role: GroupRole::Callers,
+            })
+        );
+        // The collapsed nodes are what the budget cost, and a caller that wants
+        // them can raise it.
+        assert!(graph.truncated());
+        assert_eq!(graph.omitted_nodes(), 32);
+        assert_eq!(graph.reasons(), [TruncationReason::MaxNodes]);
+
+        let again = build(
+            &result,
+            &revisions(&index, &index),
+            &bounded_request(&roots, Relation::SUPPORTED, 10),
+        );
+        assert_eq!(graph.nodes(), again.nodes());
+        assert_eq!(graph.edges(), again.edges());
+    }
+
+    #[test]
+    fn tests_collapse_into_one_group_although_the_budget_would_have_taken_them() {
+        let index = ImportIndex::from_edges(
+            &[
+                ("src/__tests__/core.spec.ts", "src/core.ts"),
+                ("src/__tests__/parse.spec.ts", "src/core.ts"),
+                ("src/__tests__/render.spec.ts", "src/core.ts"),
+            ],
+            &[],
+        );
+        let result = analysis(vec![modified("src/core.ts")]);
+        let roots = paths_of(&["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &request(&roots, Relation::SUPPORTED),
+        );
+
+        // The default budget is thirty; the three tests are grouped because
+        // they are context, not because they did not fit.
+        assert!(!graph.truncated());
+        assert_eq!(node_paths(&graph), vec!["src/core.ts", "src"]);
+        assert_eq!(
+            group(&graph, GroupRole::Tests),
+            Some(&Group {
+                size: 3,
+                role: GroupRole::Tests,
+            })
+        );
+        let tested_by = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.relation == Relation::TestedBy)
+            .collect::<Vec<_>>();
+        assert_eq!(tested_by.len(), 1);
+        assert_eq!(tested_by[0].from, Node::group_id(GroupRole::Tests));
+        assert_eq!(tested_by[0].to, Node::module_id("src/core.ts"));
+    }
+
+    #[test]
+    fn a_classification_collapses_what_a_shared_name_does_not() {
+        let importers = paths_of(&[
+            "dist/parse.ts",
+            "coverage/parse.ts",
+            "node_modules/left-pad/parse.ts",
+            "vendor/parse.ts",
+            "src/parse.ts",
+        ]);
+        let index = importers_of_core(&importers);
+        let result = analysis(vec![modified("src/core.ts")]);
+        let roots = paths_of(&["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &request(&roots, Relation::SUPPORTED),
+        );
+
+        assert_eq!(
+            group(&graph, GroupRole::Generated).map(|group| group.size),
+            Some(2)
+        );
+        assert_eq!(
+            group(&graph, GroupRole::Vendored).map(|group| group.size),
+            Some(2)
+        );
+        // The source file shares its name with two collapsed ones and stays a
+        // place a reader can open.
+        assert!(node(&graph, "src/parse.ts").is_some());
+        assert!(node(&graph, "dist/parse.ts").is_none());
+        assert!(node(&graph, "vendor/parse.ts").is_none());
+    }
+
+    #[test]
+    fn a_group_outlives_the_changed_nodes_it_replaced() {
+        let importers = importer_paths(10, "changed");
+        let index = importers_of_core(&importers);
+        let mut files = vec![modified("src/core.ts")];
+        files.extend(importers.iter().map(|path| modified(path)));
+        let result = analysis(files);
+        let roots = paths_of(&["src/core.ts"]);
+
+        let graph = build(
+            &result,
+            &revisions(&index, &index),
+            &bounded_request(&roots, Relation::SUPPORTED, 5),
+        );
+
+        // Every importer is changed, so truncation on its own would have kept
+        // them and dropped the group. Grouping runs first, so the group is
+        // there and the nodes it replaced are not.
+        assert_eq!(graph.nodes().len(), 5);
+        let collapsed = group(&graph, GroupRole::Callers).expect("the overflow is one group");
+        assert_eq!(collapsed.size, 7);
+        assert_eq!(
+            graph
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == NodeKind::Module && node.path != "src/core.ts")
+                .count(),
+            3
+        );
+        // Every member was modified, so the group says so too.
+        assert_eq!(
+            graph
+                .node(&Node::group_id(GroupRole::Callers))
+                .map(|node| node.status),
+            Some(NodeStatus::Modified)
+        );
+    }
+
+    #[test]
+    fn a_grouped_graph_renders_identically_from_the_same_input() {
+        let importers = importer_paths(12, "importer");
+        let index = importers_of_core(&importers);
+        let result = analysis(vec![modified("src/core.ts")]);
+        let roots = paths_of(&["src/core.ts"]);
+        let render_once = || {
+            let graph = build(
+                &result,
+                &revisions(&index, &index),
+                &bounded_request(&roots, Relation::SUPPORTED, 6),
+            );
+            let label = graph
+                .node(&Node::group_id(GroupRole::Callers))
+                .expect("the overflow is one group")
+                .label
+                .clone();
+            (
+                label,
+                render::dependency_diff(&graph),
+                render::mermaid(&graph),
+            )
+        };
+
+        let (label, diff, mermaid) = render_once();
+        assert_eq!(
+            render_once(),
+            (label.clone(), diff.clone(), mermaid.clone())
+        );
+        // Both renderings carry the group rather than quietly leaving a gap.
+        assert!(diff.contains(&label));
+        assert!(mermaid.contains(&label));
+    }
 }
